@@ -162,18 +162,33 @@ client가 보낸 user ID를 authorization 근거로 단독 신뢰하지 않는�
 
 image tag에 git SHA를 넣는다. `latest`에 의존하지 않는다.
 
-## opicmobile-45cd5 = OUT OF SCOPE
+## Infrastructure Isolation (영구 규칙)
 
-`opicmobile-45cd5`는 **DailyOPIc production project다.**
-꾸미러 작업으로 그 project를 **읽는 것 외에 아무것도 하지 않는다** —
-resource 생성 · 삭제 · IAM · Firestore · Cloud Run · Artifact Registry ·
-Service Account · API enable/disable · billing 전부 금지.
+DailyOPIc(`opicmobile-45cd5`)은 **실제 사용자가 있는 LIVE production**이고
+꾸미러 작업에서 **완전히 OUT OF SCOPE**다.
 
-`dailyopic-api` · Firestore `(default)`(nam5) · AR `dailyopic` ·
-`dailyopic-cloudrun` SA는 절대 수정하지 않는다.
+명령 대상에 `opicmobile-45cd5` · `dailyopic-api` · `dailyopic-cloudrun` 또는
+DailyOPIc resource가 등장하면 **mutation 전에 멈추고 보고한다.**
+사용자의 명시적 승인 없이 진행하지 않는다. READ-ONLY audit만 허용.
 
-그 project에 남아 있는 꾸미러 resource는 **temporary bootstrap이고 production이 아니다.**
-정리는 별도 cleanup phase에서만 다룬다.
+공유 가능: Google 계정 · **GCP Billing Account** · Apple Developer 계정 · GitHub 계정.
+공유 금지: project · Cloud Run · Firestore · Storage bucket · Artifact Registry ·
+service account · IAM · Secret · Workload Identity · CI/CD identity · Pub/Sub ·
+Cloud Tasks · Redis · Cloud SQL · Firebase project · RevenueCat project · StoreKit product ·
+AdMob app.
+
+새 infra를 붙일 때 먼저 묻는다: **"DailyOPIc에서 쓰는 resource인가?"**
+YES면 재사용하지 않고 `ggumirror-prod` 안에 꾸미러 전용으로 만든다.
+
+### 향후 정책
+
+| 필요해지면 | 이렇게 한다 |
+|---|---|
+| Cloud Storage | `ggumirror-prod`에 꾸미러 식별 가능한 이름으로 bucket 신규 생성. runtime SA에 그 bucket 최소 권한만 추가 |
+| CI/CD | `ggumirror-prod` 전용 Workload Identity + 배포 SA. long-lived JSON key를 만들지 않는다 |
+| Secret Manager | 실제 secret이 생길 때 `ggumirror-prod`에만 |
+| Firebase | 실제 요구(FCM · App Check 등)가 생길 때만, `ggumirror-prod` 기반 꾸미러 전용 설정으로 |
+| RevenueCat | 꾸미러 전용 project / app / product. **구매 성공을 잔액 권위로 쓰지 않는다** — server ledger가 권위다 |
 
 ## Next Phase
 
