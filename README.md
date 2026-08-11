@@ -418,17 +418,82 @@ FIRESTORE_EMULATOR_HOST=127.0.0.1:8090 APPLE_CLIENT_ID=com.mark77234.ggumirror .
 
 `FIRESTORE_EMULATOR_HOST`가 있으면 SDK가 알아서 emulator로 간다 — 코드에 분기가 없다.
 
-## Cloud Run readiness
+## Production
 
-이번 Phase에서 **실제 배포는 하지 않았다.** 다음은 준비돼 있다.
+**꾸미러 전용 GCP project를 쓴다.** 다른 서비스와 project를 공유하지 않는다.
 
-- container가 `0.0.0.0:$PORT`에서 listen
-- non-root user(uid 10001)로 실행
-- `/health`가 외부 의존성 없이 200
-- graceful shutdown (uvicorn이 PID 1 신호를 받는다)
+| | |
+|---|---|
+| GCP project | **`ggumirror-prod`** (project number `764151610434`) |
+| Cloud Run service | `ggumirror-api` |
+| region | `asia-northeast3` (서울) |
+| URL | https://ggumirror-api-cmyv4amroa-du.a.run.app |
+| Firestore | **`(default)` @ asia-northeast3** |
+| Artifact Registry | `ggumirror` @ asia-northeast3 |
+| runtime SA | `ggumirror-api-runtime@ggumirror-prod.iam.gserviceaccount.com` — `roles/datastore.user`만 |
+| scaling | min 0 / max 3, CPU 1, 512Mi, concurrency 80, timeout 30s |
 
-배포 workflow(`deploy.yml`)는 **아직 만들지 않았다** —
-GCP project · service account · Workload Identity가 확정되지 않았다.
+Firestore collection은 `ggumirror_users` · `ggumirror_auth_identities` ·
+`ggumirror_sessions` 셋뿐이다. project 단위 격리 + collection namespace 격리를 둘 다 갖는다.
+
+### opicmobile-45cd5 는 우리 것이 아니다
+
+`opicmobile-45cd5`는 **DailyOPIc production project고 꾸미러 작업 범위 밖(OUT OF SCOPE)이다.**
+
+그 project에서 꾸미러 때문에 resource 생성 · 삭제 · IAM · Firestore · Cloud Run ·
+Artifact Registry · Service Account · API · billing을 **건드리지 않는다.**
+특히 `dailyopic-api` · Firestore `(default)`(nam5) · Artifact Registry `dailyopic` ·
+`dailyopic-cloudrun` SA는 절대 수정하지 않는다.
+
+초기 bootstrap 때 그 project에 꾸미러 resource를 만든 적이 있다
+(`ggumirror-api` · named DB `ggumirror-prod` · AR `ggumirror` · runtime SA).
+**temporary bootstrap이고 더 이상 production이 아니다.** 지금 production은 위 표뿐이다.
+정리는 별도 cleanup phase에서 한다.
+
+### 배포 (수동)
+
+```bash
+gcloud auth configure-docker asia-northeast3-docker.pkg.dev
+```
+
+Cloud Run은 linux/amd64다. Apple Silicon에서는 platform을 명시한다:
+
+```bash
+SHA=$(git rev-parse --short HEAD) && docker build --platform linux/amd64 -t asia-northeast3-docker.pkg.dev/ggumirror-prod/ggumirror/ggumirror-api:$SHA .
+```
+
+```bash
+docker push asia-northeast3-docker.pkg.dev/ggumirror-prod/ggumirror/ggumirror-api:$(git rev-parse --short HEAD)
+```
+
+```bash
+gcloud run deploy ggumirror-api --project=ggumirror-prod --region=asia-northeast3 --image=asia-northeast3-docker.pkg.dev/ggumirror-prod/ggumirror/ggumirror-api:$(git rev-parse --short HEAD) --service-account=ggumirror-api-runtime@ggumirror-prod.iam.gserviceaccount.com --allow-unauthenticated --min-instances=0 --max-instances=3 --cpu=1 --memory=512Mi --concurrency=80 --timeout=30s --set-env-vars="APP_ENV=production,LOG_LEVEL=INFO,APPLE_CLIENT_ID=com.mark77234.ggumirror,GCP_PROJECT_ID=ggumirror-prod,FIRESTORE_DATABASE=(default)"
+```
+
+`latest` tag를 쓰지 않는다 — 어떤 commit이 떠 있는지 revision에서 바로 보여야 한다.
+
+Cloud Run endpoint는 인터넷에서 도달 가능하다(`--allow-unauthenticated`).
+iOS 앱이 직접 부르기 때문이다. **인증은 application Bearer session이 한다** —
+Cloud Run IAM 인증을 사용자에게 요구하지 않는다.
+
+Secret Manager는 만들지 않았다. 지금 필요한 secret이 하나도 없다(ADC + Apple private key 불필요).
+
+### 자동 배포 (아직 안 함)
+
+첫 배포는 수동으로 했다. GitHub Actions 배포를 붙일 때 필요한 것:
+
+1. Workload Identity Pool + provider (repo 한정 조건) — **새 project에**
+2. 배포용 service account — `roles/run.developer` · `roles/artifactregistry.writer` ·
+   `roles/iam.serviceAccountUser`
+3. `.github/workflows/deploy.yml` — `google-github-actions/auth`(WIF) → build/push → deploy
+
+**service account JSON key를 쓰지 않는다.**
+
+### Firestore location
+
+`(default)`를 처음부터 `asia-northeast3`에 만들었다. 서울 Cloud Run과 같은 region이라
+로그인 요청이 태평양을 건너지 않는다. (bootstrap 때 겪은 `nam5` 문제는 project를
+분리하면서 사라졌다 — 그 DB는 DailyOPIc project 것이고 우리가 쓰지 않는다.)
 
 ## Security
 
@@ -450,7 +515,7 @@ GCP project · service account · Workload Identity가 확정되지 않았다.
 
 ## 다음 Phase
 
-**B-3 — Shard Ledger.**
+**C-1 — Lock Screen Quick Mirror** (client).
 
-server authoritative 조각 원장. client가 보낸 잔액을 신뢰하지 않는다.
-그 전에 필요한 것: 실제 Cloud Run 배포(Infra Phase) — 지금은 로컬 backend까지만 연결돼 있다.
+그 다음 **B-3 Shard Ledger** — server authoritative 조각 원장.
+client가 보낸 잔액을 신뢰하지 않는다.

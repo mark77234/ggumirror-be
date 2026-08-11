@@ -149,14 +149,38 @@ client가 보낸 user ID를 authorization 근거로 단독 신뢰하지 않는�
 `Authorization` header와 secret을 로그에 남기지 않는다.
 로그에는 값이 아니라 결과만 남긴다.
 
+## Production
+
+| | |
+|---|---|
+| GCP project | **`ggumirror-prod`** (꾸미러 전용) |
+| Cloud Run | `ggumirror-api` @ asia-northeast3 |
+| URL | https://ggumirror-api-cmyv4amroa-du.a.run.app |
+| Firestore | `(default)` @ asia-northeast3 |
+| Artifact Registry | `ggumirror` @ asia-northeast3 |
+| runtime SA | `ggumirror-api-runtime` — `roles/datastore.user`만 |
+
+image tag에 git SHA를 넣는다. `latest`에 의존하지 않는다.
+
+## opicmobile-45cd5 = OUT OF SCOPE
+
+`opicmobile-45cd5`는 **DailyOPIc production project다.**
+꾸미러 작업으로 그 project를 **읽는 것 외에 아무것도 하지 않는다** —
+resource 생성 · 삭제 · IAM · Firestore · Cloud Run · Artifact Registry ·
+Service Account · API enable/disable · billing 전부 금지.
+
+`dailyopic-api` · Firestore `(default)`(nam5) · AR `dailyopic` ·
+`dailyopic-cloudrun` SA는 절대 수정하지 않는다.
+
+그 project에 남아 있는 꾸미러 resource는 **temporary bootstrap이고 production이 아니다.**
+정리는 별도 cleanup phase에서만 다룬다.
+
 ## Next Phase
 
-**B-3 — Shard Ledger.**
+**C-1 — Lock Screen Quick Mirror** (client 작업).
 
-server authoritative 조각 원장. client가 보낸 잔액으로 거래를 처리하지 않는다.
-
-그 전에 Infra Phase가 필요하다 — 실제 Cloud Run 배포 · GCP project ·
-Workload Identity. 지금 client는 DEBUG 빌드에서 로컬 backend에만 붙는다.
+그 다음 **B-3 Shard Ledger** — server authoritative 조각 원장.
+client가 보낸 잔액으로 거래를 처리하지 않는다.
 
 Cloud Run 자동 배포 workflow는 GCP project · service account ·
 Workload Identity가 확정된 뒤에 만든다.
