@@ -38,9 +38,26 @@ def test_config_defaults():
 
 
 def test_config_reads_env():
-    settings = load_settings({"APP_ENV": "production", "LOG_LEVEL": "warning", "PORT": "9090"})
+    settings = load_settings({
+        "APP_ENV": "production",
+        "LOG_LEVEL": "warning",
+        "PORT": "9090",
+        "APPLE_CLIENT_ID": "com.mark77234.ggumirror",
+    })
     assert (settings.app_env, settings.log_level, settings.port) == ("production", "WARNING", 9090)
+    assert settings.apple_client_id == "com.mark77234.ggumirror"
     assert settings.is_production is True
+
+
+def test_production_requires_apple_client_id():
+    """audience가 없으면 다른 앱의 Apple token도 통과한다. 기동에서 막는다."""
+    with pytest.raises(ValueError, match="APPLE_CLIENT_ID"):
+        load_settings({"APP_ENV": "production"})
+
+
+def test_local_allows_missing_apple_client_id():
+    """local에서는 /health만 띄우고 확인하는 일이 많다. 검증기 자체가 빈 값을 거부한다."""
+    assert load_settings({}).apple_client_id == ""
 
 
 @pytest.mark.parametrize(

@@ -2,3 +2,6 @@
 # 개발/테스트용은 requirements-dev.txt.
 fastapi==0.121.2
 uvicorn==0.40.0
+# Apple identity token(JWT/JWK) 검증. RSA/ASN.1/JWT parsing을 직접 만들지 않는다.
+# pyjwt[crypto] = PyJWT + cryptography(RSA signature 검증).
+pyjwt[crypto]==2.12.0

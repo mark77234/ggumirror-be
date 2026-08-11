@@ -23,6 +23,10 @@ class Settings:
     app_env: str = "local"
     log_level: str = "INFO"
     port: int = 8080
+    # Apple identity token의 expected audience.
+    # native iOS Sign in with Apple에서는 **app의 Bundle ID**다 — Services ID가 아니다.
+    # 현재 client: com.mark77234.ggumirror (docs 참고)
+    apple_client_id: str = ""
 
     @property
     def is_production(self) -> bool:
@@ -50,7 +54,18 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     if not 1 <= port <= 65535:
         raise ValueError(f"PORT={port} is out of range (1-65535)")
 
-    return Settings(app_env=app_env, log_level=log_level, port=port)
+    apple_client_id = env.get("APPLE_CLIENT_ID", "").strip()
+    if app_env == "production" and not apple_client_id:
+        # audience 없이 token을 검증하면 다른 앱의 token도 통과한다.
+        # production에서는 조용히 넘어가지 않고 기동을 실패시킨다.
+        raise ValueError("APPLE_CLIENT_ID is required when APP_ENV=production")
+
+    return Settings(
+        app_env=app_env,
+        log_level=log_level,
+        port=port,
+        apple_client_id=apple_client_id,
+    )
 
 
 def configure_logging(settings: Settings) -> None:
