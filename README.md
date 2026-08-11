@@ -445,10 +445,10 @@ Artifact Registry · Service Account · API · billing을 **건드리지 않는�
 특히 `dailyopic-api` · Firestore `(default)`(nam5) · Artifact Registry `dailyopic` ·
 `dailyopic-cloudrun` SA는 절대 수정하지 않는다.
 
-초기 bootstrap 때 그 project에 꾸미러 resource를 만든 적이 있다
-(`ggumirror-api` · named DB `ggumirror-prod` · AR `ggumirror` · runtime SA).
-**temporary bootstrap이고 더 이상 production이 아니다.** 지금 production은 위 표뿐이다.
-정리는 별도 cleanup phase에서 한다.
+초기 bootstrap 때 그 project에 꾸미러 resource를 만든 적이 있지만
+(`ggumirror-api` · named DB `ggumirror-prod` · AR `ggumirror` · runtime SA)
+**I-3에서 전부 삭제했다.** `opicmobile-45cd5`에 남아 있는 꾸미러 resource는 **없다.**
+지금 production은 위 표뿐이다.
 
 ### 배포 (수동)
 
