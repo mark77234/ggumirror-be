@@ -1,0 +1,4 @@
+# runtime dependencies. Docker image에 들어가는 것은 이 파일뿐이다.
+# 개발/테스트용은 requirements-dev.txt.
+fastapi==0.121.2
+uvicorn==0.40.0

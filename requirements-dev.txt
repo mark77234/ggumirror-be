@@ -1,0 +1,4 @@
+# 개발/테스트 전용. Docker image에는 들어가지 않는다.
+-r requirements.txt
+pytest==9.0.1
+httpx==0.28.1
