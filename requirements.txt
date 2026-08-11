@@ -5,3 +5,5 @@ uvicorn==0.40.0
 # Apple identity token(JWT/JWK) 검증. RSA/ASN.1/JWT parsing을 직접 만들지 않는다.
 # pyjwt[crypto] = PyJWT + cryptography(RSA signature 검증).
 pyjwt[crypto]==2.12.0
+# Firestore. iOS는 Firestore에 직접 붙지 않는다 — 이 backend만 접근한다.
+google-cloud-firestore==2.22.0

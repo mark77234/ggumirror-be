@@ -43,6 +43,7 @@ def test_config_reads_env():
         "LOG_LEVEL": "warning",
         "PORT": "9090",
         "APPLE_CLIENT_ID": "com.mark77234.ggumirror",
+        "GCP_PROJECT_ID": "ggumirror-prod",
     })
     assert (settings.app_env, settings.log_level, settings.port) == ("production", "WARNING", 9090)
     assert settings.apple_client_id == "com.mark77234.ggumirror"
@@ -53,6 +54,11 @@ def test_production_requires_apple_client_id():
     """audience가 없으면 다른 앱의 Apple token도 통과한다. 기동에서 막는다."""
     with pytest.raises(ValueError, match="APPLE_CLIENT_ID"):
         load_settings({"APP_ENV": "production"})
+
+
+def test_production_requires_gcp_project():
+    with pytest.raises(ValueError, match="GCP_PROJECT_ID"):
+        load_settings({"APP_ENV": "production", "APPLE_CLIENT_ID": "com.mark77234.ggumirror"})
 
 
 def test_local_allows_missing_apple_client_id():
@@ -73,8 +79,8 @@ def test_invalid_config_fails_clearly(env: dict[str, str], expected: str):
         load_settings(env)
 
 
-def test_no_feature_routes_yet():
-    """B-1의 API는 /health와 /뿐이다. 다음 Phase 전에 contract를 확정하지 않는다."""
+def test_no_marketplace_routes_yet():
+    """B-2B까지의 API는 health / auth / users뿐이다. Store 계열은 아직 만들지 않는다."""
     paths = {route.path for route in create_app(Settings()).routes if hasattr(route, "path")}
-    assert {"/health", "/"} <= paths
-    assert not {p for p in paths if p.startswith(("/auth", "/users", "/shards", "/store", "/listings", "/purchases"))}
+    assert {"/health", "/", "/auth/apple", "/auth/logout", "/users/me"} <= paths
+    assert not {p for p in paths if p.startswith(("/shards", "/store", "/listings", "/purchases"))}

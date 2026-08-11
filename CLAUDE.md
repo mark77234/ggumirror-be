@@ -20,9 +20,9 @@ Backend repository for 꾸미러.
 - purchase / ownership
 - seller shard settlement
 
-## Current Implementation (Phase B-2A 완료)
+## Current Implementation (Phase B-2B 완료)
 
-FastAPI 뼈대 + Apple token 검증 layer.
+FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth.
 
 ```
 app/main.py          create_app()
@@ -30,31 +30,64 @@ app/api/health.py    GET /health, GET /
 app/auth/apple.py    AppleTokenVerifier, VerifiedAppleIdentity
 app/auth/jwks.py     AppleJWKSProvider (조회 + cache)
 app/auth/errors.py   AppleTokenReason, AppleTokenError
+app/auth/models.py   User, Session, token/hash 정책
+app/auth/store.py    AuthStore protocol + in-memory
+app/auth/firestore_store.py  Firestore 구현
+app/api/auth.py      POST /auth/apple, POST /auth/logout
+app/api/users.py     GET /users/me
+app/api/deps.py      Bearer → current user
 app/core/config.py   환경변수 + logging
-tests/               pytest (Apple 호출 없음)
+tests/               pytest (Apple · Firestore 호출 없음)
 ```
 
-B-2A에서 Apple identity token **검증 layer만** 추가했다.
-endpoint는 없다 — `POST /auth/apple`도 debug verify endpoint도 만들지 않았다.
+API는 health / auth / users뿐이다. shard · store · listing · purchase는 없다.
 
 Python 3.13 고정 (local · Docker · CI 동일).
 
 dependency source of truth: `requirements.txt`(runtime) / `requirements-dev.txt`(개발).
 `pyproject.toml`은 pytest 설정만 담는다 — 이 service는 배포되는 package가 아니라 container다.
 
+## Session Hash Policy
+
+session은 **opaque random token**이다. 꾸미러 자체 JWT를 만들지 않는다 —
+server가 취소할 수 있어야 한다.
+
+- `secrets.token_urlsafe(32)`
+- Firestore에는 **`sha256(token)`만** 저장한다. raw token은 client에게 반환하는
+  그 순간에만 존재한다. 저장·로그 모두 금지
+- document ID도 token hash다
+- 수명은 `app/auth/models.py`의 `SESSION_LIFETIME` 한 곳에서만 정한다.
+  숫자를 코드 여러 곳에 흩뿌리지 않는다
+- 생성 시각 / 만료는 **server 시계**로 만든다. client가 보낸 시간을 근거로 쓰지 않는다
+
+## Internal User vs Provider Identity
+
+| | |
+|---|---|
+| 꾸미러 user ID | internal **UUID v4**. API에 나가는 유일한 사용자 식별자 |
+| Apple subject | provider identity. Firestore mapping 안에서만 쓴다 |
+
+- Apple subject를 **응답 · 로그 · analytics label에 쓰지 않는다**
+- Apple subject를 document ID에 raw로 쓰지 않는다 —
+  `sha256("apple:<subject>")`를 key로 쓴다(deterministic이라 중복 User 방지는 그대로)
+- **email은 identity key가 아니다.** 식별은 항상 검증된 `sub`로 한다
+- collection은 `ggumirror_` prefix. 같은 GCP project의 다른 service collection을
+  읽지도 쓰지도 않는다
+
 ## Structure Rules
 
 기능이 생기기 전에 layer를 만들지 않는다. 다음을 미리 추가하지 않는다:
 
 - service layer
-- repository abstraction / interface
+- repository abstraction을 더 쌓기 (`AuthStore` protocol 하나가 전부다 —
+  구현은 Firestore + test fake 둘뿐)
 - dependency injection container
 - DDD layering
 - global exception handler framework
 - CORS (client가 iOS native다. web client가 생기면 그때)
 
-Firestore를 붙일 때는 `app/core/firestore.py`에 client 하나를 만들고
-FastAPI dependency로 주입한다. 추상 repository를 먼저 만들지 않는다.
+Firestore client는 처음 auth 요청 때 만든다. `/health`가 credential에 의존하면
+멀쩡한 container가 죽었다고 판정된다.
 
 새 endpoint는 Client와 contract를 확정한 뒤에만 만든다.
 
@@ -72,6 +105,8 @@ Apple identityToken은 server에서 검증한다(B-2A 완료). client가 "검증
 - raw Apple subject
 - email
 - authorizationCode
+- client nonce
+- **session access token** (raw도, hash도 남길 이유가 없다)
 - `Authorization` header
 - secret / 향후 auth credential
 
@@ -116,15 +151,12 @@ client가 보낸 user ID를 authorization 근거로 단독 신뢰하지 않는�
 
 ## Next Phase
 
-**B-2B — Server User Identity.**
+**B-3 — Shard Ledger.**
 
-1. `Apple subject → internal ggumirror user UUID` mapping (Firestore)
-2. `POST /auth/apple` — 검증 → user 생성/조회 → 꾸미러 session 발급
-3. 실패 매핑: `jwks_unavailable` → 503, 나머지 → 401 + 일반 메시지
-4. nonce flow 연결 — **Client 변경 필요**. 현재 client는 nonce를 보내지 않는다
-5. iOS 연결
+server authoritative 조각 원장. client가 보낸 잔액으로 거래를 처리하지 않는다.
 
-그 다음이 Shard Ledger다.
+그 전에 Infra Phase가 필요하다 — 실제 Cloud Run 배포 · GCP project ·
+Workload Identity. 지금 client는 DEBUG 빌드에서 로컬 backend에만 붙는다.
 
 Cloud Run 자동 배포 workflow는 GCP project · service account ·
 Workload Identity가 확정된 뒤에 만든다.

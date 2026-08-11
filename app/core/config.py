@@ -27,6 +27,10 @@ class Settings:
     # native iOS Sign in with Apple에서는 **app의 Bundle ID**다 — Services ID가 아니다.
     # 현재 client: com.mark77234.ggumirror (docs 참고)
     apple_client_id: str = ""
+    # Firestore. Cloud Run에서는 Application Default Credentials를 쓴다 —
+    # service account JSON key를 repo에 넣지 않는다.
+    gcp_project_id: str = ""
+    firestore_database: str = "(default)"
 
     @property
     def is_production(self) -> bool:
@@ -60,11 +64,19 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         # production에서는 조용히 넘어가지 않고 기동을 실패시킨다.
         raise ValueError("APPLE_CLIENT_ID is required when APP_ENV=production")
 
+    gcp_project_id = env.get("GCP_PROJECT_ID", "").strip()
+    if app_env == "production" and not gcp_project_id:
+        raise ValueError("GCP_PROJECT_ID is required when APP_ENV=production")
+
+    firestore_database = env.get("FIRESTORE_DATABASE", "").strip() or "(default)"
+
     return Settings(
         app_env=app_env,
         log_level=log_level,
         port=port,
         apple_client_id=apple_client_id,
+        gcp_project_id=gcp_project_id,
+        firestore_database=firestore_database,
     )
 
 

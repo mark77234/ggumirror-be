@@ -15,7 +15,7 @@
 - 실제 Store listing · 구매 / 소유권
 - 판매자 조각 정산
 
-## 현재 구현 범위 (Phase B-2A까지)
+## 현재 구현 범위 (Phase B-2B까지)
 
 **B-1 — Foundation**
 
@@ -30,34 +30,49 @@
 - JWKS 조회 + cache + key rotation 대응
 - 실패 분류(`AppleTokenReason`)
 
+**B-2B — Server User Identity + Session**
+
+- Firestore User + Apple identity mapping
+- opaque access token session (Bearer)
+- `POST /auth/apple` · `POST /auth/logout` · `GET /users/me`
+- iOS client 연결 (nonce 생성 → 서버 검증 → Keychain 세션)
+
 아직 구현하지 않은 것 (의도적):
 
-Firestore User 생성 · 꾸미러 access token / session 발급 · `POST /auth/apple` endpoint ·
-iOS 연결 · Shard Ledger · Store API · Listing · 구매 · 소유권 · 판매자 정산 ·
-authorizationCode 교환 · Apple private key / client_secret.
+Shard Ledger · shard balance · daily reward · Store API · Listing · Asset upload ·
+actual Publish · 구매 · 소유권 · 판매자 정산 · Cloud Sync ·
+authorizationCode 교환 · Apple private key / client_secret · refresh token · Cloud Run 배포.
 
 ## Architecture
 
 ```
 app/
-├── main.py          create_app()
-├── api/health.py    GET /health, GET /
-├── auth/apple.py    AppleTokenVerifier, VerifiedAppleIdentity
-├── auth/jwks.py     AppleJWKSProvider (조회 + cache)
-├── auth/errors.py   AppleTokenReason, AppleTokenError
-└── core/config.py   환경변수 + logging
-tests/               pytest (Apple 호출 없음)
-scripts/             수동 확인용. CI에 들어가지 않는다
-Dockerfile           Cloud Run 실행용
+├── main.py                 create_app() + verifier / store 조립
+├── api/health.py           GET /health, GET /
+├── api/auth.py             POST /auth/apple, POST /auth/logout
+├── api/users.py            GET /users/me
+├── api/deps.py             Bearer → current user
+├── auth/apple.py           AppleTokenVerifier, VerifiedAppleIdentity
+├── auth/jwks.py            AppleJWKSProvider (조회 + cache)
+├── auth/errors.py          AppleTokenReason, AppleTokenError
+├── auth/models.py          User, Session, token/hash 정책
+├── auth/store.py           AuthStore protocol + in-memory 구현
+├── auth/firestore_store.py Firestore 구현
+└── core/config.py          환경변수 + logging
+tests/                      pytest (Apple · Firestore 호출 없음)
+scripts/                    수동 확인용. CI에 들어가지 않는다
+Dockerfile                  Cloud Run 실행용
 ```
+
+abstraction은 `AuthStore` protocol 하나뿐이다 — 구현은 Firestore 하나 + test fake 하나.
+service layer / repository 계층을 더 쌓지 않는다.
 
 의도적으로 **만들지 않은 것**: service layer, repository abstraction,
 dependency container, DDD layering, global exception framework, CORS.
 실제 기능이 생길 때 필요한 만큼만 추가한다.
 
-Firestore도 아직 붙이지 않았다. 붙일 때는 `app/core/firestore.py` 하나에
-client를 만들고 필요한 곳에서 FastAPI dependency로 주입한다 —
-repository interface를 먼저 만들지 않는다.
+Firestore client는 **처음 auth 요청 때** 만든다. `/health`가 Firestore credential에
+의존하면 멀쩡한 container가 죽었다고 판정된다.
 
 ## Python version
 
@@ -128,14 +143,16 @@ docker run --rm -e PORT=9000 -p 9000:9000 ggumirror-be
 
 ## API
 
-| method | path | 설명 |
-|---|---|---|
-| GET | `/health` | process health. DB · 외부 API에 의존하지 않는다 |
-| GET | `/` | service name + status |
+| method | path | auth | 설명 |
+|---|---|---|---|
+| GET | `/health` | — | process health. DB · 외부 API에 의존하지 않는다 |
+| GET | `/` | — | service name + status |
+| POST | `/auth/apple` | — | Apple identityToken 검증 → User → session |
+| POST | `/auth/logout` | Bearer | 이 session만 revoke |
+| GET | `/users/me` | Bearer | internal user id |
 
-이 외의 endpoint는 **없다.** `/auth/apple`, `/users`, `/shards`, `/store`,
-`/listings`, `/purchases`를 미리 만들지 않는다 —
-Client와 contract를 확정한 뒤에 만든다.
+이 외의 endpoint는 **없다.** `/shards`, `/store`, `/listings`, `/purchases`를
+미리 만들지 않는다 — Client와 contract를 확정한 뒤에 만든다.
 
 ## Apple identity token verification (B-2A)
 
@@ -279,6 +296,128 @@ PYTHONPATH=. .venv/bin/python scripts/apple_jwks_smoke.py
 
 CI에는 들어가지 않는다.
 
+## Server User Identity (B-2B)
+
+### Firestore
+
+collection 이름에 `ggumirror_` prefix를 붙인다. 같은 GCP project에 다른 service가
+있을 수 있고, **다른 service의 collection은 읽지도 쓰지도 않는다.**
+
+| collection | document ID | 내용 |
+|---|---|---|
+| `ggumirror_users` | internal UUID | `createdAt`, `updatedAt` |
+| `ggumirror_auth_identities` | `sha256("apple:<subject>")` | `provider`, `userId`, `createdAt` |
+| `ggumirror_sessions` | `sha256(accessToken)` | `userId`, `createdAt`, `expiresAt`, `revokedAt` |
+
+shard / store collection은 만들지 않았다.
+
+Cloud Run에서는 **Application Default Credentials**를 쓴다.
+service account JSON key를 repo에 넣지 않는다.
+
+### User
+
+`id`(UUID v4) · `createdAt` · `updatedAt`뿐이다.
+shard balance · seller field · store profile · 통계를 미리 넣지 않았다.
+
+### Apple identity mapping
+
+Apple subject와 User는 분리돼 있다. identity 문서가 `Apple subject → userId`를 가리킨다.
+
+**raw Apple subject를 저장하지 않는다.** document ID가
+`sha256("apple:<subject>")`이고, 문서 본문에는 `provider`와 `userId`만 있다.
+Firestore console · export · index 이름에 subject가 남지 않는다.
+
+hash는 deterministic하므로 "같은 subject → 같은 문서"라는 성질은 그대로다 —
+중복 User 방지의 근거가 바로 이것이다.
+
+### 중복 User 방지
+
+`user_for_identity`는 Firestore transaction 안에서 identity 문서를 읽고,
+없을 때만 User + identity를 함께 만든다.
+document key가 deterministic이라 동시에 처음 로그인해도 두 요청이 같은 문서를 겨루고,
+한쪽은 재시도 후 상대가 만든 User를 그대로 쓴다.
+
+email은 identity key가 **아니다.** User 생성에 email을 요구하지 않고, 서버에 복사하지도
+않는다 — client가 이미 first authorization의 이름 / 이메일을 로컬에 보존한다.
+
+### Session
+
+- **opaque random token.** 꾸미러 자체 JWT를 만들지 않았다 — server가 취소할 수 있어야 하고
+  JWT는 그걸 어렵게 만든다
+- `secrets.token_urlsafe(32)` → 43자
+- Firestore에는 **`sha256(token)`만** 저장한다. raw token은 어디에도 저장하지 않는다
+  (client에게 반환하는 그 순간에만 존재한다)
+- 수명 **30일**, `app/auth/models.py`의 `SESSION_LIFETIME` 한 곳에서만 정한다
+- 취소: 만료 · 로그아웃 · 향후 강제 revoke 모두 Firestore 문서 하나로 가능하다
+- 시간은 **server 시계**로 만든다. client가 보낸 시간을 근거로 쓰지 않는다
+
+### POST /auth/apple
+
+```json
+{ "identityToken": "<Apple JWT>", "nonce": "<client raw nonce>" }
+```
+
+nonce는 **원본**을 보낸다. 서버가 SHA-256으로 바꿔 token의 `nonce` claim과 비교한다.
+그래서 token만 훔쳐도 우리 서버에 쓸 수 없다. authorizationCode는 받지 않는다.
+
+```json
+{
+  "accessToken": "...",
+  "tokenType": "Bearer",
+  "expiresAt": "2026-09-10T11:22:33.123456Z",
+  "user": { "id": "<internal uuid>" }
+}
+```
+
+**Apple subject는 응답에 담기지 않는다.** 나가는 것은 internal UUID뿐이다.
+key는 client의 Swift Codable 이름과 그대로 맞춘 camelCase다.
+
+흐름: 검증(B-2A) → identity 조회 → 없으면 User 생성 → session 생성 → token 반환.
+
+### 오류 매핑
+
+| 상황 | status |
+|---|---|
+| malformed / signature / expired / audience / issuer / nonce mismatch | **401** |
+| Apple JWKS에 닿지 못함 | **503** |
+| `APPLE_CLIENT_ID` 미설정 · Firestore client 생성 실패 | **503** |
+| Firestore 쓰기 실패 | **500** |
+
+client에게는 검증 상세를 주지 않는다 — 어떤 항목에서 걸렸는지, kid가 무엇인지,
+Firestore 경로가 무엇인지 전부 응답에 넣지 않는다.
+
+### Bearer
+
+`Authorization: Bearer <accessToken>` → `sha256` → session 조회 → 만료 / 취소 확인
+→ internal User. header를 로그에 남기지 않는다.
+
+`get_current_user`는 `app/api/deps.py`에 있고, 지금 쓰는 곳은 `/users/me`와
+`/auth/logout`뿐이다. 가짜 protected endpoint를 만들지 않았다.
+
+### POST /auth/logout
+
+이 기기의 session만 revoke한다. **Apple authorization 자체는 revoke하지 않는다** —
+그건 사용자가 iOS 설정에서 할 일이다. client의 거울 / 스티커 / 등록 준비와는 무관하다.
+이미 없거나 만료된 token이어도 204다 — client는 어차피 로컬을 지운다.
+
+### Local 개발
+
+`/health`와 `/`는 credential 없이 그대로 뜬다. auth endpoint는 Firestore가 필요하다.
+
+**주의**: 아무 설정 없이 로컬에서 auth endpoint를 부르면
+Application Default Credentials의 **기본 project**로 붙는다.
+로컬에서는 emulator를 쓰는 편이 안전하다:
+
+```bash
+gcloud emulators firestore start --host-port=127.0.0.1:8090
+```
+
+```bash
+FIRESTORE_EMULATOR_HOST=127.0.0.1:8090 APPLE_CLIENT_ID=com.mark77234.ggumirror .venv/bin/uvicorn app.main:app --port 8080
+```
+
+`FIRESTORE_EMULATOR_HOST`가 있으면 SDK가 알아서 emulator로 간다 — 코드에 분기가 없다.
+
 ## Cloud Run readiness
 
 이번 Phase에서 **실제 배포는 하지 않았다.** 다음은 준비돼 있다.
@@ -306,15 +445,12 @@ GCP project · service account · Workload Identity가 확정되지 않았다.
   test로 고정했다 (`test_logs_never_contain_credentials`)
 - secret 기본값을 코드에 넣지 않는다. `.env`는 commit하지 않는다
 - production 응답에 stack trace를 담지 않는다 (`debug=False`)
+- session raw token을 **저장하지 않는다.** Firestore에는 `sha256(token)`만 둔다
+- raw Apple subject를 저장 · 응답 · 로그에 쓰지 않는다. 저장은 hash key로만 한다
 
 ## 다음 Phase
 
-**B-2B — Server User Identity.**
+**B-3 — Shard Ledger.**
 
-1. `Apple subject → internal ggumirror user UUID` mapping (Firestore)
-2. `POST /auth/apple` — identityToken 검증 → user 생성/조회 → 꾸미러 session 발급
-3. 실패 매핑: `jwks_unavailable` → 503, 나머지 → 401 + 일반 메시지
-4. nonce flow 연결 (Client 변경 필요)
-5. iOS 연결
-
-그 다음이 Shard Ledger다.
+server authoritative 조각 원장. client가 보낸 잔액을 신뢰하지 않는다.
+그 전에 필요한 것: 실제 Cloud Run 배포(Infra Phase) — 지금은 로컬 backend까지만 연결돼 있다.
