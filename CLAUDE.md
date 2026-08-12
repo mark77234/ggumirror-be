@@ -20,9 +20,9 @@ Backend repository for 꾸미러.
 - purchase / ownership
 - seller shard settlement
 
-## Current Implementation (Phase B-2B 완료)
+## Current Implementation (Phase B-3 완료)
 
-FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth.
+FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth + server-authoritative 조각 원장.
 
 ```
 app/main.py          create_app()
@@ -34,13 +34,18 @@ app/auth/models.py   User, Session, token/hash 정책
 app/auth/store.py    AuthStore protocol + in-memory
 app/auth/firestore_store.py  Firestore 구현
 app/api/auth.py      POST /auth/apple, POST /auth/logout
-app/api/users.py     GET /users/me
+app/api/users.py     GET /users/me, GET /users/me/shards
 app/api/deps.py      Bearer → current user
+app/shards/models.py ShardWallet, ShardLedgerEntry, ShardReason, idempotency_hash
+app/shards/store.py  ShardStore protocol + in-memory
+app/shards/firestore_store.py  Firestore transaction 구현
+app/shards/service.py  ShardLedgerService
 app/core/config.py   환경변수 + logging
 tests/               pytest (Apple · Firestore 호출 없음)
 ```
 
-API는 health / auth / users뿐이다. shard · store · listing · purchase는 없다.
+API는 health / auth / users뿐이다. store · listing · purchase는 없다.
+조각은 **읽기 endpoint 하나**(`GET /users/me/shards`)만 있다.
 
 Python 3.13 고정 (local · Docker · CI 동일).
 
@@ -74,13 +79,51 @@ server가 취소할 수 있어야 한다.
 - collection은 `ggumirror_` prefix. 같은 GCP project의 다른 service collection을
   읽지도 쓰지도 않는다
 
+## Shard Ledger Policy (영구 규칙)
+
+거울조각의 진실은 **server ledger 하나**다. client가 보낸 잔액은 어떤 거래의 근거도 아니다.
+
+- `ShardLedgerEntry`는 **불변 append-only**다. 이미 쓴 entry를 고치거나 지우지 않는다.
+  잘못됐으면 반대 부호의 `refund` / `admin_adjustment` entry를 새로 쌓는다
+- ledger 기록과 wallet 갱신은 **하나의 Firestore transaction**에서만 일어난다.
+  따로 쓰면 중간에 죽었을 때 잔액과 원장이 갈라진다
+- 모든 이동에 `ShardReason`이 붙는다. 이유 없는 이동은 만들 수 없다
+- **idempotency**: ledger 문서 ID가
+  `sha256(len:user_id | len:reason | len:external_event_id)`다.
+  transaction 안에서 `create()`로 쓰므로 중복이 구조적으로 막힌다 —
+  "조회해서 없으면 쓴다"로 바꾸지 않는다 (그 사이에 틈이 생긴다)
+- **user scope는 service가 강제한다.** `user_id`를 열쇠에서 빼지 않고,
+  호출부가 event id에 user id를 넣어주기를 기대하지도 않는다.
+  빼면 출석(`daily_attendance` + 날짜)에서 하루에 한 사람만 조각을 받는다
+- 길이 접두사 canonical encoding을 쓴다. 값에 `:` · `|`가 섞여도 조합이 뒤섞이지 않는다
+- raw user id · raw external event id를 문서 ID에 노출하지 않는다. hash 결과만 쓴다
+- `balance`는 음수가 되지 않는다. 부족하면 `InsufficientShards`로 거절하고 아무것도 쓰지 않는다
+- 부호는 `credit` / `debit`이 정한다. 호출부가 음수를 넘겨 방향을 뒤집을 수 없다
+- 로그에 user id · external event id · idempotency key를 남기지 않는다
+
+### generic mutation endpoint 금지
+
+`POST /shards/credit` · `/shards/debit` · `/shards/add` · `/shards/set` 을
+**절대 만들지 않는다.** 하나라도 생기면 client가 원하는 만큼 조각을 만들 수 있다.
+
+지급 / 차감은 **각자의 이유를 검증하는 전용 endpoint**로만 생긴다 —
+출석(하루 1회) · AdMob SSV callback(서명 검증) · IAP(영수증 검증) · 구매 · 등록.
+`tests/test_shards.py::test_no_generic_mutation_endpoint`가 고정한다.
+
+### AdMob Rewarded = SSV only
+
+보상 권위는 **Google AdMob Server-Side Verification callback 하나뿐이다.**
+client의 `onUserEarnedReward`로 조각을 지급하지 않는다 — 검증되지 않은 입력이다.
+
+B-5 요구사항: Google public key 서명 검증 → `transaction_id`를 external event id로
+사용 → 하루 5회 상한(같은 transaction 안에서 확인) → reason `rewarded_ad`.
+
 ## Structure Rules
 
 기능이 생기기 전에 layer를 만들지 않는다. 다음을 미리 추가하지 않는다:
 
-- service layer
-- repository abstraction을 더 쌓기 (`AuthStore` protocol 하나가 전부다 —
-  구현은 Firestore + test fake 둘뿐)
+- repository abstraction을 더 쌓기 (`AuthStore` · `ShardStore` protocol 둘이 전부다 —
+  각각 구현은 Firestore + test fake 둘뿐)
 - dependency injection container
 - DDD layering
 - global exception handler framework
@@ -190,12 +233,22 @@ YES면 재사용하지 않고 `ggumirror-prod` 안에 꾸미러 전용으로 만
 | Firebase | 실제 요구(FCM · App Check 등)가 생길 때만, `ggumirror-prod` 기반 꾸미러 전용 설정으로 |
 | RevenueCat | 꾸미러 전용 project / app / product. **구매 성공을 잔액 권위로 쓰지 않는다** — server ledger가 권위다 |
 
+## Business Model Roadmap
+
+B-3 원장 위에 얹는다. 전부 server가 지급 / 차감한다.
+
+| Phase | 내용 | reason |
+|---|---|---|
+| B-4 | 출석 — 하루 1개 | `daily_attendance` |
+| B-5 | AdMob rewarded — 1개, 하루 5회, **SSV 필수** | `rewarded_ad` |
+| B-6 | 조각 IAP — 10 / 30 / 70 / 160 | `iap_purchase` |
+| B-7 | 꾸미러 Pass — ₩4,900 월 / ₩39,000 년 | 정책 확정 후 |
+| B-8 | 마켓 — 등록 20 조각, 조각 구매 거울은 영구 소유 | `mirror_publish_fee` · `mirror_purchase` · `mirror_sale` |
+
 ## Next Phase
 
-**C-1 — Lock Screen Quick Mirror** (client 작업).
-
-그 다음 **B-3 Shard Ledger** — server authoritative 조각 원장.
-client가 보낸 잔액으로 거래를 처리하지 않는다.
+**B-4 — Daily Attendance.** 원장 · reason · idempotency는 이미 있다.
+"하루에 한 번"이라는 규칙을 담은 전용 endpoint 하나만 추가한다.
 
 Cloud Run 자동 배포 workflow는 GCP project · service account ·
 Workload Identity가 확정된 뒤에 만든다.

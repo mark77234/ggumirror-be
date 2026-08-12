@@ -15,7 +15,7 @@
 - 실제 Store listing · 구매 / 소유권
 - 판매자 조각 정산
 
-## 현재 구현 범위 (Phase B-2B까지)
+## 현재 구현 범위 (Phase B-3까지)
 
 **B-1 — Foundation**
 
@@ -37,11 +37,19 @@
 - `POST /auth/apple` · `POST /auth/logout` · `GET /users/me`
 - iOS client 연결 (nonce 생성 → 서버 검증 → Keychain 세션)
 
+**B-3 — Server-Authoritative Shard Ledger**
+
+- 불변 ledger + wallet projection (`app/shards/`)
+- Firestore transaction 안에서 원장 기록과 잔액 갱신이 한 번에 일어난다
+- idempotency key로 중복 지급 / 중복 차감을 **구조적으로** 막는다
+- `GET /users/me/shards` — **읽기 endpoint 하나뿐이다**
+- iOS `ShardWallet`은 서버 값을 보여주기만 한다
+
 아직 구현하지 않은 것 (의도적):
 
-Shard Ledger · shard balance · daily reward · Store API · Listing · Asset upload ·
-actual Publish · 구매 · 소유권 · 판매자 정산 · Cloud Sync ·
-authorizationCode 교환 · Apple private key / client_secret · refresh token · Cloud Run 배포.
+daily attendance · rewarded ad SSV callback · shard IAP · 꾸미러 Pass ·
+Store API · Listing · Asset upload · actual Publish · 구매 · 소유권 · 판매자 정산 ·
+Cloud Sync · authorizationCode 교환 · Apple private key / client_secret · refresh token.
 
 ## Architecture
 
@@ -50,8 +58,12 @@ app/
 ├── main.py                 create_app() + verifier / store 조립
 ├── api/health.py           GET /health, GET /
 ├── api/auth.py             POST /auth/apple, POST /auth/logout
-├── api/users.py            GET /users/me
+├── api/users.py            GET /users/me, GET /users/me/shards
 ├── api/deps.py             Bearer → current user
+├── shards/models.py        ShardWallet, ShardLedgerEntry, ShardReason, idempotency
+├── shards/store.py         ShardStore protocol + in-memory 구현
+├── shards/firestore_store.py  Firestore transaction 구현
+├── shards/service.py       ShardLedgerService (credit / debit / wallet)
 ├── auth/apple.py           AppleTokenVerifier, VerifiedAppleIdentity
 ├── auth/jwks.py            AppleJWKSProvider (조회 + cache)
 ├── auth/errors.py          AppleTokenReason, AppleTokenError
@@ -64,8 +76,10 @@ scripts/                    수동 확인용. CI에 들어가지 않는다
 Dockerfile                  Cloud Run 실행용
 ```
 
-abstraction은 `AuthStore` protocol 하나뿐이다 — 구현은 Firestore 하나 + test fake 하나.
-service layer / repository 계층을 더 쌓지 않는다.
+abstraction은 `AuthStore` · `ShardStore` protocol 둘뿐이다 —
+각각 구현은 Firestore 하나 + test fake 하나. 계층을 더 쌓지 않는다.
+`ShardLedgerService`는 amount 검증과 reason 강제를 담당하는 얇은 층이고,
+"service layer 규약" 때문에 만든 것이 아니다.
 
 의도적으로 **만들지 않은 것**: service layer, repository abstraction,
 dependency container, DDD layering, global exception framework, CORS.
@@ -150,9 +164,17 @@ docker run --rm -e PORT=9000 -p 9000:9000 ggumirror-be
 | POST | `/auth/apple` | — | Apple identityToken 검증 → User → session |
 | POST | `/auth/logout` | Bearer | 이 session만 revoke |
 | GET | `/users/me` | Bearer | internal user id |
+| GET | `/users/me/shards` | Bearer | 내 조각 잔액 (읽기 전용) |
 
-이 외의 endpoint는 **없다.** `/shards`, `/store`, `/listings`, `/purchases`를
+이 외의 endpoint는 **없다.** `/store`, `/listings`, `/purchases`를
 미리 만들지 않는다 — Client와 contract를 확정한 뒤에 만든다.
+
+**조각을 바꾸는 endpoint는 없고, 앞으로도 generic한 것은 만들지 않는다.**
+`POST /shards/credit` · `/shards/debit` · `/shards/add` · `/shards/set` 같은 것이
+하나라도 생기면 client가 원하는 만큼 조각을 만들 수 있게 된다.
+지급 / 차감은 **각자의 이유를 검증하는 전용 endpoint**로만 생긴다
+(출석 · AdMob SSV callback · IAP 검증 · 구매 · 등록).
+`tests/test_shards.py::test_no_generic_mutation_endpoint`가 이걸 고정한다.
 
 ## Apple identity token verification (B-2A)
 
@@ -308,8 +330,10 @@ collection 이름에 `ggumirror_` prefix를 붙인다. 같은 GCP project에 다
 | `ggumirror_users` | internal UUID | `createdAt`, `updatedAt` |
 | `ggumirror_auth_identities` | `sha256("apple:<subject>")` | `provider`, `userId`, `createdAt` |
 | `ggumirror_sessions` | `sha256(accessToken)` | `userId`, `createdAt`, `expiresAt`, `revokedAt` |
+| `ggumirror_shard_wallets` | internal user UUID | `balance`, `lifetimeEarned`, `lifetimeSpent`, `updatedAt`, `schemaVersion` |
+| `ggumirror_shard_ledger` | idempotency hash 또는 자동 id | `userId`, `delta`, `balanceAfter`, `reason`, `createdAt`, `schemaVersion` |
 
-shard / store collection은 만들지 않았다.
+store / listing / purchase collection은 만들지 않았다.
 
 Cloud Run에서는 **Application Default Credentials**를 쓴다.
 service account JSON key를 repo에 넣지 않는다.
@@ -418,6 +442,103 @@ FIRESTORE_EMULATOR_HOST=127.0.0.1:8090 APPLE_CLIENT_ID=com.mark77234.ggumirror .
 
 `FIRESTORE_EMULATOR_HOST`가 있으면 SDK가 알아서 emulator로 간다 — 코드에 분기가 없다.
 
+## Shard Ledger (B-3)
+
+거울조각은 **server가 유일한 진실**이다. client는 잔액을 보여줄 뿐이고,
+client가 보낸 숫자는 어떤 거래의 근거도 되지 않는다.
+
+### 원장이 먼저, 잔액은 결과
+
+```
+ShardLedgerEntry (불변 · append-only)   ← 진실
+ShardWallet (balance / lifetime 합계)   ← 빠르게 읽기 위한 projection
+```
+
+ledger 문서는 **한 번 쓰면 수정하지 않는다.** 잘못 지급했으면 반대 부호의
+`refund` / `admin_adjustment` entry를 새로 쌓는다. 과거를 고쳐 쓰지 않는다 —
+분쟁이 생겼을 때 "그때 무슨 일이 있었나"를 답할 수 있어야 한다.
+
+두 문서는 **하나의 Firestore transaction** 안에서 같이 쓰인다
+(`@firestore.transactional`, 모든 read를 write보다 먼저). 동시에 두 요청이 와도
+잔액이 어긋나지 않는다 — transaction 충돌 시 SDK가 재시도하면서 최신 잔액을 다시 읽는다.
+
+`balance`는 절대 음수가 되지 않는다. 부족하면 `InsufficientShards`로 거절하고
+**아무것도 쓰지 않는다.** 차감을 먼저 하고 실패를 나중에 처리하지 않는다.
+
+### Reason
+
+모든 이동에는 이유가 붙는다 (`ShardReason`):
+
+`daily_attendance` · `rewarded_ad` · `iap_purchase` · `mirror_purchase` ·
+`mirror_sale` · `mirror_publish_fee` · `refund` · `admin_adjustment`
+
+이유 없는 이동은 만들 수 없다. 나중에 "이 조각이 왜 늘었나"를 답하지 못하면
+환불 · 정산 · 어뷰징 조사를 전부 할 수 없다.
+
+### Idempotency
+
+같은 사건이 두 번 도착해도 조각은 한 번만 움직인다. 네트워크 재시도 · AdMob SSV 재전송 ·
+App Store notification 재전송은 **정상 동작**이지 예외가 아니다.
+
+```
+document id = sha256( len:user_id | len:reason | len:external_event_id )
+```
+
+이 hash가 **ledger 문서의 ID 자체**다. transaction 안에서 `create()`로 쓰기 때문에
+이미 있으면 쓰기가 실패한다 — "먼저 조회해서 없으면 쓴다"가 아니라 **구조적으로** 막힌다.
+조회-후-쓰기 사이의 틈이 없다.
+
+**user scope는 `ShardLedgerService`가 강제한다.** 호출부가 event id에 user id를 넣어주기를
+기대하지 않는다 — 잊은 곳 하나가 사용자끼리 같은 문서를 겨루게 만든다.
+출석처럼 event id가 날짜뿐일 때(`daily_attendance` + `2026-08-12`) user scope가 없으면
+**하루에 한 사람만** 조각을 받는다.
+
+세 값은 **길이 접두사**로 이어 붙인다. 어떤 값에 `:`나 `|`가 섞여 있어도
+다른 조합과 같은 문자열이 되지 않는다 — `("u:x", "1")`과 `("u", "x:1")`이
+구분되지 않으면 서로 다른 사건이 하나로 합쳐진다.
+
+raw user id와 raw external event id는 **문서 ID에 노출되지 않는다.** hash 결과만 쓴다.
+
+external event id 예:
+
+| 사건 | external event id |
+|---|---|
+| 출석 | 날짜(UTC). user는 service가 붙인다 |
+| AdMob rewarded | SSV callback의 `transaction_id` |
+| IAP | App Store transaction id |
+| 구매 / 판매 | 주문 id |
+
+같은 user + 같은 event = **정확히 한 번.** 다른 user + 같은 event = **서로 독립.**
+AdMob `transaction_id`가 global unique여도 원장 invariant 자체는 user-scoped로 유지된다.
+
+### 검증
+
+`ShardLedgerService`가 amount를 먼저 거른다: 정수가 아니거나, `bool`이거나,
+0 이하이거나, `MAX_DELTA`(100,000)를 넘으면 거절한다. 부호는 credit / debit
+**호출부가 아니라 service가** 정한다 — 호출부가 음수를 넘겨 credit으로 차감하는 길이 없다.
+
+### 로그
+
+`shard_wallet_read` · `shard_ledger_credit` · `shard_ledger_debit`뿐이다.
+user id · external event id · idempotency key를 로그에 남기지 않는다.
+
+### AdMob Rewarded 준비 상태 (B-5에서 쓴다)
+
+**보상 권위는 Google SSV callback 하나뿐이다.**
+client의 `onUserEarnedReward`는 UI를 갱신할 뿐, 그것만으로 조각을 지급하지 않는다.
+client가 "광고 다 봤다"고 말하는 것은 검증되지 않은 입력이다.
+
+B-5에서 만들 것:
+
+1. AdMob SSV callback endpoint (`GET`, Google가 부른다)
+2. Google public key로 **서명 검증** — 검증 실패하면 지급하지 않는다
+3. `transaction_id`를 external event id로 써서 재전송에도 한 번만 지급
+4. 하루 5회 상한 — 상한 확인도 같은 transaction 안에서
+5. 지급 reason은 `rewarded_ad` 고정
+
+지금 원장이 이미 갖춘 것: 이유 · idempotency · transaction · 상한 검증 자리.
+B-5는 "검증된 callback → `credit(rewarded_ad, transaction_id)`" 한 줄을 붙이는 일이다.
+
 ## Production
 
 **꾸미러 전용 GCP project를 쓴다.** 다른 서비스와 project를 공유하지 않는다.
@@ -434,7 +555,7 @@ FIRESTORE_EMULATOR_HOST=127.0.0.1:8090 APPLE_CLIENT_ID=com.mark77234.ggumirror .
 | scaling | min 0 / max 3, CPU 1, 512Mi, concurrency 80, timeout 30s |
 
 Firestore collection은 `ggumirror_users` · `ggumirror_auth_identities` ·
-`ggumirror_sessions` 셋뿐이다. project 단위 격리 + collection namespace 격리를 둘 다 갖는다.
+`ggumirror_sessions` · `ggumirror_shard_wallets` · `ggumirror_shard_ledger` 다섯뿐이다. project 단위 격리 + collection namespace 격리를 둘 다 갖는다.
 
 ### opicmobile-45cd5 는 우리 것이 아니다
 
@@ -513,9 +634,22 @@ Secret Manager는 만들지 않았다. 지금 필요한 secret이 하나도 없�
 - session raw token을 **저장하지 않는다.** Firestore에는 `sha256(token)`만 둔다
 - raw Apple subject를 저장 · 응답 · 로그에 쓰지 않는다. 저장은 hash key로만 한다
 
+## 비즈니스 모델 로드맵
+
+B-3 원장 위에 얹는다. **전부 server가 지급 / 차감한다.**
+
+| Phase | 내용 | reason | idempotency key |
+|---|---|---|---|
+| B-4 | 출석 — 하루 1개 | `daily_attendance` | `<userId>:<날짜(UTC)>` |
+| B-5 | AdMob rewarded — 1개, **하루 5회** | `rewarded_ad` | SSV `transaction_id` |
+| B-6 | 조각 IAP — 10 / 30 / 70 / 160 | `iap_purchase` | App Store transaction id |
+| B-7 | 꾸미러 Pass — ₩4,900 월 / ₩39,000 년 | (구독 혜택 정책 확정 후) | 구독 transaction id |
+| B-8 | 마켓 — 등록 20 조각, 조각으로 산 거울은 영구 소유 | `mirror_publish_fee` · `mirror_purchase` · `mirror_sale` | 주문 id |
+
+B-5는 **Google SSV callback만** 보상 근거로 쓴다. B-6 / B-7은 Apple 영수증 검증
+결과만 쓴다 — client의 "구매 성공했다"를 그대로 믿지 않는다.
+
 ## 다음 Phase
 
-**C-1 — Lock Screen Quick Mirror** (client).
-
-그 다음 **B-3 Shard Ledger** — server authoritative 조각 원장.
-client가 보낸 잔액을 신뢰하지 않는다.
+**B-4 — Daily Attendance.** 원장 · reason · idempotency는 이미 있다.
+필요한 것은 "하루에 한 번"이라는 규칙을 담은 전용 endpoint 하나다.

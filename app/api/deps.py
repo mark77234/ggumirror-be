@@ -16,6 +16,7 @@ from fastapi import Depends, HTTPException, Request, status
 from app.auth.apple import AppleTokenVerifier
 from app.auth.models import User, sha256_hex
 from app.auth.store import AuthStore, StoreUnavailable
+from app.shards.service import ShardLedgerService
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,15 @@ def store(request: Request) -> AuthStore:
         return request.app.state.auth_store()
     except Exception as error:  # Firestore client 생성 실패 (credential / network)
         logger.error("auth_store_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
+def shard_service(request: Request) -> ShardLedgerService:
+    """조각 원장 서비스. store와 같은 이유로 처음 쓰일 때 만든다."""
+    try:
+        return request.app.state.shard_service()
+    except Exception as error:  # Firestore client 생성 실패 (credential / network)
+        logger.error("shard_service_unavailable error=%s", type(error).__name__)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
 
 

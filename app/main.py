@@ -18,6 +18,8 @@ from fastapi import FastAPI
 from app.api import auth, health, users
 from app.auth.apple import AppleTokenVerifier
 from app.auth.store import AuthStore
+from app.shards.service import ShardLedgerService
+from app.shards.store import ShardStore
 from app.core.config import SERVICE_NAME, Settings, configure_logging, load_settings
 
 logger = logging.getLogger(__name__)
@@ -26,8 +28,9 @@ logger = logging.getLogger(__name__)
 def create_app(
     settings: Settings | None = None,
     auth_store: AuthStore | None = None,
+    shard_store: ShardStore | None = None,
 ) -> FastAPI:
-    """`auth_store`를 주면 그것을 쓴다 — test는 in-memory fake를 넣는다."""
+    """`auth_store` / `shard_store`를 주면 그것을 쓴다 — test는 in-memory fake를 넣는다."""
     settings = settings or load_settings()
     configure_logging(settings)
 
@@ -47,23 +50,36 @@ def create_app(
         return AppleTokenVerifier(client_id=settings.apple_client_id)
 
     @lru_cache(maxsize=1)
-    def store() -> AuthStore:
-        if auth_store is not None:
-            return auth_store
+    def _firestore():
         # Firestore import를 여기서 한다 — dependency가 없는 환경에서도 app은 뜬다.
         from google.cloud import firestore
-
-        from app.auth.firestore_store import FirestoreAuthStore
 
         client = firestore.Client(
             project=settings.gcp_project_id or None,
             database=settings.firestore_database,
         )
         logger.info("firestore_client_created database=%s", settings.firestore_database)
-        return FirestoreAuthStore(client)
+        return client
+
+    @lru_cache(maxsize=1)
+    def store() -> AuthStore:
+        if auth_store is not None:
+            return auth_store
+        from app.auth.firestore_store import FirestoreAuthStore
+
+        return FirestoreAuthStore(_firestore())
+
+    @lru_cache(maxsize=1)
+    def shards() -> ShardLedgerService:
+        if shard_store is not None:
+            return ShardLedgerService(shard_store)
+        from app.shards.firestore_store import FirestoreShardStore
+
+        return ShardLedgerService(FirestoreShardStore(_firestore()))
 
     app.state.apple_verifier = verifier
     app.state.auth_store = store
+    app.state.shard_service = shards
 
     app.include_router(health.router)
     app.include_router(auth.router)
