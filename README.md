@@ -45,9 +45,18 @@
 - `GET /users/me/shards` — **읽기 endpoint 하나뿐이다**
 - iOS `ShardWallet`은 서버 값을 보여주기만 한다
 
+**B-4 — Daily Attendance**
+
+- 하루 한 번 출석 → 조각 **+1** (`app/shards/attendance.py`)
+- 하루의 기준은 **server 시계의 Asia/Seoul 날짜**다. client 날짜 · timezone을 받지 않는다
+- `GET /users/me/attendance` · `POST /users/me/attendance` — **둘 다 Bearer 필수**
+- POST는 **request body를 받지 않는다.** userId · date · amount · reason을 정할 자리가 없다
+- 지급은 B-3 원장이 한다 — `credit(daily_attendance, external_event_id=<KST 날짜>)`
+- 출석 전용 collection을 만들지 않았다. "오늘 받았나"는 **원장에게 묻는다**
+
 아직 구현하지 않은 것 (의도적):
 
-daily attendance · rewarded ad SSV callback · shard IAP · 꾸미러 Pass ·
+rewarded ad SSV callback · shard IAP · 꾸미러 Pass ·
 Store API · Listing · Asset upload · actual Publish · 구매 · 소유권 · 판매자 정산 ·
 Cloud Sync · authorizationCode 교환 · Apple private key / client_secret · refresh token.
 
@@ -165,6 +174,8 @@ docker run --rm -e PORT=9000 -p 9000:9000 ggumirror-be
 | POST | `/auth/logout` | Bearer | 이 session만 revoke |
 | GET | `/users/me` | Bearer | internal user id |
 | GET | `/users/me/shards` | Bearer | 내 조각 잔액 (읽기 전용) |
+| GET | `/users/me/attendance` | Bearer | 오늘(KST) 출석을 받았는지 |
+| POST | `/users/me/attendance` | Bearer | 오늘의 출석 조각 +1. **body 없음** |
 
 이 외의 endpoint는 **없다.** `/store`, `/listings`, `/purchases`를
 미리 만들지 않는다 — Client와 contract를 확정한 뒤에 만든다.
@@ -503,13 +514,30 @@ external event id 예:
 
 | 사건 | external event id |
 |---|---|
-| 출석 | 날짜(UTC). user는 service가 붙인다 |
+| 출석 | 날짜(**KST**) `YYYY-MM-DD`. user는 service가 붙인다 |
 | AdMob rewarded | SSV callback의 `transaction_id` |
 | IAP | App Store transaction id |
 | 구매 / 판매 | 주문 id |
 
 같은 user + 같은 event = **정확히 한 번.** 다른 user + 같은 event = **서로 독립.**
 AdMob `transaction_id`가 global unique여도 원장 invariant 자체는 user-scoped로 유지된다.
+
+### "이번 호출이 실제로 적었는가" — `ShardMutationResult`
+
+`credit` / `debit`은 `ShardMutationResult(wallet, applied)`를 돌려준다.
+
+- `applied=True` — 이 호출이 원장에 줄을 적었다
+- `applied=False` — 같은 사건이 이미 있어 아무것도 적지 않았다. **실패가 아니다**
+
+`applied`는 저장소의 **원자적 쓰기 결과**다. `event_applied`로 미리 조회해서 짐작하면
+조회와 쓰기 사이에 다른 요청이 끼어들어 둘 다 "내가 적었다"고 답한다.
+
+출석(B-4)이 첫 사용자다. B-5 SSV 재전송 · B-6 IAP 재검증 · B-8 주문 재시도도
+"이번 callback이 실제로 지급했는가"를 같은 값으로 판단한다 —
+기능마다 다른 방법을 만들지 않는다.
+
+`event_applied` / `ShardLedgerService.has_event`는 **읽기 전용 상태 조회**
+(`GET /users/me/attendance`)에만 쓴다. 지급 경로에서는 쓰지 않는다.
 
 ### 검증
 
@@ -521,6 +549,107 @@ AdMob `transaction_id`가 global unique여도 원장 invariant 자체는 user-sc
 
 `shard_wallet_read` · `shard_ledger_credit` · `shard_ledger_debit`뿐이다.
 user id · external event id · idempotency key를 로그에 남기지 않는다.
+
+## Daily Attendance (B-4)
+
+하루 한 번 출석하면 **조각 +1**. 원장 · reason · idempotency는 B-3 것을 그대로 쓴다 —
+B-4가 더한 것은 "하루"의 정의와 전용 endpoint 둘뿐이다.
+
+| | |
+|---|---|
+| 보상 | **+1** (`app/shards/attendance.py`의 `DAILY_REWARD`) |
+| 한도 | **Asia/Seoul calendar day 당 1회** |
+| authority | **server**. client 날짜 · timezone · 기기 시각을 믿지 않는다 |
+| ledger reason | `daily_attendance` |
+| external event id | server KST 날짜 `YYYY-MM-DD` |
+
+### 하루의 기준 — Asia/Seoul
+
+```
+server 시각(UTC) → Asia/Seoul → YYYY-MM-DD
+```
+
+UTC 2026-08-13 15:01 = **KST 2026-08-14 00:01** → 출석일은 `2026-08-14`다.
+UTC로 계산하면 한국 사용자가 자정 직후에 어제 몫을 다시 받거나 오늘 몫을 못 받는다.
+
+`attendance_date(now=None)`는 test가 시간을 고정할 수 있도록 `now`를 받는다.
+production은 언제나 인자 없이 부른다 = server 시계. **client가 시각을 넘기는 경로는 없다.**
+
+**정책은 Asia/Seoul calendar day**이고, 현재 구현은 **server-authoritative UTC+09:00
+고정 offset**(`timezone(timedelta(hours=9))`)이다. 한국의 현행 civil time이 UTC+09:00
+고정이라 두 값이 일치하고, container에 tzdata가 들어 있는지에 의존하지 않는다.
+
+한국의 timezone rule이 바뀌면(예: DST 도입) `ZoneInfo("Asia/Seoul")`로 바꾼다 —
+날짜 계산이 `attendance_date()` 한 함수에만 있으므로 그 한 줄이 전부다.
+그때는 image에 tzdata가 있는지 함께 확인해야 한다.
+
+`now`가 timezone-naive면 **거부한다.** 조용히 UTC로 가정하면 하루가 통째로 어긋난다.
+
+### API
+
+```
+GET /users/me/attendance     → {"attendanceDate":"2026-08-16","claimed":false}
+POST /users/me/attendance    → {"attendanceDate":"2026-08-16","claimed":true,"reward":1,"balance":1}
+```
+
+같은 날 두 번째 POST:
+
+```
+{"attendanceDate":"2026-08-16","claimed":false,"reward":0,"balance":1}
+```
+
+**중복 출석은 오류가 아니라 idempotent success다.** 400으로 만들면 client가
+"네트워크 실패 후 재시도"와 "정말 두 번 눌렀다"를 구분해야 한다. 재시도는 정상 동작이다.
+`balance`는 어느 경우에나 서버 원장이 계산한 현재 잔액이라, 응답을 잃어버린 client가
+다시 불러도 잔액이 부풀지 않고 오히려 제자리를 찾는다.
+
+#### `claimed`의 정확한 뜻
+
+| | POST | GET |
+|---|---|---|
+| `claimed: true` | **이 요청이 원장에 줄을 적고 reward를 지급했다** | 오늘 이미 받았다 |
+| `claimed: false` | 같은 사건이 이미 적용돼 **이 요청은 지급하지 않았다** | 아직 받지 않았다 |
+
+POST의 `claimed`는 **`ShardMutationResult.applied` 그대로**다.
+같은 사용자·같은 날짜로 10개가 동시에 들어오면 HTTP는 10개 모두 200이고,
+`claimed=true`는 **정확히 하나**, 나머지 9개는 `claimed=false, reward=0`이다.
+`balance`는 10개 전부 최종 서버 잔액을 말한다.
+
+지급 여부를 `has_event`로 **미리 조회해서 정하지 않는다.** 조회와 쓰기 사이에
+다른 요청이 끼어들면 둘 다 "내가 지급했다"고 답한다.
+
+POST는 **request body를 받지 않는다.** `userId` · `date` · `amount` · `reason`을 보내도
+받는 자리가 없어 아무 영향이 없다. 누구인지는 Bearer session, 며칠인지는 server 시계,
+얼마인지는 서버 상수에서 온다. 둘 다 인증 없이 부르면 401이다.
+
+### 왜 출석 collection이 없나
+
+"오늘 받았나"는 **원장에게 묻는다** (`ShardLedgerService.has_event`).
+ledger 문서 ID가 `sha256(user | daily_attendance | KST 날짜)`이므로 조회 하나로 끝난다.
+
+같은 경제 사실의 authority를 두 곳에 두지 않는다. 출석 상태를 따로 저장하면
+언젠가 원장과 다른 답을 하고, 그때 어느 쪽이 진실인지 아무도 모른다.
+
+### 동시성 — 경제도 응답도 정확하다
+
+같은 사용자가 같은 날짜로 10개를 동시에 보내면:
+
+| | |
+|---|---|
+| HTTP 200 | 10 |
+| `claimed=true` / `reward=1` | **정확히 1** |
+| `claimed=false` / `reward=0` | **정확히 9** |
+| ledger entry | 1 |
+| balance · lifetimeEarned | +1 |
+
+"이번 요청이 적었는가"는 **원장 쓰기 transaction의 결과**에서 나온다
+(`ShardStore.apply` → `ShardMutationResult.applied`).
+`transaction.create(<idempotency 문서>)`가 성공한 쪽만 `applied=True`이고,
+중복 분기로 들어간 쪽은 `False`다.
+
+Firestore가 commit 시점에 `AlreadyExists`를 돌려주는 경우(우리가 읽은 뒤 상대가 먼저
+commit) 역시 **실패가 아니다.** 원장에 이미 그 줄이 있다는 뜻이므로 transaction을
+한 번 다시 돌려 중복 분기로 들어간다 — 500이 아니라 `claimed=false`가 정답이다.
 
 ### AdMob Rewarded 준비 상태 (B-5에서 쓴다)
 
@@ -640,7 +769,7 @@ B-3 원장 위에 얹는다. **전부 server가 지급 / 차감한다.**
 
 | Phase | 내용 | reason | idempotency key |
 |---|---|---|---|
-| B-4 | 출석 — 하루 1개 | `daily_attendance` | `<userId>:<날짜(UTC)>` |
+| B-4 ✅ | 출석 — 하루 1개 | `daily_attendance` | user + reason + **KST 날짜** |
 | B-5 | AdMob rewarded — 1개, **하루 5회** | `rewarded_ad` | SSV `transaction_id` |
 | B-6 | 조각 IAP — 10 / 30 / 70 / 160 | `iap_purchase` | App Store transaction id |
 | B-7 | 꾸미러 Pass — ₩4,900 월 / ₩39,000 년 | (구독 혜택 정책 확정 후) | 구독 transaction id |
@@ -651,5 +780,6 @@ B-5는 **Google SSV callback만** 보상 근거로 쓴다. B-6 / B-7은 Apple �
 
 ## 다음 Phase
 
-**B-4 — Daily Attendance.** 원장 · reason · idempotency는 이미 있다.
-필요한 것은 "하루에 한 번"이라는 규칙을 담은 전용 endpoint 하나다.
+**B-5 — AdMob Rewarded + SSV.** 전용 endpoint로 조각을 지급하는 패턴은 B-4에서 확인됐다.
+B-5가 더할 것은 Google SSV **서명 검증**과 하루 5회 상한이고,
+상한 확인은 지급과 같은 transaction 안에서 해야 한다.

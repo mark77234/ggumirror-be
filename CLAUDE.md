@@ -20,9 +20,10 @@ Backend repository for 꾸미러.
 - purchase / ownership
 - seller shard settlement
 
-## Current Implementation (Phase B-3 완료)
+## Current Implementation (Phase B-4 완료)
 
-FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth + server-authoritative 조각 원장.
+FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth +
+server-authoritative 조각 원장 + 하루 한 번 출석.
 
 ```
 app/main.py          create_app()
@@ -34,18 +35,20 @@ app/auth/models.py   User, Session, token/hash 정책
 app/auth/store.py    AuthStore protocol + in-memory
 app/auth/firestore_store.py  Firestore 구현
 app/api/auth.py      POST /auth/apple, POST /auth/logout
-app/api/users.py     GET /users/me, GET /users/me/shards
+app/api/users.py     GET /users/me, GET /users/me/shards, GET·POST /users/me/attendance
 app/api/deps.py      Bearer → current user
 app/shards/models.py ShardWallet, ShardLedgerEntry, ShardReason, idempotency_hash
 app/shards/store.py  ShardStore protocol + in-memory
 app/shards/firestore_store.py  Firestore transaction 구현
 app/shards/service.py  ShardLedgerService
+app/shards/attendance.py  KST 날짜 규칙 + 출석 지급
 app/core/config.py   환경변수 + logging
 tests/               pytest (Apple · Firestore 호출 없음)
 ```
 
 API는 health / auth / users뿐이다. store · listing · purchase는 없다.
-조각은 **읽기 endpoint 하나**(`GET /users/me/shards`)만 있다.
+조각을 움직이는 통로는 **출석 하나**(`POST /users/me/attendance`)뿐이고,
+그것도 client가 값을 정할 수 없는 전용 endpoint다.
 
 Python 3.13 고정 (local · Docker · CI 동일).
 
@@ -109,6 +112,60 @@ server가 취소할 수 있어야 한다.
 지급 / 차감은 **각자의 이유를 검증하는 전용 endpoint**로만 생긴다 —
 출석(하루 1회) · AdMob SSV callback(서명 검증) · IAP(영수증 검증) · 구매 · 등록.
 `tests/test_shards.py::test_no_generic_mutation_endpoint`가 고정한다.
+
+### Daily Attendance (B-4) — 하루의 기준은 server KST
+
+출석은 **하루 한 번 +1**이고, "하루"의 정의가 이 기능의 전부다.
+
+- 날짜는 **server 시계 → Asia/Seoul → `YYYY-MM-DD`**다.
+  client 날짜 · client timezone · 기기 시각 · UserDefaults · 앱 재설치 여부를
+  근거로 쓰지 않는다. client가 시각을 넘기는 경로 자체가 없다
+- `attendance_date(now=None)`의 `now`는 **test 전용**이다. production은 인자 없이 부른다.
+  timezone-naive datetime은 거부한다 — 조용히 UTC로 가정하면 하루가 통째로 어긋난다
+- **정책은 Asia/Seoul calendar day**, 현재 구현은 server-authoritative **UTC+09:00 고정
+  offset**이다. 한국 현행 civil time이 UTC+09:00 고정이라 결과가 같고, container tzdata에
+  의존하지 않는다. 한국 timezone rule이 바뀌면 `ZoneInfo("Asia/Seoul")`로 옮긴다 —
+  날짜 계산이 `attendance_date()` 한 곳에만 있어 그 한 줄이 전부다
+- 지급은 **B-3 원장만** 한다 —
+  `credit(amount=1, reason=daily_attendance, external_event_id=<KST 날짜>)`.
+  user scope는 service가 붙이므로 날짜만 넘긴다
+- **출석 전용 collection을 만들지 않는다.** 상태 조회(GET)는 `has_event`로 원장에 묻는다.
+  같은 경제 사실의 authority가 두 곳이 되면 언젠가 서로 다른 답을 한다
+- POST는 **body를 받지 않는다.** `userId` · `date` · `amount` · `reason`을 받는 자리를
+  만들지 않는다. 하나라도 열면 client가 보상을 정하는 구조가 된다
+- 중복 출석은 **오류가 아니라 idempotent success**다 (`claimed=false, reward=0`).
+  400으로 만들면 client가 재시도와 중복 tap을 구분해야 하는데, 재시도는 정상 동작이다
+- 응답의 `balance`는 어느 경로에서나 **원장이 계산한 현재 잔액**이다.
+  응답을 잃은 client가 다시 불러도 잔액이 부풀지 않고 제자리를 찾는다
+- streak · 7일 보너스 · 달력 · 지난 출석 복구 · 알림은 **없다.** 딱 하루 한 번 +1이다
+
+#### `claimed` semantics (API 계약)
+
+| | 뜻 |
+|---|---|
+| POST `claimed=true` | **이 요청이 원장에 줄을 적고 reward를 지급했다** |
+| POST `claimed=false` | 같은 event가 이미 적용돼 **이 요청은 지급하지 않았다** |
+| GET `claimed` | 오늘 이미 받았는가 |
+
+동시 10요청 → HTTP 200 × 10, `claimed=true`는 **정확히 1개**, 나머지 9개는 `reward=0`.
+
+### 지급 여부는 transaction 결과에서만 나온다 (영구 규칙)
+
+**`has_event` → `credit` 같은 check-then-act로 "지급했는가"를 정하지 않는다.**
+조회와 쓰기 사이에 다른 요청이 끼어들면 둘 다 "내가 지급했다"고 답한다 —
+잔액은 맞는데 응답이 거짓말을 하고, client는 받지도 않은 조각을 받았다고 표시한다.
+
+- `ShardStore.apply`는 `(wallet, entry, applied)`를 돌려준다.
+  `applied`는 **원자적 쓰기의 결과 그 자체**다
+- `ShardLedgerService.credit` / `debit`은 `ShardMutationResult(wallet, applied)`를 돌려준다.
+  기능마다 다른 판단 방법을 만들지 않는다 — B-5 SSV 재전송 · B-6 IAP 재검증 ·
+  B-8 주문 재시도가 전부 이 값을 쓴다
+- Firestore가 commit에서 `AlreadyExists`를 주는 것도 **실패가 아니다.**
+  원장에 이미 있다는 뜻이므로 transaction을 한 번 다시 돌려 중복 분기로 들어간다.
+  500으로 올리지 않는다
+- `has_event`는 **읽기 전용 상태 조회**(GET)에만 쓴다. 지급 경로에서는 쓰지 않는다.
+  `tests/test_attendance.py::test_claim_does_not_check_before_acting`과
+  `test_slow_ledger_still_has_one_winner`가 이걸 고정한다
 
 ### AdMob Rewarded = SSV only
 
@@ -239,7 +296,7 @@ B-3 원장 위에 얹는다. 전부 server가 지급 / 차감한다.
 
 | Phase | 내용 | reason |
 |---|---|---|
-| B-4 | 출석 — 하루 1개 | `daily_attendance` |
+| B-4 ✅ | 출석 — 하루 1개 (Asia/Seoul day) | `daily_attendance` |
 | B-5 | AdMob rewarded — 1개, 하루 5회, **SSV 필수** | `rewarded_ad` |
 | B-6 | 조각 IAP — 10 / 30 / 70 / 160 | `iap_purchase` |
 | B-7 | 꾸미러 Pass — ₩4,900 월 / ₩39,000 년 | 정책 확정 후 |
@@ -247,8 +304,9 @@ B-3 원장 위에 얹는다. 전부 server가 지급 / 차감한다.
 
 ## Next Phase
 
-**B-4 — Daily Attendance.** 원장 · reason · idempotency는 이미 있다.
-"하루에 한 번"이라는 규칙을 담은 전용 endpoint 하나만 추가한다.
+**B-5 — AdMob Rewarded + SSV.** 원장 · reason · idempotency · 전용 endpoint 패턴은
+B-4에서 이미 확인됐다. B-5가 더할 것은 Google SSV 서명 검증과 하루 5회 상한이다.
+상한 확인은 지급과 **같은 transaction 안에서** 해야 한다.
 
 Cloud Run 자동 배포 workflow는 GCP project · service account ·
 Workload Identity가 확정된 뒤에 만든다.

@@ -84,6 +84,26 @@ class ShardLedgerEntry:
         return str(uuid4())
 
 
+@dataclass(frozen=True)
+class ShardMutationResult:
+    """조각을 움직인 결과.
+
+    `applied`는 **이번 호출이 실제로 원장에 줄을 적었는가**다.
+    이미 있던 사건이면 `False`이고, 그때도 `wallet`은 정상적인 현재 잔액이다
+    (실패가 아니다 — 같은 사건이 두 번 도착하는 것은 정상 동작이다).
+
+    이 값은 **추측하지 않는다.** "먼저 조회해서 없으면 쓴다"로 판단하면
+    조회와 쓰기 사이에 다른 요청이 끼어들어 둘 다 "내가 적었다"고 답한다.
+    `applied`는 오직 **원장 쓰기를 시도한 그 transaction의 결과**에서 나온다.
+
+    출석(B-4)이 첫 사용자다. 광고 SSV(B-5) · IAP(B-6) · 구매(B-8)도
+    "이번 callback이 실제 지급했는가"를 같은 방식으로 알아야 한다.
+    """
+
+    wallet: ShardWallet
+    applied: bool
+
+
 def idempotency_hash(user_id: str, reason: ShardReason, external_event_id: str) -> str:
     """같은 사용자의 같은 사건인지 판단하는 열쇠.
 

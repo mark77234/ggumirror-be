@@ -55,19 +55,19 @@ def test_missing_wallet_is_zero(shards: ShardLedgerService, store: InMemoryShard
 
 
 def test_first_credit_creates_wallet(shards: ShardLedgerService, store: InMemoryShardStore):
-    wallet = shards.credit(USER, 1, ShardReason.DAILY_ATTENDANCE)
-    assert wallet.balance == 1
+    result = shards.credit(USER, 1, ShardReason.DAILY_ATTENDANCE)
+    assert result.wallet.balance == 1
     assert USER in store.wallets
 
 
 def test_credit_adds(shards: ShardLedgerService):
-    assert shards.credit(USER, 1, ShardReason.DAILY_ATTENDANCE).balance == 1
-    assert shards.credit(USER, 4, ShardReason.IAP_PURCHASE).balance == 5
+    assert shards.credit(USER, 1, ShardReason.DAILY_ATTENDANCE).wallet.balance == 1
+    assert shards.credit(USER, 4, ShardReason.IAP_PURCHASE).wallet.balance == 5
 
 
 def test_debit_subtracts(shards: ShardLedgerService):
     shards.credit(USER, 20, ShardReason.IAP_PURCHASE)
-    assert shards.debit(USER, 20, ShardReason.MIRROR_PUBLISH_FEE).balance == 0
+    assert shards.debit(USER, 20, ShardReason.MIRROR_PUBLISH_FEE).wallet.balance == 0
 
 
 def test_insufficient_debit_changes_nothing(shards: ShardLedgerService, store: InMemoryShardStore):
@@ -89,8 +89,10 @@ def test_same_event_applies_once(shards: ShardLedgerService, store: InMemoryShar
     first = shards.credit(USER, 1, ShardReason.REWARDED_AD, external_event_id="ssv-txn-1")
     second = shards.credit(USER, 1, ShardReason.REWARDED_AD, external_event_id="ssv-txn-1")
 
-    assert first.balance == 1
-    assert second.balance == 1, "같은 SSV transaction이 두 번 반영됐다"
+    assert first.wallet.balance == 1
+    assert first.applied is True
+    assert second.wallet.balance == 1, "같은 SSV transaction이 두 번 반영됐다"
+    assert second.applied is False, "재전송된 callback이 지급했다고 답했다"
     assert len(store.entries) == 1
 
 
@@ -141,13 +143,13 @@ def test_same_event_is_scoped_per_user(shards: ShardLedgerService, store: InMemo
     date = "2026-08-12"
 
     # A. userA 첫 출석 → 지급
-    assert shards.credit(USER, 1, ShardReason.DAILY_ATTENDANCE, external_event_id=date).balance == 1
+    assert shards.credit(USER, 1, ShardReason.DAILY_ATTENDANCE, external_event_id=date).wallet.balance == 1
 
     # B. userA 같은 날 다시 → 중복, 두 번 지급되지 않는다
-    assert shards.credit(USER, 1, ShardReason.DAILY_ATTENDANCE, external_event_id=date).balance == 1
+    assert shards.credit(USER, 1, ShardReason.DAILY_ATTENDANCE, external_event_id=date).wallet.balance == 1
 
     # C. userB 같은 날 → 남의 사건이 아니다. 정상 지급
-    assert shards.credit(OTHER, 1, ShardReason.DAILY_ATTENDANCE, external_event_id=date).balance == 1
+    assert shards.credit(OTHER, 1, ShardReason.DAILY_ATTENDANCE, external_event_id=date).wallet.balance == 1
 
     assert shards.wallet(USER).balance == 1
     assert shards.wallet(OTHER).balance == 1
@@ -262,21 +264,14 @@ def test_balance_stays_integer(shards: ShardLedgerService):
 
 
 # MARK: - 동시성
+#
+# `InMemoryShardStore.apply`가 lock 안에서 통째로 일어난다 —
+# Firestore transaction이 주는 원자성과 같은 의미다. test가 직렬화 장치를 따로 끼우지 않는다.
 
 
 def test_concurrent_credits_do_not_lose_updates(store: InMemoryShardStore):
     """+1이 여러 번 동시에 들어와도 하나도 사라지지 않는다."""
     shards = ShardLedgerService(store)
-    lock = threading.Lock()
-    original = store.apply
-
-    def serialized(*args, **kwargs):
-        # Firestore transaction이 충돌 시 직렬화하는 것과 같은 의미.
-        with lock:
-            return original(*args, **kwargs)
-
-    store.apply = serialized  # type: ignore[method-assign]
-
     threads = [
         threading.Thread(
             target=lambda index=index: shards.credit(
@@ -299,15 +294,6 @@ def test_concurrent_debits_cannot_go_negative(store: InMemoryShardStore):
     shards = ShardLedgerService(store)
     shards.credit(USER, 20, ShardReason.IAP_PURCHASE)
 
-    lock = threading.Lock()
-    original = store.apply
-
-    def serialized(*args, **kwargs):
-        with lock:
-            return original(*args, **kwargs)
-
-    store.apply = serialized  # type: ignore[method-assign]
-
     failures: list[Exception] = []
 
     def spend(index: int) -> None:
@@ -329,15 +315,6 @@ def test_concurrent_debits_cannot_go_negative(store: InMemoryShardStore):
 def test_same_event_concurrently_applies_once(store: InMemoryShardStore):
     """같은 SSV transaction이 동시에 두 번 도착해도 한 번만 반영된다."""
     shards = ShardLedgerService(store)
-    lock = threading.Lock()
-    original = store.apply
-
-    def serialized(*args, **kwargs):
-        with lock:
-            return original(*args, **kwargs)
-
-    store.apply = serialized  # type: ignore[method-assign]
-
     threads = [
         threading.Thread(
             target=lambda: shards.credit(USER, 1, ShardReason.REWARDED_AD, external_event_id="ssv-dup")
@@ -350,6 +327,32 @@ def test_same_event_concurrently_applies_once(store: InMemoryShardStore):
         thread.join()
 
     assert shards.wallet(USER).balance == 1
+    assert len(store.entries) == 1
+
+
+def test_concurrent_same_event_has_exactly_one_applied(store: InMemoryShardStore):
+    """같은 사건이 동시에 여러 번 와도 **"내가 적었다"고 답하는 것은 하나뿐이다.**
+
+    출석(B-4)만의 규칙이 아니다 — 광고 SSV 재전송 · 결제 재시도도 이 답을 그대로 쓴다.
+    """
+    shards = ShardLedgerService(store)
+    results: list = [None] * 5
+    barrier = threading.Barrier(5)
+
+    def run(index: int) -> None:
+        barrier.wait()
+        results[index] = shards.credit(
+            USER, 1, ShardReason.REWARDED_AD, external_event_id="ssv-same"
+        )
+
+    threads = [threading.Thread(target=run, args=(index,)) for index in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sum(1 for r in results if r.applied) == 1
+    assert all(r.wallet.balance == 1 for r in results)
     assert len(store.entries) == 1
 
 

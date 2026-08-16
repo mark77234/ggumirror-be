@@ -47,6 +47,13 @@ class FirestoreShardStore:
             return ShardWallet.empty(user_id)
         return _wallet(user_id, snapshot.to_dict() or {})
 
+    def event_applied(self, idempotency_key_hash: str) -> bool:
+        """원장 문서 하나가 있는지만 본다. **문서 ID가 곧 사건 식별자**라서 조회 하나로 끝난다."""
+        try:
+            return self._db.collection(LEDGER).document(idempotency_key_hash).get().exists
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("ledger_event_read", error) from error
+
     # MARK: - 쓰기
 
     def apply(
@@ -55,7 +62,7 @@ class FirestoreShardStore:
         delta: int,
         reason: ShardReason,
         idempotency_key_hash: str | None,
-    ) -> tuple[ShardWallet, ShardLedgerEntry]:
+    ) -> tuple[ShardWallet, ShardLedgerEntry, bool]:
         wallet_ref = self._db.collection(WALLETS).document(user_id)
         # 같은 사건을 두 번 적지 않기 위한 자리표. **document id가 곧 열쇠다** —
         # 이미 있으면 그 자리에 쓰지 못하므로 중복이 구조적으로 막힌다.
@@ -67,6 +74,11 @@ class FirestoreShardStore:
 
         @firestore.transactional
         def run(transaction: firestore.Transaction) -> tuple[ShardWallet, ShardLedgerEntry, bool]:
+            """세 번째 값은 **이번 transaction이 실제로 원장에 적었는가**다.
+
+            transaction 밖에서 미리 조회해 짐작하지 않는다. 그러면 동시에 들어온
+            두 요청이 둘 다 "없더라, 내가 적었다"고 답한다 — 잔액은 맞지만 응답이 거짓말이 된다.
+            """
             # 읽기는 쓰기보다 먼저. Firestore transaction의 규칙이다.
             claim = claim_ref.get(transaction=transaction) if idempotency_key_hash else None
             if claim is not None and claim.exists:
@@ -78,7 +90,7 @@ class FirestoreShardStore:
                     if wallet_snapshot.exists
                     else ShardWallet.empty(user_id)
                 )
-                return current, existing, True
+                return current, existing, False
 
             snapshot = wallet_ref.get(transaction=transaction)
             current = (
@@ -112,24 +124,31 @@ class FirestoreShardStore:
             )
 
             # 원장 먼저 — 있으면 안 되는 자리에 쓰는 것이므로 create로 막는다.
+            # 여기까지 왔다는 것은 이 transaction이 그 줄의 **작성자**라는 뜻이다.
             transaction.create(claim_ref, _entry_document(entry))
             transaction.set(wallet_ref, _wallet_document(wallet))
-            return wallet, entry, False
+            return wallet, entry, True
 
         try:
-            wallet, entry, duplicate = run(self._db.transaction())
+            wallet, entry, applied = run(self._db.transaction())
         except InsufficientShards:
             raise
-        except gcp_exceptions.AlreadyExists as error:
-            # 같은 사건이 동시에 두 번 들어왔다. 한쪽만 남는 것이 정상이다.
+        except gcp_exceptions.AlreadyExists:
+            # 같은 사건이 동시에 두 번 들어왔고, 우리가 읽은 뒤 상대가 먼저 commit했다.
+            # **실패가 아니다** — 원장에 이미 그 줄이 있다는 뜻이고, 그것이 정확히
+            # "이번 요청은 적지 않았다"는 답이다. 다시 돌리면 중복 분기로 들어가
+            # 상대가 만든 줄과 그 시점의 잔액을 일관되게 읽는다.
             logger.info("shard_ledger_duplicate_ignored reason=%s", reason.value)
-            raise StoreUnavailable("ledger_conflict") from error
+            try:
+                wallet, entry, applied = run(self._db.transaction())
+            except gcp_exceptions.GoogleAPIError as error:
+                raise self._unavailable("ledger_apply_retry", error) from error
         except gcp_exceptions.GoogleAPIError as error:
             raise self._unavailable("ledger_apply", error) from error
 
-        if duplicate:
+        if not applied:
             logger.info("shard_ledger_duplicate_ignored reason=%s", reason.value)
-        return wallet, entry
+        return wallet, entry, applied
 
     # MARK: - 내부
 

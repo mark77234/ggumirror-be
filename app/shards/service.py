@@ -22,7 +22,7 @@ import logging
 from app.shards.models import (
     MAX_DELTA,
     InvalidShardAmount,
-    ShardLedgerEntry,
+    ShardMutationResult,
     ShardReason,
     ShardWallet,
     idempotency_hash,
@@ -43,6 +43,14 @@ class ShardLedgerService:
         logger.info("shard_wallet_read balance=%d", wallet.balance)
         return wallet
 
+    def has_event(self, user_id: str, reason: ShardReason, external_event_id: str) -> bool:
+        """이 사건이 이미 반영됐는가. **원장이 답한다.**
+
+        출석 상태 조회(B-4)처럼 지급 없이 물어보기만 할 때 쓴다. 열쇠를 만드는 방식은
+        `_apply`와 **같은 함수 하나**다 — 두 곳에서 따로 만들면 언젠가 어긋난다.
+        """
+        return self._store.event_applied(idempotency_hash(user_id, reason, external_event_id))
+
     # MARK: - 쓰기
 
     def credit(
@@ -51,12 +59,15 @@ class ShardLedgerService:
         amount: int,
         reason: ShardReason,
         external_event_id: str | None = None,
-    ) -> ShardWallet:
+    ) -> ShardMutationResult:
         """조각을 준다.
 
         `external_event_id`는 **그 사건을 유일하게 가리키는 값**이다
         (AdMob SSV transaction_id · StoreKit transaction id · 출석 날짜 …).
         같은 값이 다시 오면 **한 번만** 반영된다 — 재시도와 중복 callback이 잔액을 부풀리지 않는다.
+
+        결과의 `applied`가 **이번 호출이 실제로 지급했는가**다. 재시도로 들어온 요청에
+        "지급했다"고 답하지 않으려면 이 값을 쓴다 — 따로 조회해서 짐작하지 않는다.
         """
         return self._apply(user_id, self._checked(amount), reason, external_event_id)
 
@@ -66,7 +77,7 @@ class ShardLedgerService:
         amount: int,
         reason: ShardReason,
         external_event_id: str | None = None,
-    ) -> ShardWallet:
+    ) -> ShardMutationResult:
         """조각을 쓴다. 잔액이 모자라면 `InsufficientShards` — 아무것도 기록되지 않는다."""
         return self._apply(user_id, -self._checked(amount), reason, external_event_id)
 
@@ -78,16 +89,20 @@ class ShardLedgerService:
         delta: int,
         reason: ShardReason,
         external_event_id: str | None,
-    ) -> ShardWallet:
+    ) -> ShardMutationResult:
         # user scope는 **service가 강제한다.** 호출부가 event id에 user id를 넣어주기를
         # 기대하면, 잊은 곳 하나가 사용자끼리 같은 문서를 겨루게 만든다.
         key = idempotency_hash(user_id, reason, external_event_id) if external_event_id else None
-        wallet, entry = self._store.apply(user_id, delta, reason, key)
+        # `applied`는 저장소의 원자적 쓰기 결과다. 여기서 다시 판단하지 않는다.
+        wallet, entry, applied = self._store.apply(user_id, delta, reason, key)
 
         event = "shard_ledger_credit" if delta > 0 else "shard_ledger_debit"
         # 값은 남기되 누구인지 · 어떤 외부 id인지는 남기지 않는다.
-        logger.info("%s reason=%s delta=%d balance=%d", event, reason.value, entry.delta, wallet.balance)
-        return wallet
+        logger.info(
+            "%s reason=%s delta=%d balance=%d applied=%s",
+            event, reason.value, entry.delta, wallet.balance, applied,
+        )
+        return ShardMutationResult(wallet=wallet, applied=applied)
 
     @staticmethod
     def _checked(amount: int) -> int:
