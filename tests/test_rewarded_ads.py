@@ -1009,3 +1009,83 @@ def test_redaction_leaves_other_paths_alone():
     )
     RedactSensitiveQuery().filter(record)
     assert record.getMessage() == "/users/me/shards?userId=someone"
+
+
+# MARK: - ad unit 진단 로그 (설정값을 확정하기 위한 최소 노출)
+
+
+def test_unconfigured_logs_observed_ad_unit(shard_store, contexts, google, caplog):
+    """설정 전이라도 **검증된 ad_unit 값은** 한 번 봐야 채울 수 있다.
+
+    이 로그가 `ADMOB_SSV_EXPECTED_AD_UNIT`을 확정하는 유일한 근거다 —
+    platform request log는 exclusion으로 저장되지 않기 때문이다.
+    """
+    import logging
+
+    ads = RewardedAdService(
+        shards=ShardLedgerService(shard_store),
+        contexts=contexts,
+        keys=AdMobKeyProvider(fetch=lambda: google.document),
+        config=RewardedAdConfig(ad_unit="", reward_item=""),  # 미설정 = 현재 production 상태
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(RewardedAdError) as error:
+            call(ads, google.callback_query(content_for(ad_unit="1234567890")))
+
+    assert error.value.reason is RewardedAdReason.NOT_CONFIGURED
+    assert "observed_ad_unit=1234567890" in caplog.text
+    assert shard_store.entries == []
+
+
+def test_unexpected_ad_unit_logs_the_observed_value(ads, google, shard_store, caplog):
+    import logging
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(RewardedAdError):
+            call(ads, google.callback_query(content_for(ad_unit="9999999999")))
+
+    assert "observed_ad_unit=9999999999" in caplog.text
+    assert shard_store.entries == []
+
+
+def test_invalid_signature_never_logs_an_ad_unit(ads, google, shard_store, caplog):
+    """**서명이 틀리면 ad_unit을 읽지도 남기지도 않는다.**
+
+    검증 전 값을 로그에 남기면, 아무나 우리 로그에 원하는 문자열을 적을 수 있다.
+    """
+    import logging
+
+    content = content_for(ad_unit="ATTACKER_CONTROLLED")
+    forged = f"{content}&signature=AAAA&key_id={google.key_id}"
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(RewardedAdError):
+            call(ads, forged)
+
+    assert "observed_ad_unit" not in caplog.text
+    assert "ATTACKER_CONTROLLED" not in caplog.text
+    assert shard_store.entries == []
+
+
+def test_diagnostic_log_never_leaks_credentials(shard_store, contexts, google, caplog):
+    """ad_unit 하나만 늘었을 뿐, 나머지는 그대로 로그에 없다."""
+    import logging
+
+    ads = RewardedAdService(
+        shards=ShardLedgerService(shard_store),
+        contexts=contexts,
+        keys=AdMobKeyProvider(fetch=lambda: google.document),
+        config=RewardedAdConfig(ad_unit="", reward_item=""),
+    )
+    query = google.callback_query(
+        content_for(ad_unit="1234567890", custom_data="secret-context", transaction_id="secret-txn")
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(RewardedAdError):
+            call(ads, query)
+
+    assert "observed_ad_unit=1234567890" in caplog.text
+    for secret in ("secret-context", "secret-txn", "signature=", "custom_data"):
+        assert secret not in caplog.text, f"로그에 {secret}이 새어 나갔다"

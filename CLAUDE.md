@@ -234,6 +234,21 @@ signed stateless token을 쓰지 않은 이유: **새 server secret이 필요하
 `RedactSensitiveQuery`(`app/core/config.py`)가 `/admob/rewarded/ssv?<redacted>`로 바꾼다.
 query에 credential이 실려 오는 경로를 새로 만들면 `SENSITIVE_QUERY_PATHS`에 추가한다.
 
+### SSV query는 두 곳에서 가린다 (영구 규칙)
+
+`RedactSensitiveQuery`는 **우리 process 로그만** 가린다. Cloud Run이 따로 남기는
+**platform request log**(`run.googleapis.com/requests`)의 `httpRequest.requestUrl`에는
+query가 통째로 들어가고, 여기에는 Google signature와 reward context가 있다.
+application filter로는 닿지 않는다 — canary로 실제 확인했다.
+
+- `ggumirror-prod` `_Default` sink에 exclusion **`exclude-ggumirror-admob-ssv-request-log`**
+  가 있고, `ggumirror-api`의 `/admob/rewarded/ssv` request log만 저장에서 제외한다
+- **다른 경로 request log는 유지한다.** `/health` · `/auth/*` · `/users/me/*` 그대로
+- 앱 stdout의 `?<redacted>` 줄과 `admob_ssv_*` 이벤트도 그대로 남는다
+- query로 credential을 받는 endpoint를 새로 만들면 `SENSITIVE_QUERY_PATHS`와
+  이 exclusion **양쪽**에 추가한다. 한쪽만 하면 반쪽만 가려진다
+- exclusion 반영에는 몇 분 걸린다. 직후 canary는 아직 저장되는 것처럼 보인다
+
 ## Structure Rules
 
 기능이 생기기 전에 layer를 만들지 않는다. 다음을 미리 추가하지 않는다:

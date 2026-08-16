@@ -862,6 +862,39 @@ B-5에서 만들 것:
 지금 원장이 이미 갖춘 것: 이유 · idempotency · transaction · 상한 검증 자리.
 B-5는 "검증된 callback → `credit(rewarded_ad, transaction_id)`" 한 줄을 붙이는 일이다.
 
+### Cloud Run request log는 앱 로그와 별개다 (운영 설정)
+
+`app/core/config.py`의 `RedactSensitiveQuery`는 **우리 process가 찍는 로그만** 가린다.
+Cloud Run은 그것과 별개로 **platform request log**(`run.googleapis.com/requests`)를 남기고,
+거기에는 `httpRequest.requestUrl`이 **query까지 통째로** 들어간다.
+SSV callback query에는 Google signature와 우리가 발급한 reward context가 있으므로
+application logging filter만으로는 보호되지 않는다 — canary 요청으로 실제 확인했다.
+
+그래서 `ggumirror-prod`의 `_Default` sink에 **endpoint 하나만** 제외하는 exclusion을 뒀다.
+
+| | |
+|---|---|
+| name | `exclude-ggumirror-admob-ssv-request-log` |
+| 대상 | `ggumirror-api`의 `run.googleapis.com/requests` 중 `/admob/rewarded/ssv` |
+| 유지 | `/health` · `/auth/*` · `/users/me/*` 등 **다른 request log는 그대로 남는다** |
+
+```
+resource.type="cloud_run_revision"
+AND resource.labels.service_name="ggumirror-api"
+AND log_id("run.googleapis.com/requests")
+AND httpRequest.requestUrl=~"^https://[^/]+/admob/rewarded/ssv(\?|$)"
+```
+
+**앱 stdout log는 그대로 남는다** — `GET /admob/rewarded/ssv?<redacted>`와
+`admob_ssv_*` 이벤트는 계속 보이므로 운영에 필요한 정보를 잃지 않는다.
+없어지는 것은 query가 들어간 platform request log 항목 하나뿐이다.
+
+exclusion은 **즉시 적용되지 않는다** — 반영까지 몇 분 걸린다.
+바꾼 직후 canary로 확인하면 아직 저장되는 것처럼 보인다.
+
+새 endpoint가 credential을 query로 받게 되면 `SENSITIVE_QUERY_PATHS`와
+이 exclusion **양쪽**에 추가해야 한다. 한쪽만 하면 반쪽만 가려진다.
+
 ## Production
 
 **꾸미러 전용 GCP project를 쓴다.** 다른 서비스와 project를 공유하지 않는다.

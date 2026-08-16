@@ -102,14 +102,23 @@ class RewardedAdService:
     # MARK: - 내부
 
     def _check_product(self, callback: VerifiedRewardCallback) -> None:
-        """서명이 맞아도 **우리 제품의 보상이 아니면** 지급하지 않는다."""
+        """서명이 맞아도 **우리 제품의 보상이 아니면** 지급하지 않는다.
+
+        여기까지 왔다는 것은 **Google 서명 검증을 이미 통과했다**는 뜻이다(`handle_callback` 순서).
+        그래서 `ad_unit`만은 로그에 남긴다 — 광고 단위 식별자이지 credential이 아니고,
+        `ADMOB_SSV_EXPECTED_AD_UNIT`에 넣을 값을 이 로그 말고는 알 방법이 없다.
+
+        **다른 값은 여전히 남기지 않는다** — raw query · signature · custom_data(reward context) ·
+        transaction_id는 credential이거나 사용자를 가리키는 값이다.
+        """
         if not self._config.is_configured:
             # production ad unit이 아직 없다. 서명이 맞아도 지급하지 않는다.
-            logger.warning("admob_ssv_not_configured")
+            # 설정 전이라도 실제 값을 한 번은 봐야 하므로 여기서도 남긴다.
+            logger.warning("admob_ssv_not_configured observed_ad_unit=%s", callback.ad_unit)
             raise RewardedAdError(RewardedAdReason.NOT_CONFIGURED)
 
         if callback.ad_unit != self._config.ad_unit:
-            logger.warning("admob_ssv_unexpected_ad_unit")
+            logger.warning("admob_ssv_unexpected_ad_unit observed_ad_unit=%s", callback.ad_unit)
             raise RewardedAdError(RewardedAdReason.UNEXPECTED_AD_UNIT)
 
         if (
