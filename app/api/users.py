@@ -17,7 +17,9 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
-from app.api.deps import CurrentUser, shard_service
+from app.ads.service import RewardedAdService
+from app.api.deps import CurrentUser, rewarded_ad_service, shard_service
+from app.auth.models import issue_session_token
 from app.shards import attendance
 from app.shards.service import ShardLedgerService
 
@@ -55,6 +57,24 @@ class AttendanceClaimPayload(BaseModel):
     claimed: bool
     reward: int
     balance: int
+
+    model_config = {"populate_by_name": True}
+
+
+class RewardedAdStatusPayload(BaseModel):
+    """오늘 광고 보상 상태. 버튼을 그리는 데만 쓴다."""
+
+    rewarded_today: int = Field(serialization_alias="rewardedToday")
+    remaining_today: int = Field(serialization_alias="remainingToday")
+    daily_limit: int = Field(serialization_alias="dailyLimit")
+
+    model_config = {"populate_by_name": True}
+
+
+class RewardContextPayload(BaseModel):
+    """광고에 실어 보낼 opaque context. **내부 user id가 아니다.**"""
+
+    context: str
 
     model_config = {"populate_by_name": True}
 
@@ -122,3 +142,48 @@ def claim_attendance(
         reward=result.reward,
         balance=result.balance,
     )
+
+
+# MARK: - 광고 보상
+
+
+@router.get(
+    "/me/rewarded-ads",
+    response_model=RewardedAdStatusPayload,
+    response_model_by_alias=True,
+)
+def my_rewarded_ads(
+    user: CurrentUser,
+    ads: Annotated[RewardedAdService, Depends(rewarded_ad_service)],
+) -> RewardedAdStatusPayload:
+    """오늘 광고 보상을 몇 번 받았고 몇 번 남았는지. **읽기 전용**이다."""
+    state = ads.status(user.id)
+    return RewardedAdStatusPayload(
+        rewarded_today=state.rewarded_today,
+        remaining_today=state.remaining_today,
+        daily_limit=state.daily_limit,
+    )
+
+
+@router.post(
+    "/me/rewarded-ads/context",
+    response_model=RewardContextPayload,
+    response_model_by_alias=True,
+)
+def create_reward_context(
+    user: CurrentUser,
+    ads: Annotated[RewardedAdService, Depends(rewarded_ad_service)],
+) -> RewardContextPayload:
+    """광고에 실어 보낼 **short-lived opaque context**를 발급한다.
+
+    **조각을 지급하는 endpoint가 아니다.** 여기서는 아무 잔액도 움직이지 않는다.
+    지급은 Google이 서명한 SSV callback이 도착했을 때만 일어난다.
+
+    client는 이 값을 `ServerSideVerificationOptions.customData`에 넣는다.
+    session token · Apple token · 내부 user UUID는 **절대 넣지 않는다** —
+    callback URL은 로그와 재시도 기록에 남는다.
+    """
+    # session token과 같은 방식으로 만든다. 서버는 hash만 저장한다.
+    token = issue_session_token()
+    ads.issue_context(user.id, token)
+    return RewardContextPayload(context=token)

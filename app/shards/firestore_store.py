@@ -18,6 +18,8 @@ from google.cloud import firestore
 from app.auth.store import StoreUnavailable
 from app.shards.models import (
     InsufficientShards,
+    PeriodQuota,
+    QuotaExceeded,
     ShardLedgerEntry,
     ShardReason,
     ShardWallet,
@@ -28,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 WALLETS = "ggumirror_shard_wallets"
 LEDGER = "ggumirror_shard_ledger"
+# 기간당 지급 횟수 counter. **잔액의 authority가 아니다** — 원장이 경제의 진실이고,
+# 이 문서는 "하루 5회" 같은 상한을 원자적으로 세기 위한 operational projection이다.
+# 문서 ID는 hash라서 raw user id도 날짜도 노출되지 않는다.
+QUOTAS = "ggumirror_shard_quotas"
 
 
 class FirestoreShardStore:
@@ -54,6 +60,14 @@ class FirestoreShardStore:
         except gcp_exceptions.GoogleAPIError as error:
             raise self._unavailable("ledger_event_read", error) from error
 
+    def quota_used(self, quota_key: str) -> int:
+        """상태 표시용 읽기. 지급 경로에서는 쓰지 않는다."""
+        try:
+            snapshot = self._db.collection(QUOTAS).document(quota_key).get()
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("quota_read", error) from error
+        return int((snapshot.to_dict() or {}).get("count") or 0) if snapshot.exists else 0
+
     # MARK: - 쓰기
 
     def apply(
@@ -62,6 +76,7 @@ class FirestoreShardStore:
         delta: int,
         reason: ShardReason,
         idempotency_key_hash: str | None,
+        quota: PeriodQuota | None = None,
     ) -> tuple[ShardWallet, ShardLedgerEntry, bool]:
         wallet_ref = self._db.collection(WALLETS).document(user_id)
         # 같은 사건을 두 번 적지 않기 위한 자리표. **document id가 곧 열쇠다** —
@@ -71,6 +86,7 @@ class FirestoreShardStore:
             if idempotency_key_hash
             else self._db.collection(LEDGER).document(ShardLedgerEntry.new_id())
         )
+        quota_ref = self._db.collection(QUOTAS).document(quota.key) if quota else None
 
         @firestore.transactional
         def run(transaction: firestore.Transaction) -> tuple[ShardWallet, ShardLedgerEntry, bool]:
@@ -90,7 +106,18 @@ class FirestoreShardStore:
                     if wallet_snapshot.exists
                     else ShardWallet.empty(user_id)
                 )
+                # 중복이다. **quota는 건드리지 않는다** — 재전송이 남은 횟수를 깎으면 안 된다.
                 return current, existing, False
+
+            # 상한 확인도 **이 transaction 안에서** 한다. 밖에서 세어보고 들어오면
+            # 동시에 도착한 callback들이 전부 "아직 4개다"를 보고 상한을 넘겨 지급한다.
+            used = 0
+            if quota_ref is not None:
+                quota_snapshot = quota_ref.get(transaction=transaction)
+                used = int((quota_snapshot.to_dict() or {}).get("count") or 0)
+                if used >= quota.limit:
+                    # 아무것도 쓰지 않는다 — 잔액 · 원장 · counter 전부 그대로다.
+                    raise QuotaExceeded()
 
             snapshot = wallet_ref.get(transaction=transaction)
             current = (
@@ -127,11 +154,17 @@ class FirestoreShardStore:
             # 여기까지 왔다는 것은 이 transaction이 그 줄의 **작성자**라는 뜻이다.
             transaction.create(claim_ref, _entry_document(entry))
             transaction.set(wallet_ref, _wallet_document(wallet))
+            if quota_ref is not None:
+                # 지급과 같은 transaction에서 counter가 오른다. 둘이 갈라질 수 없다.
+                transaction.set(
+                    quota_ref,
+                    {"count": used + 1, "limit": quota.limit, "updatedAt": now},
+                )
             return wallet, entry, True
 
         try:
             wallet, entry, applied = run(self._db.transaction())
-        except InsufficientShards:
+        except (InsufficientShards, QuotaExceeded):
             raise
         except gcp_exceptions.AlreadyExists:
             # 같은 사건이 동시에 두 번 들어왔고, 우리가 읽은 뒤 상대가 먼저 commit했다.

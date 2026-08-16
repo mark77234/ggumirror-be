@@ -15,7 +15,10 @@ from functools import lru_cache
 
 from fastapi import FastAPI
 
-from app.api import auth, health, users
+from app.ads.service import RewardedAdConfig, RewardedAdService
+from app.ads.store import RewardContextStore
+from app.ads.verifier import AdMobKeyProvider
+from app.api import ads, auth, health, users
 from app.auth.apple import AppleTokenVerifier
 from app.auth.store import AuthStore
 from app.shards.service import ShardLedgerService
@@ -29,8 +32,10 @@ def create_app(
     settings: Settings | None = None,
     auth_store: AuthStore | None = None,
     shard_store: ShardStore | None = None,
+    reward_context_store: RewardContextStore | None = None,
+    admob_keys: AdMobKeyProvider | None = None,
 ) -> FastAPI:
-    """`auth_store` / `shard_store`를 주면 그것을 쓴다 — test는 in-memory fake를 넣는다."""
+    """store를 주면 그것을 쓴다 — test는 in-memory fake와 test key를 넣는다."""
     settings = settings or load_settings()
     configure_logging(settings)
 
@@ -77,13 +82,35 @@ def create_app(
 
         return ShardLedgerService(FirestoreShardStore(_firestore()))
 
+    @lru_cache(maxsize=1)
+    def rewarded_ads() -> RewardedAdService:
+        if reward_context_store is not None:
+            contexts: RewardContextStore = reward_context_store
+        else:
+            from app.ads.firestore_store import FirestoreRewardContextStore
+
+            contexts = FirestoreRewardContextStore(_firestore())
+
+        return RewardedAdService(
+            shards=shards(),
+            contexts=contexts,
+            keys=admob_keys or AdMobKeyProvider(),
+            # ad unit이 비어 있으면 서명이 맞아도 지급하지 않는다(fail closed).
+            config=RewardedAdConfig(
+                ad_unit=settings.admob_ssv_expected_ad_unit,
+                reward_item=settings.admob_reward_item,
+            ),
+        )
+
     app.state.apple_verifier = verifier
     app.state.auth_store = store
     app.state.shard_service = shards
+    app.state.rewarded_ad_service = rewarded_ads
 
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(users.router)
+    app.include_router(ads.router)
 
     logger.info("app created env=%s log_level=%s", settings.app_env, settings.log_level)
     return app

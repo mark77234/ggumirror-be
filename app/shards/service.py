@@ -22,6 +22,7 @@ import logging
 from app.shards.models import (
     MAX_DELTA,
     InvalidShardAmount,
+    PeriodQuota,
     ShardMutationResult,
     ShardReason,
     ShardWallet,
@@ -51,6 +52,22 @@ class ShardLedgerService:
         """
         return self._store.event_applied(idempotency_hash(user_id, reason, external_event_id))
 
+    def quota_used(self, user_id: str, reason: ShardReason, period: str) -> int:
+        """그 기간에 이 이유로 몇 번 지급됐는지. **표시용 읽기**다.
+
+        광고 버튼의 `오늘 2 / 5`를 그리는 데 쓴다. 지급 경로에서 부르지 않는다 —
+        세어보고 지급하면 동시 요청이 상한을 넘긴다.
+        """
+        return self._store.quota_used(self._quota_key(user_id, reason, period))
+
+    @staticmethod
+    def _quota_key(user_id: str, reason: ShardReason, period: str) -> str:
+        """counter 문서의 열쇠. 원장 열쇠와 **같은 함수**로 만들되 namespace를 분리한다.
+
+        raw user id도 날짜도 문서 ID에 남지 않는다.
+        """
+        return idempotency_hash(user_id, reason, f"quota:{period}")
+
     # MARK: - 쓰기
 
     def credit(
@@ -59,6 +76,8 @@ class ShardLedgerService:
         amount: int,
         reason: ShardReason,
         external_event_id: str | None = None,
+        period: str | None = None,
+        limit: int | None = None,
     ) -> ShardMutationResult:
         """조각을 준다.
 
@@ -68,8 +87,17 @@ class ShardLedgerService:
 
         결과의 `applied`가 **이번 호출이 실제로 지급했는가**다. 재시도로 들어온 요청에
         "지급했다"고 답하지 않으려면 이 값을 쓴다 — 따로 조회해서 짐작하지 않는다.
+
+        `period` + `limit`을 함께 주면 **그 기간에 `limit`번까지만** 지급한다
+        (광고 보상의 하루 5회). 확인과 증가가 지급과 같은 transaction 안에서 일어나고,
+        이미 찼으면 `QuotaExceeded`가 난다 — 아무것도 기록되지 않는다.
         """
-        return self._apply(user_id, self._checked(amount), reason, external_event_id)
+        quota = (
+            PeriodQuota(key=self._quota_key(user_id, reason, period), limit=limit)
+            if period is not None and limit is not None
+            else None
+        )
+        return self._apply(user_id, self._checked(amount), reason, external_event_id, quota)
 
     def debit(
         self,
@@ -89,12 +117,13 @@ class ShardLedgerService:
         delta: int,
         reason: ShardReason,
         external_event_id: str | None,
+        quota: PeriodQuota | None = None,
     ) -> ShardMutationResult:
         # user scope는 **service가 강제한다.** 호출부가 event id에 user id를 넣어주기를
         # 기대하면, 잊은 곳 하나가 사용자끼리 같은 문서를 겨루게 만든다.
         key = idempotency_hash(user_id, reason, external_event_id) if external_event_id else None
         # `applied`는 저장소의 원자적 쓰기 결과다. 여기서 다시 판단하지 않는다.
-        wallet, entry, applied = self._store.apply(user_id, delta, reason, key)
+        wallet, entry, applied = self._store.apply(user_id, delta, reason, key, quota)
 
         event = "shard_ledger_credit" if delta > 0 else "shard_ledger_debit"
         # 값은 남기되 누구인지 · 어떤 외부 id인지는 남기지 않는다.

@@ -15,7 +15,7 @@
 - 실제 Store listing · 구매 / 소유권
 - 판매자 조각 정산
 
-## 현재 구현 범위 (Phase B-3까지)
+## 현재 구현 범위 (Phase B-5까지)
 
 **B-1 — Foundation**
 
@@ -54,9 +54,19 @@
 - 지급은 B-3 원장이 한다 — `credit(daily_attendance, external_event_id=<KST 날짜>)`
 - 출석 전용 collection을 만들지 않았다. "오늘 받았나"는 **원장에게 묻는다**
 
+**B-5 — AdMob Rewarded + SSV**
+
+- 광고 1회 → 조각 **+1**, 하루 **5회**(Asia/Seoul) (`app/ads/`)
+- 보상 권위는 **검증된 Google SSV callback 하나뿐**이다. client callback은 근거가 아니다
+- Google이 서명한 **raw query 바이트**를 검증한다 — 재조립한 문자열이 아니다
+- 하루 상한 · 중복 방지 · 원장 기록 · 잔액 갱신이 **한 Firestore transaction**
+- 보상 날짜는 **서명된 `timestamp`**에서 나온다 (늦게 온 callback도 그 날의 몫)
+- user binding은 short-lived opaque context — session token을 Google에 보내지 않는다
+- **production ad unit이 아직 없어 지급은 fail closed 상태다** (env 두 개를 채우면 동작)
+
 아직 구현하지 않은 것 (의도적):
 
-rewarded ad SSV callback · shard IAP · 꾸미러 Pass ·
+shard IAP · 꾸미러 Pass ·
 Store API · Listing · Asset upload · actual Publish · 구매 · 소유권 · 판매자 정산 ·
 Cloud Sync · authorizationCode 교환 · Apple private key / client_secret · refresh token.
 
@@ -67,8 +77,15 @@ app/
 ├── main.py                 create_app() + verifier / store 조립
 ├── api/health.py           GET /health, GET /
 ├── api/auth.py             POST /auth/apple, POST /auth/logout
-├── api/users.py            GET /users/me, GET /users/me/shards
+├── api/users.py            GET /users/me · shards · attendance · rewarded-ads
+├── api/ads.py              GET /admob/rewarded/ssv (Google 서명이 곧 인증)
 ├── api/deps.py             Bearer → current user
+├── ads/verifier.py         AdMob 공개키 cache + raw query ECDSA 검증
+├── ads/service.py          검증 → 제품 대조 → context → 원장
+├── ads/store.py            reward context protocol + in-memory
+├── ads/firestore_store.py  reward context Firestore 구현
+├── ads/models.py           보상 상수 · 실패 분류 · 검증된 callback
+├── shards/attendance.py    KST 날짜 규칙 + 출석 지급
 ├── shards/models.py        ShardWallet, ShardLedgerEntry, ShardReason, idempotency
 ├── shards/store.py         ShardStore protocol + in-memory 구현
 ├── shards/firestore_store.py  Firestore transaction 구현
@@ -176,6 +193,9 @@ docker run --rm -e PORT=9000 -p 9000:9000 ggumirror-be
 | GET | `/users/me/shards` | Bearer | 내 조각 잔액 (읽기 전용) |
 | GET | `/users/me/attendance` | Bearer | 오늘(KST) 출석을 받았는지 |
 | POST | `/users/me/attendance` | Bearer | 오늘의 출석 조각 +1. **body 없음** |
+| GET | `/users/me/rewarded-ads` | Bearer | 오늘 광고 보상 횟수 / 남은 횟수 |
+| POST | `/users/me/rewarded-ads/context` | Bearer | 광고에 실을 opaque context. **조각을 주지 않는다** |
+| GET | `/admob/rewarded/ssv` | **Google 서명** | AdMob SSV callback. 유일한 광고 지급 통로 |
 
 이 외의 endpoint는 **없다.** `/store`, `/listings`, `/purchases`를
 미리 만들지 않는다 — Client와 contract를 확정한 뒤에 만든다.
@@ -651,7 +671,181 @@ Firestore가 commit 시점에 `AlreadyExists`를 돌려주는 경우(우리가 �
 commit) 역시 **실패가 아니다.** 원장에 이미 그 줄이 있다는 뜻이므로 transaction을
 한 번 다시 돌려 중복 분기로 들어간다 — 500이 아니라 `claimed=false`가 정답이다.
 
-### AdMob Rewarded 준비 상태 (B-5에서 쓴다)
+## AdMob Rewarded + SSV (B-5)
+
+광고 1회 정상 시청 → **조각 +1**, 하루 최대 **5회**(Asia/Seoul).
+
+| | |
+|---|---|
+| 보상 | **+1** (`app/ads/models.py`의 `REWARD_PER_AD`) |
+| 하루 한도 | **5** (`DAILY_REWARD_LIMIT`) |
+| 하루 기준 | Asia/Seoul, **서명된 SSV `timestamp`**에서 유도 |
+| authority | **검증된 Google SSV callback 하나뿐** |
+| client callback | **경제 authority가 아니다** |
+| idempotency | Google `transaction_id` |
+| ledger reason | `rewarded_ad` |
+
+### 왜 client callback을 믿지 않나
+
+`onUserEarnedReward`는 검증되지 않은 입력이다. 그것으로 지급하면 앱을 고쳐
+"광고 다 봤다"를 무한히 보내는 것으로 조각을 찍어낼 수 있다.
+client가 광고를 다 본 뒤 하는 일은 **상태 새로고침 하나**다.
+
+### 흐름
+
+```
+로그인 client → POST /users/me/rewarded-ads/context → opaque context (조각 안 움직임)
+                                    ↓ customData
+                              Google 광고 시청
+                                    ↓ 서명된 callback
+Google → GET /admob/rewarded/ssv?...&signature=..&key_id=..
+            1. ECDSA 서명 검증        ← 이걸 통과해야 어떤 값도 믿는다
+            2. ad_unit / reward_item / reward_amount 대조
+            3. context → 내부 user UUID
+            4. 원장 transaction (하루 5회 + 중복 방지 + 잔액)
+```
+
+### 서명 검증 — raw query bytes를 그대로
+
+Google은 **자기가 보낸 query string의 바이트열**에 서명한다.
+그래서 검증 입력은 **ASGI `scope["query_string"]`(bytes) 그대로**다.
+
+`Request.url.query`도 쓰지 않는다 — URL 객체를 거치면 parsing과 재직렬화를 한 번
+지나므로 검증 대상이 "받은 바이트"가 아니게 될 여지가 생긴다.
+`verify()`는 문자열을 받으면 `TypeError`로 거절한다(그 경로가 굳지 않게).
+
+```
+...&reward_item=..&timestamp=..&signature=<sig>&key_id=<id>
+^------------ 서명 대상 ------------^
+```
+
+규약상 마지막 두 parameter는 항상 `signature`, `key_id`다.
+decode · 정렬 · 재인코딩을 하지 않고, **검증에 성공한 뒤에야** 값을 해석한다.
+특히 `timestamp`는 보상 날짜를 정하는 값이라 검증 전에 읽지 않는다.
+
+공개키는 `https://www.gstatic.com/admob/reward/verifier-keys.json`에서 받아
+process memory에 1시간 cache한다(Google rotation 고려, 하루보다 길게 믿지 않는다).
+모르는 `key_id`면 **한 번 갱신**하고 다시 찾는다 — `AppleJWKSProvider`와 같은 모양이다.
+**key 조회 실패는 서명 실패와 구분한다**(전자만 5xx로 재시도를 받는다).
+
+ECDSA(SHA-256) 검증은 이미 있는 `cryptography`로 한다. 새 dependency를 넣지 않았다.
+
+### user binding — session token을 Google에 보내지 않는다
+
+callback URL은 로그 · 중계 · 재시도 기록에 남는다. 그래서 거기에
+**session token · Apple identity token · 내부 user UUID를 넣지 않는다.**
+
+대신 로그인한 사용자가 광고 직전에 **short-lived opaque context**를 발급받고 그것만 보낸다.
+session과 같은 규칙이다 — `secrets.token_urlsafe`, Firestore에는 `sha256`만,
+document ID도 hash, 수명 6시간.
+
+signed stateless token 대신 저장형을 고른 이유: 서명 token은 **새 server secret**이
+필요한데 이 서비스에는 secret이 하나도 없다(Secret Manager도 만들지 않았다).
+보상 하나 때문에 secret 관리 · rotation · 유출 대응을 새로 들이는 것보다,
+이미 있는 opaque-token 패턴 재사용이 작고 안전하다. 게다가 저장형은 **취소할 수 있다.**
+
+context는 callback이 와도 **소비하지 않는다** — Google 재전송 때도 같은 사용자로 풀려야 한다.
+중복 지급은 `transaction_id` idempotency가 막는다.
+
+### 제품 대조 — 서명만 맞다고 주지 않는다
+
+`ad_unit` · `reward_item` · `reward_amount`가 설정과 다르면 지급하지 않는다.
+지급액은 **`REWARD_PER_AD` 상수**다 — callback의 숫자는 지급액의 출처가 아니라 검증 대상이다.
+
+`ADMOB_SSV_EXPECTED_AD_UNIT` / `ADMOB_REWARD_ITEM`이 비어 있으면 서명이 맞아도
+**지급하지 않는다(fail closed).** 실제 ad unit이 생기기 전에 추측한 ID를 넣지 않는다.
+
+#### ad unit 이름이 두 개인 이유
+
+| 어디 | 이름 | 무엇 |
+|---|---|---|
+| client (xcconfig) | `ADMOB_REWARDED_AD_UNIT_ID` | 광고를 **load**할 때 쓰는 ID |
+| backend (env) | `ADMOB_SSV_EXPECTED_AD_UNIT` | callback의 `ad_unit`과 **비교**할 값 |
+
+**둘이 같은 문자열이라고 가정하지 않는다.** 확인된 것은 "서명된 callback에 `ad_unit`이
+들어온다"는 사실뿐이고, 그 값의 정확한 표현은 실제 callback을 받아봐야 안다.
+같다고 단정하고 하드코딩하면 다를 경우 **모든 보상이 조용히 거절**된다(200 + 미지급).
+
+확정 방법: ad unit 생성 → SSV callback URL 등록 → SSV Test Tool 1회 →
+`admob_ssv_no_reward reason=unexpected_ad_unit` 로그와 함께 실제 값을 확인 →
+그 값을 `ADMOB_SSV_EXPECTED_AD_UNIT`에 넣는다.
+
+### 하루 5회 — 확인과 증가가 지급과 같은 transaction
+
+```
+GET count → if count < 5 → credit()      ← 절대 이렇게 하지 않는다
+```
+
+동시에 도착한 callback들이 전부 "아직 4개다"를 보고 상한을 넘겨 지급한다.
+quota가 4일 때 서로 다른 정상 callback 10개가 동시에 오면 **정확히 하나만** 지급되고
+최종 5가 되어야 한다(`test_concurrent_callbacks_cannot_exceed_the_daily_cap`).
+
+그래서 `ShardStore.apply`가 `PeriodQuota`를 함께 받는다 —
+**상한 확인 · counter 증가 · 원장 기록 · 잔액 갱신이 한 Firestore transaction**이다.
+중복(idempotency)으로 판정되면 counter를 올리지 않는다 — 재전송이 남은 횟수를 깎으면 안 된다.
+
+counter는 `ggumirror_shard_quotas`에 있고 문서 ID는 hash다(raw user id · 날짜 노출 없음).
+**이것은 잔액의 authority가 아니다** — 경제의 진실은 여전히 원장이고,
+이 문서는 상한을 원자적으로 세기 위한 operational projection이다.
+
+### 보상 날짜는 서명된 timestamp
+
+```
+광고 완료 23:59:58 KST → callback 도착 00:00:02 KST → 전날 quota
+```
+
+서버가 받은 시각으로 정하면 자정 근처에 quota가 두 번 열리거나 하루가 통째로 밀린다.
+**서명 검증을 통과한** `timestamp`만 쓴다.
+
+### 응답 코드 = Google에 대한 지시
+
+| 상황 | 응답 |
+|---|---|
+| 지급함 | **200** |
+| 중복 transaction · 하루 상한 도달 | **200** |
+| context 없음 · 우리 것 아님 · 만료 | **200** |
+| ad unit / reward 불일치 · 미설정(fail closed) | **200** |
+| 서명 실패 · signature/key_id 누락 · 형식 오류 | **400** |
+| Google key 조회 실패 · Firestore 오류 | **5xx** |
+
+원칙: **서명이 유효한데 우리가 "안 준다"고 판단을 끝낸 상태는 전부 200**이다.
+재시도해도 결과가 같은데 4xx를 주면 Google이 전달 실패로 보고 한동안 다시 보낸다.
+왜 안 줬는지는 응답이 아니라 **로그**로 구분한다.
+
+**AdMob SSV Test Tool은 사용자 context 없이 호출한다** — 서명이 유효하므로 200이고
+조각은 하나도 움직이지 않는다. 그래서 ad unit 설정 전에도 Test Tool이 통과한다.
+
+서명이 틀린 callback에 5xx를 주면 영원히 재시도를 받는다.
+반대로 일시적 실패에 200을 주면 정당한 보상이 조용히 사라진다.
+
+#### context 실패는 셋으로 나눠 기록한다
+
+| 로그 | 뜻 |
+|---|---|
+| `admob_ssv_missing_context` | `custom_data`가 아예 없다. **SSV Test Tool이 정상적으로 이 상태** |
+| `admob_ssv_unknown_context` | 값은 있는데 우리가 발급한 적이 없다 |
+| `admob_ssv_expired_context` | 우리가 준 것이지만 시간이 지났다 |
+
+실제 광고 트래픽에서 `missing_context`가 보이기 시작하면 **client가 context를 안 싣고
+있다는 신호**다. 하나로 뭉뚱그리면 그걸 알아챌 수 없다.
+
+### 로그
+
+`admob_ssv_reward_applied` · `admob_ssv_duplicate` · `admob_ssv_daily_limit_reached` ·
+`admob_ssv_rejected reason=...` · `admob_ssv_unknown_key_id`.
+transaction id는 **12자 hash**로만 남긴다.
+
+**access log는 우리가 부르는 것이 아니라서 filter로 막는다.** uvicorn access logger는
+요청 줄을 query까지 통째로 남기고, 거기에 Google signature와 reward context가 들어 있다.
+`RedactSensitiveQuery`가 `/admob/rewarded/ssv?<redacted>`로 바꾼다(경로는 남긴다).
+
+### 아직 없는 것
+
+**production AdMob app / rewarded ad unit이 아직 없다.** endpoint는 살아 있지만
+`ADMOB_SSV_EXPECTED_AD_UNIT`이 비어 있는 동안에는 아무에게도 조각을 주지 않는다.
+console 설정 후 env 두 개를 채우면 그때부터 동작한다.
+
+### AdMob Rewarded 준비 상태 (B-3 시점 기록)
 
 **보상 권위는 Google SSV callback 하나뿐이다.**
 client의 `onUserEarnedReward`는 UI를 갱신할 뿐, 그것만으로 조각을 지급하지 않는다.
@@ -770,7 +964,7 @@ B-3 원장 위에 얹는다. **전부 server가 지급 / 차감한다.**
 | Phase | 내용 | reason | idempotency key |
 |---|---|---|---|
 | B-4 ✅ | 출석 — 하루 1개 | `daily_attendance` | user + reason + **KST 날짜** |
-| B-5 | AdMob rewarded — 1개, **하루 5회** | `rewarded_ad` | SSV `transaction_id` |
+| B-5 ✅ | AdMob rewarded — 1개, **하루 5회** | `rewarded_ad` | SSV `transaction_id` |
 | B-6 | 조각 IAP — 10 / 30 / 70 / 160 | `iap_purchase` | App Store transaction id |
 | B-7 | 꾸미러 Pass — ₩4,900 월 / ₩39,000 년 | (구독 혜택 정책 확정 후) | 구독 transaction id |
 | B-8 | 마켓 — 등록 20 조각, 조각으로 산 거울은 영구 소유 | `mirror_publish_fee` · `mirror_purchase` · `mirror_sale` | 주문 id |
@@ -780,6 +974,9 @@ B-5는 **Google SSV callback만** 보상 근거로 쓴다. B-6 / B-7은 Apple �
 
 ## 다음 Phase
 
-**B-5 — AdMob Rewarded + SSV.** 전용 endpoint로 조각을 지급하는 패턴은 B-4에서 확인됐다.
-B-5가 더할 것은 Google SSV **서명 검증**과 하루 5회 상한이고,
-상한 확인은 지급과 같은 transaction 안에서 해야 한다.
+**B-6 — 조각 IAP.** 원장 · idempotency · 전용 endpoint · 원자적 상한까지 갖췄다.
+B-6이 더할 것은 App Store 영수증 검증과 transaction id 기반 지급이다.
+client의 "구매 성공했다"를 그대로 믿지 않는다.
+
+그 전에 **B-5 production 설정이 남아 있다** — AdMob app / rewarded ad unit 생성,
+SSV callback URL 등록, `ADMOB_SSV_EXPECTED_AD_UNIT` · `ADMOB_REWARD_ITEM` 배포.

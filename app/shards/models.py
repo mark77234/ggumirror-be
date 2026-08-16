@@ -85,6 +85,23 @@ class ShardLedgerEntry:
 
 
 @dataclass(frozen=True)
+class PeriodQuota:
+    """한 기간에 몇 번까지 허용할지. 광고 보상의 "하루 5회"가 첫 사용자다.
+
+    **잔액의 authority가 아니다.** 경제의 진실은 원장이고, 이건 "몇 번 줬는지"를
+    원자적으로 세기 위한 operational counter다.
+
+    확인과 증가가 **지급과 같은 transaction 안에서** 일어나야 한다.
+    "세어보고 → 모자라면 준다"로 나누면 동시에 들어온 callback이 상한을 넘겨 지급한다.
+
+    `key`는 이미 hash된 값이다 — raw user id나 날짜를 문서 ID에 노출하지 않는다.
+    """
+
+    key: str
+    limit: int
+
+
+@dataclass(frozen=True)
 class ShardMutationResult:
     """조각을 움직인 결과.
 
@@ -135,3 +152,11 @@ class InsufficientShards(ShardError):
 
 class InvalidShardAmount(ShardError):
     """0 이하이거나 너무 큰 값. 도메인에서 막는다."""
+
+
+class QuotaExceeded(ShardError):
+    """그 기간의 상한을 이미 채웠다. **아무것도 기록되지 않는다.**
+
+    실패가 아니라 **정상적인 거절**이다 — 광고를 5번 본 사람이 6번째를 본 것은
+    오류가 아니고, 조각만 주지 않으면 된다.
+    """

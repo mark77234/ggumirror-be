@@ -31,6 +31,20 @@ class Settings:
     # service account JSON key를 repo에 넣지 않는다.
     gcp_project_id: str = ""
     firestore_database: str = "(default)"
+    # SSV callback의 `ad_unit` 필드와 **글자 그대로 비교할 값**이다.
+    #
+    # client가 광고를 load할 때 쓰는 `ca-app-pub-…/…` 형식과 **같다고 가정하지 않는다.**
+    # 확인된 것은 "Google이 서명한 callback에 `ad_unit`이 들어온다"는 사실뿐이고,
+    # 그 값의 정확한 표현은 실제 callback을 한 번 받아봐야 안다.
+    # 그래서 이름을 client 쪽(`ADMOB_REWARDED_AD_UNIT_ID`)과 일부러 다르게 둔다.
+    #
+    # 채우는 방법: AdMob console에서 ad unit 생성 → SSV callback URL 등록 →
+    # SSV Test Tool 1회 실행 → 검증을 통과한 callback의 `ad_unit` 값을 그대로 넣는다.
+    #
+    # 비어 있으면 서명 검증을 통과해도 **지급하지 않는다**(fail closed).
+    # 추측한 값을 넣지 않는다.
+    admob_ssv_expected_ad_unit: str = ""
+    admob_reward_item: str = ""
 
     @property
     def is_production(self) -> bool:
@@ -70,6 +84,11 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
 
     firestore_database = env.get("FIRESTORE_DATABASE", "").strip() or "(default)"
 
+    # production에서도 **필수가 아니다.** 아직 AdMob ad unit이 없어도 서비스는 떠야 하고,
+    # 없으면 광고 보상만 조용히 지급되지 않는다(다른 기능은 그대로).
+    admob_ssv_expected_ad_unit = env.get("ADMOB_SSV_EXPECTED_AD_UNIT", "").strip()
+    admob_reward_item = env.get("ADMOB_REWARD_ITEM", "").strip()
+
     return Settings(
         app_env=app_env,
         log_level=log_level,
@@ -77,7 +96,48 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         apple_client_id=apple_client_id,
         gcp_project_id=gcp_project_id,
         firestore_database=firestore_database,
+        admob_ssv_expected_ad_unit=admob_ssv_expected_ad_unit,
+        admob_reward_item=admob_reward_item,
     )
+
+
+# query string에 credential이 실려 오는 경로. **access log가 URL을 통째로 남긴다.**
+SENSITIVE_QUERY_PATHS = ("/admob/rewarded/ssv",)
+
+
+class RedactSensitiveQuery(logging.Filter):
+    """access log에서 민감한 query string을 지운다.
+
+    우리 코드가 조심하는 것만으로는 부족하다 — uvicorn의 access logger는
+    요청 줄을 **query까지 통째로** 남긴다. AdMob SSV callback의 query에는
+    Google signature와 우리가 발급한 reward context(사용자를 가리키는 값)가 들어 있어
+    그대로 Cloud Run 로그에 적히면 안 된다.
+
+    경로는 남긴다 — callback이 왔다는 사실 자체는 운영에 필요하다.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(self._redact(value) for value in record.args)
+        return True
+
+    @staticmethod
+    def _redact(value: object) -> object:
+        """경로 **끝**으로 판단한다.
+
+        access logger는 `/admob/rewarded/ssv?…`를 주지만, client logger나 proxy는
+        `http://host/admob/rewarded/ssv?…`처럼 앞이 붙은 형태를 준다.
+        정확히 일치하는지만 보면 그런 줄이 그대로 새어 나간다.
+        """
+        # str이 아닐 수도 있다 — client logger는 URL 객체를 그대로 넘긴다.
+        # logging이 어차피 문자열로 만들 값이므로 여기서 미리 본다.
+        text = value if isinstance(value, str) else str(value)
+        if "?" not in text:
+            return value
+        path, _, _ = text.partition("?")
+        if any(path.endswith(sensitive) for sensitive in SENSITIVE_QUERY_PATHS):
+            return f"{path}?<redacted>"
+        return value
 
 
 def configure_logging(settings: Settings) -> None:
@@ -85,9 +145,18 @@ def configure_logging(settings: Settings) -> None:
 
     credential을 로그에 넣지 않는 것은 formatter가 막아주지 않는다 —
     호출하는 쪽 규칙이다. README의 Security를 따른다.
+
+    예외가 하나 있다: **access log는 우리가 부르는 것이 아니라서** filter로 막는다.
     """
     logging.basicConfig(
         level=settings.log_level,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         force=True,
     )
+
+    redaction = RedactSensitiveQuery()
+    for name in ("uvicorn.access", "httpx"):
+        logger = logging.getLogger(name)
+        # 같은 filter가 두 번 붙지 않게 한다(create_app이 test에서 여러 번 불린다).
+        if not any(isinstance(existing, RedactSensitiveQuery) for existing in logger.filters):
+            logger.addFilter(redaction)
