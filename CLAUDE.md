@@ -55,6 +55,7 @@ app/shards/firestore_store.py  Firestore transaction 구현
 app/shards/service.py  ShardLedgerService
 app/shards/attendance.py  KST 날짜 규칙 + 출석 지급
 app/core/config.py   환경변수 + logging
+scripts/admin_shards.py  운영자 조각 지급/회수 CLI (B-3 원장 재사용)
 tests/               pytest (Apple · Firestore 호출 없음)
 ```
 
@@ -138,6 +139,62 @@ IAP(영수증 검증) · 구매 · 등록.
 
 차감 endpoint도 같은 규칙이다: `POST /ai/stickers`의 body는 **프롬프트 하나뿐**이고
 `amount` · `price` · `reason` · `userId`를 받는 자리가 없다.
+
+### Admin Shard CLI (A-2) — 운영자 조정은 CLI 하나뿐
+
+운영/테스트용 지급·회수는 **`scripts/admin_shards.py`** 로만 한다.
+HTTP admin endpoint를 만들지 않는다 — 하나 생기면 그것이 곧 generic mutation 통로다.
+앱에 hidden 버튼도 만들지 않는다.
+
+```bash
+python3 ggumirror-be/scripts/admin_shards.py \
+  --user-id "<uid>" --delta 100 --note "AI sticker E2E"
+```
+
+결과가 애매하면(네트워크 끊김 등) **출력된 event id로 그대로 재실행**한다.
+같은 event id는 딱 한 번만 반영된다:
+
+```bash
+python3 ggumirror-be/scripts/admin_shards.py \
+  --user-id "<uid>" --delta 100 --note "AI sticker E2E" \
+  --event-id "admin:..."
+```
+
+- **같은 event id에 다른 delta를 넣으면 거절한다.** event id는 금액이 아니라 *사건*을 가리킨다.
+  `+10`으로 쓰인 event id에 `+100`을 넣으면 원장은 어차피 중복으로 무시하지만,
+  운영자가 "Already applied"를 보고 `+100`이 반영됐다고 읽을 수 있다.
+  그래서 mutation 전에 기존 entry를 **read-only로 읽어** 비교하고 fail closed한다.
+  이건 **UX guard일 뿐**이고 exactly-once의 authority는 여전히 `ShardStore.apply`의 원자적
+  `create()`다 — 열쇠도 B-3의 `idempotency_hash`를 그대로 쓴다(CLI가 새로 만들지 않는다)
+- 조각은 **B-3 `ShardLedgerService.credit` / `debit`** 으로만 움직인다.
+  wallet 문서를 직접 고치거나 ledger 문서를 손으로 쓰지 않는다.
+  `tests/test_admin_shards.py`가 소스에서 우회 경로를 금지한다
+- `reason=admin_adjustment`(이미 있던 값이다. 새 reason을 만들지 않았다)
+- **"원복"도 지우지 않는다.** `+100` 뒤 `-20`은 반대 부호 줄이 하나 더 쌓이는 것이다
+- project는 **`ggumirror-prod` 상수**다. 이 머신의 gcloud 기본 project는
+  DailyOPIc(`opicmobile-45cd5`)이라 기본값을 신뢰하면 남의 production을 만진다.
+  `firestore.Client(project=...)`에 명시적으로 넘기고,
+  `--project`나 `GCP_PROJECT_ID` · `GOOGLE_CLOUD_PROJECT` · `GCLOUD_PROJECT` ·
+  `CLOUDSDK_CORE_PROJECT`가 다른 곳을 가리키면 **fail closed**다
+- 기본은 확인 질문이고 **기본값은 N**이다. tty가 아니면 묻지 않고 거절한다 —
+  자동 실행은 `--yes`를 명시해야 한다. `--dry-run`은 계획만 보여준다
+- 잔액이 음수가 되는 회수는 **원장이 거절한다**(`InsufficientShards`). CLI가 정책을 바꾸지 않는다
+- `python3`로 불리면 repo venv로 한 번 re-exec한다(system python에는 google-cloud-firestore가 없다)
+
+#### note는 Firestore에 남지 않는다
+
+`ShardLedgerEntry`에 note/metadata 자리가 **없다**(`userId` · `delta` · `balanceAfter` ·
+`reason` · `idempotencyKeyHash` · `createdAt` · `schemaVersion`가 전부다).
+운영 편의 하나 때문에 경제 전체가 쓰는 schema를 넓히지 않았다 —
+note에 PII가 섞여 들어올 자리를 만드는 일이기도 하다.
+
+그래서 `--note`는 **필수 입력이되 운영자 화면에만** 남는다. durable audit은
+원장이 이미 갖고 있는 것으로 한다: `reason=admin_adjustment` · `delta` ·
+`balanceAfter` · `createdAt` · `idempotencyKeyHash`.
+note를 원장에 남겨야 할 실제 요구가 생기면 그때 schema version을 올려서 넣는다.
+
+> ⚠️ **Firestore Console에서 wallet balance를 직접 수정하지 마라.**
+> 원장과 projection이 갈라지고, 그 뒤로는 어느 쪽이 진실인지 알 수 없다.
 
 ### Daily Attendance (B-4) — 하루의 기준은 server KST
 
