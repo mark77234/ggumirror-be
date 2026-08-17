@@ -85,7 +85,13 @@ def content_for(
     reward_amount: int = 1,
     reward_item: str = REWARD_ITEM,
 ) -> str:
-    """Google이 실제로 보내는 순서를 흉내 낸다(알파벳 순이 아니다)."""
+    """Google이 실제로 보내는 순서를 흉내 낸다(알파벳 순이 아니다).
+
+    기본 timestamp는 고정 날짜다 — 대부분의 test가 그 날짜로 상태를 직접 조회하므로
+    결정적이어야 한다. 다만 **서버의 "오늘"을 쓰는 경로**(HTTP `GET /users/me/rewarded-ads`)를
+    지나는 test는 이 기본값을 쓰면 자정을 넘기는 순간 깨진다 — 그쪽은 `timestamp=today_kst()`를
+    명시적으로 넘긴다.
+    """
     moment = timestamp or datetime(2026, 8, 16, 10, 0, tzinfo=KST)
     milliseconds = int(moment.timestamp() * 1000)
     return (
@@ -923,7 +929,11 @@ def test_issued_context_resolves_to_its_owner(client, apple_key, google, shard_s
     user_id = client.get("/users/me", headers=headers).json()["id"]
     context = client.post("/users/me/rewarded-ads/context", headers=headers).json()["context"]
 
-    query = google.callback_query(content_for(transaction_id="real-1", custom_data=context))
+    # 상태 조회는 **서버의 오늘**을 본다. 고정 날짜로 지급하면 자정을 넘기는 순간
+    # "지급은 어제 몫, 조회는 오늘 몫"이 되어 시계 때문에 깨진다.
+    query = google.callback_query(content_for(
+        transaction_id="real-1", custom_data=context, timestamp=datetime.now(KST)
+    ))
     assert client.get(f"/admob/rewarded/ssv?{query}").status_code == 200
 
     assert shard_store.wallet(user_id).balance == 1
