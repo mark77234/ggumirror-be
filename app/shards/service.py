@@ -21,6 +21,7 @@ import logging
 
 from app.shards.models import (
     MAX_DELTA,
+    ExclusiveClaim,
     InvalidShardAmount,
     PeriodQuota,
     ShardMutationResult,
@@ -78,6 +79,7 @@ class ShardLedgerService:
         external_event_id: str | None = None,
         period: str | None = None,
         limit: int | None = None,
+        claim: ExclusiveClaim | None = None,
     ) -> ShardMutationResult:
         """조각을 준다.
 
@@ -97,7 +99,9 @@ class ShardLedgerService:
             if period is not None and limit is not None
             else None
         )
-        return self._apply(user_id, self._checked(amount), reason, external_event_id, quota)
+        return self._apply(
+            user_id, self._checked(amount), reason, external_event_id, quota, claim
+        )
 
     def debit(
         self,
@@ -118,12 +122,13 @@ class ShardLedgerService:
         reason: ShardReason,
         external_event_id: str | None,
         quota: PeriodQuota | None = None,
+        claim: ExclusiveClaim | None = None,
     ) -> ShardMutationResult:
         # user scope는 **service가 강제한다.** 호출부가 event id에 user id를 넣어주기를
         # 기대하면, 잊은 곳 하나가 사용자끼리 같은 문서를 겨루게 만든다.
         key = idempotency_hash(user_id, reason, external_event_id) if external_event_id else None
         # `applied`는 저장소의 원자적 쓰기 결과다. 여기서 다시 판단하지 않는다.
-        wallet, entry, applied = self._store.apply(user_id, delta, reason, key, quota)
+        wallet, entry, applied = self._store.apply(user_id, delta, reason, key, quota, claim)
 
         event = "shard_ledger_credit" if delta > 0 else "shard_ledger_debit"
         # 값은 남기되 누구인지 · 어떤 외부 id인지는 남기지 않는다.

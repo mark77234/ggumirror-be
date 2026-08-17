@@ -999,7 +999,7 @@ B-3 원장 위에 얹는다. **전부 server가 지급 / 차감한다.**
 | B-4 ✅ | 출석 — 하루 1개 | `daily_attendance` | user + reason + **KST 날짜** |
 | B-5 ✅ | AdMob rewarded — 1개, **하루 5회** | `rewarded_ad` | SSV `transaction_id` |
 | A-1A ✅ | AI 스티커 — **−6개**, 실패하면 환불 | `ai_sticker` · `refund` | 서버가 만든 `generation_id` |
-| B-6 | 조각 IAP — 10 / 30 / 70 / 160 | `iap_purchase` | App Store transaction id |
+| B-6 | 조각 IAP — 10 / 50 / 100 | `iap_purchase` | App Store transaction id |
 | B-7 | 꾸미러 Pass — ₩4,900 월 / ₩39,000 년 | (구독 혜택 정책 확정 후) | 구독 transaction id |
 | B-8 | 마켓 — 등록 20 조각, 조각으로 산 거울은 영구 소유 | `mirror_publish_fee` · `mirror_purchase` · `mirror_sale` | 주문 id |
 

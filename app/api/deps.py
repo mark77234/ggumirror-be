@@ -16,6 +16,7 @@ from fastapi import Depends, HTTPException, Request, status
 from app.ads.service import RewardedAdService
 from app.ai.service import AIStickerService
 from app.auth.apple import AppleTokenVerifier
+from app.iap.service import IAPService
 from app.auth.models import User, sha256_hex
 from app.auth.store import AuthStore, StoreUnavailable
 from app.shards.service import ShardLedgerService
@@ -71,6 +72,19 @@ def ai_sticker_service(request: Request) -> AIStickerService:
         return request.app.state.ai_sticker_service()
     except Exception as error:  # Firestore client 생성 실패 (credential / network)
         logger.error("ai_sticker_service_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
+def iap_service(request: Request) -> IAPService:
+    """조각 IAP service. store와 같은 이유로 처음 쓰일 때 만든다.
+
+    검증기가 설정되지 않은 것은 **여기서 실패하지 않는다** — service는 만들어지고
+    `is_available`이 False가 될 뿐이다(A-1A provider와 같은 규칙).
+    """
+    try:
+        return request.app.state.iap_service()
+    except Exception as error:  # Firestore client 생성 실패 (credential / network)
+        logger.error("iap_service_unavailable error=%s", type(error).__name__)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
 
 

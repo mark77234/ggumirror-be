@@ -65,6 +65,16 @@ class Settings:
     # 비어 있으면 fail closed다 — 결과를 durable하게 두지 못하면 응답이 유실됐을 때
     # 복구할 방법이 없고, 그건 A-1A의 구멍 그대로다.
     ai_result_bucket: str = ""
+    # 조각 IAP가 받아들일 Apple 환경. 쉼표로 나눈다 — 예: `Production,Sandbox`.
+    #
+    # **비어 있으면 아무것도 허용하지 않는다(fail closed).** 지금이 그 상태다.
+    # Sandbox는 TestFlight · App Review · sandbox E2E에 필요하지만, Debug 빌드도
+    # production API를 쓰기 때문에 켜 두면 sandbox 결제가 production 경제에 들어온다.
+    # 그래서 **명시적으로 켤 때만** 허용한다.
+    #
+    # `Xcode`는 값에 적어도 무시된다(`parse_allowed_environments`) —
+    # 로컬 서명이라 신뢰 사슬이 없고, 받아 주면 누구나 조각을 만들 수 있다.
+    iap_allowed_environments: str = ""
 
     @property
     def is_production(self) -> bool:
@@ -114,6 +124,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     ai_image_model = env.get("AI_IMAGE_MODEL", "").strip()
     ai_image_quality = env.get("AI_IMAGE_QUALITY", "").strip() or "low"
     ai_result_bucket = env.get("AI_RESULT_BUCKET", "").strip()
+    iap_allowed_environments = env.get("IAP_ALLOWED_ENVIRONMENTS", "").strip()
 
     return Settings(
         app_env=app_env,
@@ -128,6 +139,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         ai_image_model=ai_image_model,
         ai_image_quality=ai_image_quality,
         ai_result_bucket=ai_result_bucket,
+        iap_allowed_environments=iap_allowed_environments,
     )
 
 

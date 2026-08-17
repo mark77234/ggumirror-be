@@ -15,6 +15,8 @@ from typing import Protocol
 
 from app.auth.store import StoreUnavailable  # noqa: F401  (같은 실패 타입을 쓴다)
 from app.shards.models import (
+    ClaimOwnedByAnother,
+    ExclusiveClaim,
     InsufficientShards,
     PeriodQuota,
     QuotaExceeded,
@@ -50,6 +52,7 @@ class ShardStore(Protocol):
         reason: ShardReason,
         idempotency_key_hash: str | None,
         quota: PeriodQuota | None = None,
+        claim: ExclusiveClaim | None = None,
     ) -> tuple[ShardWallet, ShardLedgerEntry, bool]:
         """원장 한 줄을 적으면서 잔액을 갱신한다. **원자적이어야 한다.**
 
@@ -59,6 +62,9 @@ class ShardStore(Protocol):
           이미 찼으면 `QuotaExceeded` — 잔액도 원장도 counter도 그대로다.
           중복(idempotency)으로 판정되면 counter를 올리지 않는다 —
           같은 사건이 두 번 와도 quota가 두 칸 줄면 안 된다
+        - `claim`을 주면 **같은 transaction 안에서** 전역 자리를 잡는다.
+          이미 있고 주인이 같으면 중복(`applied=False`), **다른 사람이면
+          `ClaimOwnedByAnother`** — 잔액도 원장도 claim도 그대로다
 
         세 번째 값은 **이번 호출이 실제로 줄을 적었는가**(`applied`)다.
         원자적 쓰기의 결과 그 자체여야 한다 — 쓰기 전에 조회해서 짐작한 값이면
@@ -83,6 +89,8 @@ class InMemoryShardStore:
         # idempotency hash → 그때 만든 원장 줄
         self._applied: dict[str, ShardLedgerEntry] = {}
         self.quotas: dict[str, int] = {}
+        # (collection, key) → 저장한 문서. 전역 claim이라 user별로 나누지 않는다.
+        self.claims: dict[tuple[str, str], dict] = {}
         self._lock = threading.Lock()
 
     def wallet(self, user_id: str) -> ShardWallet:
@@ -101,8 +109,17 @@ class InMemoryShardStore:
         reason: ShardReason,
         idempotency_key_hash: str | None,
         quota: PeriodQuota | None = None,
+        claim: ExclusiveClaim | None = None,
     ) -> tuple[ShardWallet, ShardLedgerEntry, bool]:
         with self._lock:
+            # 전역 claim을 **가장 먼저** 본다. 주인이 다르면 그 자리에서 끝난다 —
+            # 원장 멱등은 user 안에서만 유일하므로 이 검사를 대신할 수 없다.
+            if claim is not None:
+                if existing_claim := self.claims.get((claim.collection, claim.key)):
+                    owner = existing_claim.get(claim.owner_field)
+                    if owner != user_id:
+                        raise ClaimOwnedByAnother()
+
             if idempotency_key_hash is not None:
                 if existing := self._applied.get(idempotency_key_hash):
                     # 같은 사건이 다시 왔다. 두 번 반영하지 않고, 적지 않았다고 답한다.
@@ -141,4 +158,11 @@ class InMemoryShardStore:
                 self._applied[idempotency_key_hash] = entry
             if quota is not None:
                 self.quotas[quota.key] = self.quotas.get(quota.key, 0) + 1
+            if claim is not None:
+                # 원장 · 잔액과 **같은 lock 안에서** 자리를 잡는다. 하나만 성공하는 상태가 없다.
+                self.claims[(claim.collection, claim.key)] = {
+                    **claim.document,
+                    claim.owner_field: user_id,
+                    "ledgerEntryId": entry.id,
+                }
             return wallet, entry, True

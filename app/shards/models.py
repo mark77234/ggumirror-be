@@ -103,6 +103,28 @@ class PeriodQuota:
 
 
 @dataclass(frozen=True)
+class ExclusiveClaim:
+    """**전역에서 한 번만** 쓸 수 있는 자리. 원장 기록과 같은 transaction에서 만든다.
+
+    원장 멱등(`idempotency_hash`)은 열쇠에 `user_id`가 들어가므로 **user 안에서만**
+    유일하다. 그래서 같은 외부 사건 id가 다른 사용자 이름으로 들어오면 막히지 않는다.
+    IAP transaction(B-6)이 첫 사용자다 — 같은 Apple transaction으로 두 사람이
+    각각 조각을 받는 일이 있으면 안 된다.
+
+    이미 있으면 **주인을 본다**: 같은 사용자면 재전송(중복)이고, 다른 사용자면 거절이다.
+
+    `PeriodQuota`와 같은 자리다 — `apply`가 한 transaction 안에서 함께 쓰는 문서다.
+    `collection`은 부르는 쪽이 정한다. 원장이 남의 collection 이름을 알고 있지 않다.
+    """
+
+    collection: str
+    key: str
+    document: dict
+    # 주인을 판단할 field 이름.
+    owner_field: str = "userId"
+
+
+@dataclass(frozen=True)
 class ShardMutationResult:
     """조각을 움직인 결과.
 
@@ -153,6 +175,13 @@ class InsufficientShards(ShardError):
 
 class InvalidShardAmount(ShardError):
     """0 이하이거나 너무 큰 값. 도메인에서 막는다."""
+
+
+class ClaimOwnedByAnother(ShardError):
+    """전역 claim을 **다른 사용자가** 이미 갖고 있다. **아무것도 기록되지 않는다.**
+
+    재전송(같은 사용자)과 구분해서 올린다 — 전자는 정상이고 이것은 거절이다.
+    """
 
 
 class QuotaExceeded(ShardError):

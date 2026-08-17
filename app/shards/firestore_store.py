@@ -17,6 +17,8 @@ from google.cloud import firestore
 
 from app.auth.store import StoreUnavailable
 from app.shards.models import (
+    ClaimOwnedByAnother,
+    ExclusiveClaim,
     InsufficientShards,
     PeriodQuota,
     QuotaExceeded,
@@ -77,8 +79,12 @@ class FirestoreShardStore:
         reason: ShardReason,
         idempotency_key_hash: str | None,
         quota: PeriodQuota | None = None,
+        claim: ExclusiveClaim | None = None,
     ) -> tuple[ShardWallet, ShardLedgerEntry, bool]:
         wallet_ref = self._db.collection(WALLETS).document(user_id)
+        claim_document_ref = (
+            self._db.collection(claim.collection).document(claim.key) if claim else None
+        )
         # 같은 사건을 두 번 적지 않기 위한 자리표. **document id가 곧 열쇠다** —
         # 이미 있으면 그 자리에 쓰지 못하므로 중복이 구조적으로 막힌다.
         claim_ref = (
@@ -96,10 +102,20 @@ class FirestoreShardStore:
             두 요청이 둘 다 "없더라, 내가 적었다"고 답한다 — 잔액은 맞지만 응답이 거짓말이 된다.
             """
             # 읽기는 쓰기보다 먼저. Firestore transaction의 규칙이다.
-            claim = claim_ref.get(transaction=transaction) if idempotency_key_hash else None
-            if claim is not None and claim.exists:
-                data = claim.to_dict() or {}
-                existing = _entry(claim.id, data)
+            #
+            # 전역 claim을 **가장 먼저** 본다. 주인이 다르면 여기서 끝난다 —
+            # 원장 멱등 열쇠에는 user_id가 들어가므로 이 검사를 대신할 수 없다.
+            if claim_document_ref is not None:
+                global_claim = claim_document_ref.get(transaction=transaction)
+                if global_claim.exists:
+                    owner = (global_claim.to_dict() or {}).get(claim.owner_field)
+                    if owner != user_id:
+                        raise ClaimOwnedByAnother()
+
+            existing_claim = claim_ref.get(transaction=transaction) if idempotency_key_hash else None
+            if existing_claim is not None and existing_claim.exists:
+                data = existing_claim.to_dict() or {}
+                existing = _entry(existing_claim.id, data)
                 wallet_snapshot = wallet_ref.get(transaction=transaction)
                 current = (
                     _wallet(user_id, wallet_snapshot.to_dict() or {})
@@ -154,6 +170,18 @@ class FirestoreShardStore:
             # 여기까지 왔다는 것은 이 transaction이 그 줄의 **작성자**라는 뜻이다.
             transaction.create(claim_ref, _entry_document(entry))
             transaction.set(wallet_ref, _wallet_document(wallet))
+            if claim_document_ref is not None:
+                # 원장 · 잔액과 **한 transaction**이다. `create`라서 우리가 읽은 뒤
+                # 다른 요청이 먼저 자리를 잡았으면 commit이 AlreadyExists로 깨진다.
+                transaction.create(
+                    claim_document_ref,
+                    {
+                        **claim.document,
+                        claim.owner_field: user_id,
+                        "ledgerEntryId": entry.id,
+                        "createdAt": now,
+                    },
+                )
             if quota_ref is not None:
                 # 지급과 같은 transaction에서 counter가 오른다. 둘이 갈라질 수 없다.
                 transaction.set(
@@ -164,7 +192,8 @@ class FirestoreShardStore:
 
         try:
             wallet, entry, applied = run(self._db.transaction())
-        except (InsufficientShards, QuotaExceeded):
+        except (InsufficientShards, QuotaExceeded, ClaimOwnedByAnother):
+            # 도메인 거절이다. 아무것도 기록되지 않았고, 재시도로 달라지지 않는다.
             raise
         except gcp_exceptions.AlreadyExists:
             # 같은 사건이 동시에 두 번 들어왔고, 우리가 읽은 뒤 상대가 먼저 commit했다.

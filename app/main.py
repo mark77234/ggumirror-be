@@ -22,7 +22,10 @@ from app.ai.provider import ImageProvider, build_provider
 from app.ai.service import AIStickerService
 from app.ai.storage import GenerationStorage, build_storage
 from app.ai.store import GenerationStore
-from app.api import ads, ai, auth, health, users
+from app.iap.models import parse_allowed_environments
+from app.iap.service import IAPService
+from app.iap.verifier import TransactionVerifier, build_verifier
+from app.api import ads, ai, auth, health, iap, users
 from app.auth.apple import AppleTokenVerifier
 from app.auth.store import AuthStore
 from app.shards.service import ShardLedgerService
@@ -35,6 +38,7 @@ logger = logging.getLogger(__name__)
 def create_app(
     settings: Settings | None = None,
     auth_store: AuthStore | None = None,
+    transaction_verifier: TransactionVerifier | None = None,
     shard_store: ShardStore | None = None,
     reward_context_store: RewardContextStore | None = None,
     admob_keys: AdMobKeyProvider | None = None,
@@ -132,17 +136,30 @@ def create_app(
             storage=generation_storage or build_storage(settings.ai_result_bucket),
         )
 
+    @lru_cache(maxsize=1)
+    def shard_iap() -> IAPService:
+        # 검증기가 없어도 service는 만들어진다 — `is_available`이 False가 될 뿐이다.
+        # **가짜 검증기를 설정으로 켤 수 있는 경로를 만들지 않는다**(test 주입 전용).
+        return IAPService(
+            verifier=transaction_verifier or build_verifier(),
+            shards=shards(),
+            bundle_id=settings.apple_client_id,
+            allowed_environments=parse_allowed_environments(settings.iap_allowed_environments),
+        )
+
     app.state.apple_verifier = verifier
     app.state.auth_store = store
     app.state.shard_service = shards
     app.state.rewarded_ad_service = rewarded_ads
     app.state.ai_sticker_service = ai_stickers
+    app.state.iap_service = shard_iap
 
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(users.router)
     app.include_router(ads.router)
     app.include_router(ai.router)
+    app.include_router(iap.router)
 
     logger.info("app created env=%s log_level=%s", settings.app_env, settings.log_level)
     return app

@@ -20,10 +20,11 @@ Backend repository for 꾸미러.
 - purchase / ownership
 - seller shard settlement
 
-## Current Implementation (Phase A-1B.2 완료)
+## Current Implementation (Phase B-6A 완료)
 
 FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth +
-server-authoritative 조각 원장 + 하루 한 번 출석 + AdMob rewarded SSV + AI 스티커 생성.
+server-authoritative 조각 원장 + 하루 한 번 출석 + AdMob rewarded SSV + AI 스티커 생성 +
+조각 IAP foundation(Apple 검증은 B-6B).
 
 ```
 app/main.py          create_app()
@@ -55,19 +56,24 @@ app/shards/firestore_store.py  Firestore transaction 구현
 app/shards/service.py  ShardLedgerService
 app/shards/attendance.py  KST 날짜 규칙 + 출석 지급
 app/core/config.py   환경변수 + logging
+app/api/iap.py       POST /users/me/iap/shards (body는 signedTransaction 하나)
+app/iap/models.py    catalog(10/50/100) · 전역 claim id · appAccountToken 대조
+app/iap/verifier.py  Apple JWS 검증 seam (B-6B에서 공식 라이브러리로 채운다)
+app/iap/service.py   검증 → bundle/type/env/catalog/token → 원장
 scripts/admin_shards.py  운영자 조각 지급/회수 CLI (B-3 원장 재사용)
 tests/               pytest (Apple · Firestore 호출 없음)
 ```
 
-API는 health / auth / users / admob / ai뿐이다. store · listing · purchase는 없다.
+API는 health / auth / users / admob / ai / iap뿐이다. store · listing · marketplace는 없다.
 
-조각을 움직이는 통로는 **셋뿐**이고 전부 client가 값을 정할 수 없다:
+조각을 움직이는 통로는 **넷뿐**이고 전부 client가 값을 정할 수 없다:
 
 | 통로 | 무엇이 인증하나 | 방향 |
 |---|---|---|
 | `POST /users/me/attendance` | Bearer session (body 없음) | +1 |
 | `GET /admob/rewarded/ssv` | **Google ECDSA 서명** (Bearer 없음) | +1 |
 | `POST /ai/stickers` | Bearer session (body는 프롬프트뿐) | **−6** |
+| `POST /users/me/iap/shards` | Bearer session + **Apple 서명 JWS** | +10 / +50 / +100 |
 
 `POST /users/me/rewarded-ads/context`는 광고에 실을 opaque context를 발급할 뿐
 **조각을 움직이지 않는다.**
@@ -139,6 +145,56 @@ IAP(영수증 검증) · 구매 · 등록.
 
 차감 endpoint도 같은 규칙이다: `POST /ai/stickers`의 body는 **프롬프트 하나뿐**이고
 `amount` · `price` · `reason` · `userId`를 받는 자리가 없다.
+
+### 조각 IAP (B-6) — 서명된 transaction만 믿는다
+
+티어는 **10 / 50 / 100**이고 전부 **consumable**이다.
+
+| productId | 조각 |
+|---|---|
+| `com.mark77234.ggumirror.shards.10` | 10 |
+| `com.mark77234.ggumirror.shards.50` | 50 |
+| `com.mark77234.ggumirror.shards.100` | 100 |
+
+`POST /users/me/iap/shards`의 body는 **`signedTransaction` 하나뿐**이고
+`extra="forbid"`라 `amount`를 몰래 얹을 수 없다.
+
+#### 보안 invariant (영구 규칙)
+
+- **`appAccountToken`이 Apple transaction을 사용자에 묶는다.** StoreKit 구매 때
+  `.appAccountToken(<꾸미러 user UUID>)`를 싣고, 서버는 **서명된** 값이 지금 로그인한
+  사용자와 같을 때만 지급한다. **없으면 거절한다** — "없으면 현재 사용자로 본다"로 두면
+  남의 결제 JWS로 자기 지갑을 채울 수 있다.
+  꾸미러 user id는 UUID v4이고 `sha256("apple:<subject>")` 매핑으로 **재생성되지 않는다**
+  (identity 문서가 깨져 있으면 새 user를 만들지 않고 실패한다). 그래서 별도 token을 두지 않았다
+- **`transactionId`는 전역에서 한 번만 쓰인다.** 원장 멱등 열쇠에는 `user_id`가 들어가
+  **user 안에서만** 유일하므로, 같은 Apple transaction이 다른 사용자 이름으로 오면 막히지 않는다.
+  그래서 `ggumirror_iap_transactions/{hash}` 전역 claim이 따로 있다.
+  같은 사용자의 재전송은 `credited=false`, **다른 사용자면 409**다
+- **claim · ledger · wallet은 한 Firestore transaction**이다(`ShardStore.apply`의 `claim` 인자).
+  `PeriodQuota`와 같은 자리다 — 하나만 성공하는 상태가 없다
+- **수량은 서버 catalog가 정한다.** client가 보낸 productId도 쓰지 않고,
+  **JWS 안의 서명된 productId**를 열쇠로 쓴다
+- **`finish()`는 서버가 지급을 확정한 뒤에만** 부른다(client 규칙). 먼저 finish하면
+  응답을 잃었을 때 StoreKit이 재전달하지 않아 사용자가 돈만 내고 조각을 잃는다
+- **Xcode StoreKit Testing JWS를 production backend가 받지 않는다.**
+  `parse_allowed_environments`가 `Xcode`를 값에서 **버린다** — 설정으로도 켤 수 없다.
+  로컬 `.storekit`은 client UX/복구 확인용이고, 실제 지급 검증은 Sandbox/TestFlight로 한다
+- **환불 대응은 실제 판매 활성화 전 필수다.** consumable도 환불되며, 그때 조각을 회수하지
+  않으면 무한 재구매·환불로 조각을 만들 수 있다. App Store Server Notifications V2의
+  `REFUND`를 받아 반대 부호 entry를 쌓는 것이 **출시 blocker**다(선택 사항이 아니다)
+- `IAP_ALLOWED_ENVIRONMENTS`가 비어 있으면 **아무것도 허용하지 않는다**(fail closed).
+  Debug 빌드도 production API를 쓰므로 Sandbox를 켜면 sandbox 결제가 production 경제에 들어온다
+- 로그에 raw `transactionId`를 남기지 않는다 — `sha256(txn)[:12]`만 (B-5 SSV와 같은 규칙)
+
+#### client 복구 계약 (B-6C)
+
+1. 앱 시작 즉시 `Transaction.updates` listener를 띄운다
+2. 인증된 서버 세션이 준비된 뒤 `Transaction.unfinished`를 sweep한다
+3. `VerificationResult.verified`만 backend에 제출한다
+4. backend가 지급을 확정한 뒤에만 `transaction.finish()`
+
+`Transaction.currentEntitlements`는 **consumable 복구에 쓰지 않는다** — 소모품은 거기에 남지 않는다.
 
 ### Admin Shard CLI (A-2) — 운영자 조정은 CLI 하나뿐
 
@@ -605,7 +661,7 @@ B-3 원장 위에 얹는다. 전부 server가 지급 / 차감한다.
 | B-4 ✅ | 출석 — 하루 1개 (Asia/Seoul day) | `daily_attendance` |
 | B-5 ✅ | AdMob rewarded — 1개, 하루 5회, **SSV 필수** | `rewarded_ad` |
 | A-1A ✅ | AI 스티커 — **−6개**, 실패하면 환불 | `ai_sticker` · `refund` |
-| B-6 | 조각 IAP — 10 / 30 / 70 / 160 | `iap_purchase` |
+| B-6 | 조각 IAP — 10 / 50 / 100 | `iap_purchase` |
 | B-7 | 꾸미러 Pass — ₩4,900 월 / ₩39,000 년 | 정책 확정 후 |
 | B-8 | 마켓 — 등록 20 조각, 조각 구매 거울은 영구 소유 | `mirror_publish_fee` · `mirror_purchase` · `mirror_sale` |
 
