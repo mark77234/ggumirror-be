@@ -998,12 +998,154 @@ B-3 원장 위에 얹는다. **전부 server가 지급 / 차감한다.**
 |---|---|---|---|
 | B-4 ✅ | 출석 — 하루 1개 | `daily_attendance` | user + reason + **KST 날짜** |
 | B-5 ✅ | AdMob rewarded — 1개, **하루 5회** | `rewarded_ad` | SSV `transaction_id` |
+| A-1A ✅ | AI 스티커 — **−6개**, 실패하면 환불 | `ai_sticker` · `refund` | 서버가 만든 `generation_id` |
 | B-6 | 조각 IAP — 10 / 30 / 70 / 160 | `iap_purchase` | App Store transaction id |
 | B-7 | 꾸미러 Pass — ₩4,900 월 / ₩39,000 년 | (구독 혜택 정책 확정 후) | 구독 transaction id |
 | B-8 | 마켓 — 등록 20 조각, 조각으로 산 거울은 영구 소유 | `mirror_publish_fee` · `mirror_purchase` · `mirror_sale` | 주문 id |
 
 B-5는 **Google SSV callback만** 보상 근거로 쓴다. B-6 / B-7은 Apple 영수증 검증
 결과만 쓴다 — client의 "구매 성공했다"를 그대로 믿지 않는다.
+
+## AI 스티커 (A-1A · A-1B)
+
+프롬프트 한 줄 → 투명 PNG. **조각을 쓰는 첫 기능**이고,
+생성은 **서버가 소유하는 durable 작업**이다(A-1B).
+
+| endpoint | 하는 일 |
+|---|---|
+| `GET /ai/stickers/config` | `available` · `price` · `resultRetentionDays`. + 묶인 조각 정리(sweep) |
+| `POST /ai/stickers` | `{requestId, prompt}` → `{generationId, status, createdAt, balance}` |
+| `GET /ai/stickers/{id}` | 상태 조회. 남의 것은 **404** |
+| `GET /ai/stickers/{id}/image` | 결과 PNG. Bearer + 소유자 검증 |
+
+**응답에 이미지가 없다.** A-1A는 base64로 실어 보냈고 그래서 응답을 잃으면 끝이었다.
+지금은 결과가 먼저 durable하게 저장되고, 같은 `requestId`로 다시 물으면 되찾을 수 있다.
+
+### 멱등성
+
+`generationId = sha256(len:userId|len:requestId)`이고 그것이 곧 Firestore 문서 ID다.
+같은 `(user, requestId)`는 **provider 1회 · 차감 1회**다. 재시도할 때는 `prompt`를 비운다 —
+응답을 잃은 client는 원문을 다시 보낼 수 없고 서버도 저장하지 않는다.
+
+### 복구
+
+    upload → status=succeeded → 응답     (이 순서를 바꾸지 않는다)
+
+⚠️ **Cloud Run timeout은 container를 죽이지 않는다** — client 연결을 끊고 504를 줄 뿐이다.
+예전 worker가 살아서 늦게 성공할 수 있으므로 시간에 경제를 걸지 않는다.
+
+안전은 **terminal 권위 + lease CAS**가 만든다: `refunded → succeeded`도
+`succeeded → refunded`도 불가능하다. CAS에서 진 worker는 자기 object를 치운다(orphan).
+
+`lease` 만료만으로는 환불하지 않는다. `RECOVERY_GRACE`(15분, 정상 worker 수명보다 훨씬 김)를
+넘기면 **recovery eligible**이 되고, 실제 정리는 그 작업을 건드리는 다음 요청
+(재시도 · 상태 조회 · 앱 시작 sweep)에서 결과 유무를 보고 일어난다.
+**시간이 지났다고 저절로 풀리지 않는다** — 아무도 오지 않으면 `pending`으로 남는다.
+`GET /image`는 `status == succeeded`일 때만 내보낸다 — object 존재는 증거일 뿐이다.
+
+### 환경변수
+
+| | |
+|---|---|
+| `AI_IMAGE_API_KEY` | provider API key. **비어 있으면 기능이 꺼진다**(fail closed) |
+| `AI_IMAGE_MODEL` | `gpt-image-1` · `gpt-image-1.5` · `gpt-image-1-mini` 중 하나 |
+| `AI_IMAGE_QUALITY` | 기본 `medium` |
+
+model을 아무거나 넣을 수 없다. `background="transparent"`를 **공식 문서에서 확인한 것만**
+통과한다 — **`gpt-image-2`는 투명 배경을 지원하지 않고**, Gemini / Imagen 계열은
+alpha channel 자체를 내보내지 못한다. 모르는 값을 넣으면 `observed_model=`만 남기고
+기능이 꺼진다(추측한 값으로 조각만 태우는 것보다 낫다).
+
+**앱을 다시 내지 않고 이 값만 채우면 기능이 열린다** — client는 `config`를 보고 CTA를 켠다.
+
+### 켜기 전에 해야 하는 것 (아직 하지 않았다)
+
+아래는 전부 **production mutation**이라 코드와 함께 자동으로 일어나지 않는다.
+지금 `AI_IMAGE_API_KEY` · `AI_RESULT_BUCKET`이 비어 있어 기능은 fail closed다.
+
+1. **OpenAI 꾸미러 전용 Project.** DailyOPIc key를 재사용하지 않는다.
+   Project(예: `ggumirror-production`)를 새로 만들고 그 project 안에서 key를 발급한다 —
+   project를 나눠야 spend budget · rate limit · key 폐기를 따로 할 수 있다.
+   image generation에 필요한 최소 권한만 준다.
+
+2. **Secret Manager** (API가 아직 꺼져 있다):
+   ```
+   gcloud services enable secretmanager.googleapis.com --project=ggumirror-prod
+   gcloud secrets create ggumirror-openai-api-key --project=ggumirror-prod --replication-policy=automatic
+   # 값은 stdin으로만 넣는다. 명령줄 인자로 주면 shell history에 남는다.
+   gcloud secrets versions add ggumirror-openai-api-key --project=ggumirror-prod --data-file=-
+   gcloud secrets add-iam-policy-binding ggumirror-openai-api-key --project=ggumirror-prod \
+     --member=serviceAccount:ggumirror-api-runtime@ggumirror-prod.iam.gserviceaccount.com \
+     --role=roles/secretmanager.secretAccessor
+   ```
+
+   **secret 하나에만** `secretAccessor`를 붙인다 — project-level
+   `roles/secretmanager.secretAccessor`를 주지 않는다. 그러면 앞으로 생길 모든 secret을
+   이 SA가 읽게 된다.
+
+3. **결과 bucket** (꾸미러 전용 · private · uniform access · lifecycle 7일):
+   ```
+   gcloud storage buckets create gs://ggumirror-ai-results --project=ggumirror-prod \
+     --location=asia-northeast3 --uniform-bucket-level-access --public-access-prevention
+   gcloud storage buckets update gs://ggumirror-ai-results --project=ggumirror-prod \
+     --lifecycle-file=scripts/ai-results-lifecycle.json
+   gcloud storage buckets add-iam-policy-binding gs://ggumirror-ai-results --project=ggumirror-prod \
+     --member=serviceAccount:ggumirror-api-runtime@ggumirror-prod.iam.gserviceaccount.com \
+     --role=roles/storage.objectAdmin
+   ```
+
+   **권한은 bucket 하나에만 붙인다. project-wide storage role을 주지 않는다.**
+   runtime SA는 지금 `roles/datastore.user`뿐이고, 여기에 더하는 것은
+   **이 bucket의 object 권한**뿐이다. 필요한 동작은 세 가지다:
+
+   | 동작 | 왜 필요한가 |
+   |---|---|
+   | create | 생성 결과 upload |
+   | read | `GET /image` 스트리밍 · 복구 시 존재 확인 |
+   | **delete** | CAS에서 진 worker의 orphan object 정리 |
+
+   delete까지 필요해서 `objectAdmin`을 쓴다. delete를 빼려면 `objectCreator` +
+   `objectViewer`로 나눌 수 있지만, 그러면 orphan이 lifecycle(7일)까지 남는다 —
+   사용자에게 나가지는 않지만 저장 비용과 감사 잡음이 된다.
+   bucket 밖(다른 bucket · project 전체)에는 어떤 권한도 주지 않는다.
+
+4. **`--timeout`.** 이미지 생성은 수십 초가 걸린다. 현재 `--timeout=30s`로는
+   정상 생성도 잘리고, 그러면 사용자는 조각을 쓰고 아무것도 받지 못한다.
+   **`--timeout=180s`** 로 올린다.
+
+   > ⚠️ **timeout은 "container를 죽이는 deadline"이 아니라 client 응답 deadline이다.**
+   > 초과해도 worker는 계속 돈다. 그래서 순서가 중요하다:
+   >
+   >     provider(90s) < Cloud Run(180s) < client(200s)
+   >
+   > provider 쪽이 **먼저** 끊겨야 application이 실패를 직접 보고 환불까지 마친다.
+   > 반대면 client만 끊기고 정리는 아무도 하지 않는 구간이 길어진다.
+
+   AI 때문에 전체 서비스 timeout이 올라간다. 다른 endpoint는 이미 수백 ms 안에 끝나므로
+   **느려지지 않는다** — 늘어나는 것은 "죽은 요청을 붙잡고 있는 최대 시간"뿐이고,
+   `--max-instances=3` · `--concurrency=80`은 그대로다.
+
+5. 배포:
+   ```
+   gcloud run deploy ggumirror-api --project=ggumirror-prod --region=asia-northeast3 \
+     --image=... --timeout=180s \
+     --set-env-vars="...,AI_IMAGE_MODEL=gpt-image-1,AI_RESULT_BUCKET=ggumirror-ai-results" \
+     --set-secrets="AI_IMAGE_API_KEY=ggumirror-openai-api-key:latest"
+   ```
+   `--set-env-vars`는 기존 값을 **덮어쓴다** — `ADMOB_*`를 포함해 전부 다시 적는다.
+
+### 조각
+
+- **차감이 provider 호출보다 먼저다.** 요금 나가는 호출을 잔액 없이 하지 않는다
+- 잔액이 곧 상한이다 — 하루 N회 counter를 따로 두지 않았다
+- provider가 실패하면 `refund`로 되돌린다(append-only, 재시도해도 한 번)
+- 가격은 서버 상수 하나이고 `config`로 내려간다. **client가 가격을 알고 있지 않다**
+
+### 저장하지 않는 것
+
+프롬프트 원문 · 생성된 이미지. 응답으로 한 번 흘려보내고 끝이다 —
+Cloud Storage bucket이 필요 없는 이유이고, 스티커의 주인은 기기다.
+로그에는 `prompt_length`만 남는다.
 
 ## 다음 Phase
 

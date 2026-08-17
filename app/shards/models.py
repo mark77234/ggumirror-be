@@ -38,6 +38,7 @@ class ShardReason(StrEnum):
     DAILY_ATTENDANCE = "daily_attendance"
     REWARDED_AD = "rewarded_ad"
     IAP_PURCHASE = "iap_purchase"
+    AI_STICKER = "ai_sticker"
     MIRROR_PURCHASE = "mirror_purchase"
     MIRROR_SALE = "mirror_sale"
     MIRROR_PUBLISH_FEE = "mirror_publish_fee"

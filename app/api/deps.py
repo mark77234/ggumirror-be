@@ -14,6 +14,7 @@ from typing import Annotated
 from fastapi import Depends, HTTPException, Request, status
 
 from app.ads.service import RewardedAdService
+from app.ai.service import AIStickerService
 from app.auth.apple import AppleTokenVerifier
 from app.auth.models import User, sha256_hex
 from app.auth.store import AuthStore, StoreUnavailable
@@ -57,6 +58,19 @@ def rewarded_ad_service(request: Request) -> RewardedAdService:
         return request.app.state.rewarded_ad_service()
     except Exception as error:  # Firestore client 생성 실패 (credential / network)
         logger.error("rewarded_ad_service_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
+def ai_sticker_service(request: Request) -> AIStickerService:
+    """AI 스티커 service. store와 같은 이유로 처음 쓰일 때 만든다.
+
+    provider가 설정되지 않은 것은 **여기서 실패하지 않는다** — service는 만들어지고
+    `is_available`이 False가 될 뿐이다. 그래야 `/ai/stickers/config`가 답할 수 있다.
+    """
+    try:
+        return request.app.state.ai_sticker_service()
+    except Exception as error:  # Firestore client 생성 실패 (credential / network)
+        logger.error("ai_sticker_service_unavailable error=%s", type(error).__name__)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
 
 

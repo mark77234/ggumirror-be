@@ -18,7 +18,11 @@ from fastapi import FastAPI
 from app.ads.service import RewardedAdConfig, RewardedAdService
 from app.ads.store import RewardContextStore
 from app.ads.verifier import AdMobKeyProvider
-from app.api import ads, auth, health, users
+from app.ai.provider import ImageProvider, build_provider
+from app.ai.service import AIStickerService
+from app.ai.storage import GenerationStorage, build_storage
+from app.ai.store import GenerationStore
+from app.api import ads, ai, auth, health, users
 from app.auth.apple import AppleTokenVerifier
 from app.auth.store import AuthStore
 from app.shards.service import ShardLedgerService
@@ -34,6 +38,9 @@ def create_app(
     shard_store: ShardStore | None = None,
     reward_context_store: RewardContextStore | None = None,
     admob_keys: AdMobKeyProvider | None = None,
+    image_provider: ImageProvider | None = None,
+    generation_store: GenerationStore | None = None,
+    generation_storage: GenerationStorage | None = None,
 ) -> FastAPI:
     """store를 주면 그것을 쓴다 — test는 in-memory fake와 test key를 넣는다."""
     settings = settings or load_settings()
@@ -102,15 +109,40 @@ def create_app(
             ),
         )
 
+    @lru_cache(maxsize=1)
+    def ai_stickers() -> AIStickerService:
+        # provider나 bucket이 없어도 service는 만들어진다 — `is_available`이 False가 되고,
+        # `/ai/stickers/config`가 client에게 CTA를 감추라고 답한다(fail closed).
+        if generation_store is not None:
+            store: GenerationStore = generation_store
+        else:
+            from app.ai.firestore_store import FirestoreGenerationStore
+
+            store = FirestoreGenerationStore(_firestore())
+
+        return AIStickerService(
+            shards=shards(),
+            provider=image_provider
+            or build_provider(
+                api_key=settings.ai_image_api_key,
+                model=settings.ai_image_model,
+                quality=settings.ai_image_quality,
+            ),
+            store=store,
+            storage=generation_storage or build_storage(settings.ai_result_bucket),
+        )
+
     app.state.apple_verifier = verifier
     app.state.auth_store = store
     app.state.shard_service = shards
     app.state.rewarded_ad_service = rewarded_ads
+    app.state.ai_sticker_service = ai_stickers
 
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(users.router)
     app.include_router(ads.router)
+    app.include_router(ai.router)
 
     logger.info("app created env=%s log_level=%s", settings.app_env, settings.log_level)
     return app

@@ -7,3 +7,6 @@ uvicorn==0.40.0
 pyjwt[crypto]==2.12.0
 # Firestore. iOS는 Firestore에 직접 붙지 않는다 — 이 backend만 접근한다.
 google-cloud-firestore==2.22.0
+# AI 생성 결과를 잠시 두는 private bucket. **client는 bucket에 직접 붙지 않는다** —
+# signed URL을 만들지 않고 우리 endpoint로만 스트리밍한다.
+google-cloud-storage==3.4.1
