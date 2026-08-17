@@ -24,7 +24,8 @@ from app.ai.storage import GenerationStorage, build_storage
 from app.ai.store import GenerationStore
 from app.iap.models import parse_allowed_environments
 from app.iap.service import IAPService
-from app.iap.verifier import TransactionVerifier, build_verifier
+from app.iap.apple_verifier import build_apple_verifier
+from app.iap.verifier import TransactionVerifier
 from app.api import ads, ai, auth, health, iap, users
 from app.auth.apple import AppleTokenVerifier
 from app.auth.store import AuthStore
@@ -141,7 +142,12 @@ def create_app(
         # 검증기가 없어도 service는 만들어진다 — `is_available`이 False가 될 뿐이다.
         # **가짜 검증기를 설정으로 켤 수 있는 경로를 만들지 않는다**(test 주입 전용).
         return IAPService(
-            verifier=transaction_verifier or build_verifier(),
+            verifier=transaction_verifier
+            or build_apple_verifier(
+                bundle_id=settings.apple_client_id,
+                allowed_environments=parse_allowed_environments(settings.iap_allowed_environments),
+                app_apple_id=settings.iap_app_apple_id,
+            ),
             shards=shards(),
             bundle_id=settings.apple_client_id,
             allowed_environments=parse_allowed_environments(settings.iap_allowed_environments),

@@ -20,11 +20,11 @@ Backend repository for 꾸미러.
 - purchase / ownership
 - seller shard settlement
 
-## Current Implementation (Phase B-6A 완료)
+## Current Implementation (Phase B-6B 완료)
 
 FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth +
 server-authoritative 조각 원장 + 하루 한 번 출석 + AdMob rewarded SSV + AI 스티커 생성 +
-조각 IAP foundation(Apple 검증은 B-6B).
+조각 IAP(Apple 공식 library로 JWS 검증. client/UI는 B-6C).
 
 ```
 app/main.py          create_app()
@@ -58,7 +58,9 @@ app/shards/attendance.py  KST 날짜 규칙 + 출석 지급
 app/core/config.py   환경변수 + logging
 app/api/iap.py       POST /users/me/iap/shards (body는 signedTransaction 하나)
 app/iap/models.py    catalog(10/50/100) · 전역 claim id · appAccountToken 대조
-app/iap/verifier.py  Apple JWS 검증 seam (B-6B에서 공식 라이브러리로 채운다)
+app/iap/verifier.py  검증 seam (protocol + fail-closed Unconfigured)
+app/iap/apple_verifier.py  Apple 공식 SignedDataVerifier wrapper (environment별)
+app/iap/certs/       Apple root certificate (DER, 공개값)
 app/iap/service.py   검증 → bundle/type/env/catalog/token → 원장
 scripts/admin_shards.py  운영자 조각 지급/회수 CLI (B-3 원장 재사용)
 tests/               pytest (Apple · Firestore 호출 없음)
@@ -186,6 +188,49 @@ IAP(영수증 검증) · 구매 · 등록.
 - `IAP_ALLOWED_ENVIRONMENTS`가 비어 있으면 **아무것도 허용하지 않는다**(fail closed).
   Debug 빌드도 production API를 쓰므로 Sandbox를 켜면 sandbox 결제가 production 경제에 들어온다
 - 로그에 raw `transactionId`를 남기지 않는다 — `sha256(txn)[:12]`만 (B-5 SSV와 같은 규칙)
+
+#### JWS 검증은 Apple 공식 library가 한다 (B-6B)
+
+`app-store-server-library==3.1.2`의 `SignedDataVerifier.verify_and_decode_signed_transaction`.
+**x5c 인증서 체인 검증기를 직접 만들지 않는다** — 체인 · 만료 · 폐기 판단을 우리가 지면
+틀렸을 때 조각이 공짜가 된다. `tests/test_iap_verification.py`가 소스에서 자작 구현을 금지한다.
+
+library가 요구하는 것(설치본 소스에서 확인): 체인 길이 **정확히 3** · leaf에 OID
+`1.2.840.113635.100.6.11.1` · intermediate에 OID `1.2.840.113635.100.6.2.1` ·
+`X509_STRICT`(SKI/AKI + CA keyUsage) · alg **ES256**만.
+
+**Apple root certificate** — 공개 값이라 secret이 아니다. `app/iap/certs/`에 DER로 커밋한다.
+runtime에 외부 URL을 부르지 않는다(결제 검증이 남의 사이트 가용성에 묶이면 안 되고,
+값이 조용히 바뀌어도 안 된다). 출처: <https://www.apple.com/certificateauthority/>
+
+| 파일 | 이름 | SHA-256 (DER) |
+|---|---|---|
+| `AppleIncRootCertificate.cer` | Apple Root CA | `b0b1730ecbc7ff4505142c49f1295e6eda6bcaed7e2c68c5be91b5a11001f024` |
+| `AppleRootCA-G2.cer` | Apple Root CA - G2 | `c2b9b042dd57830e7d117dac55ac8ae19407d38e41d88f3215bc3a890444a050` |
+| `AppleRootCA-G3.cer` | Apple Root CA - G3 | `63343abfb89a6a03ebb57e9b3f5fa7be7c4f5c756f3017b3a8c488c3653e9179` |
+
+Apple PKI가 공개한 root **세 개를 모두** 넣는다. 현재 App Store JWS 체인은 G3에 뿌리를 두지만,
+G3 하나만 가정하면 Apple이 체인을 옮길 때 결제가 통째로 멈춘다. 셋 다 Apple 자신의 root라
+신뢰 범위가 넓어지는 손실이 없고, bundleId · environment · 체인 길이 검사는 그대로 걸린다.
+
+**`enable_online_checks=True`가 기본이다.** 인증서 **폐기(OCSP)** 확인을 켠다 —
+돈이 오가는 경로에서 폐기된 서명 인증서를 받는 것이 더 위험하다. 조회가 실패하면
+`RETRYABLE_VERIFICATION_FAILURE`를 받아 **503으로 올리고 지급하지 않는다**(우회 경로 없음).
+client가 아직 `finish()`하지 않았으므로 그 결제는 유실되지 않고 다시 온다 —
+그래서 fail closed의 비용이 싸다.
+
+- **Production verifier에는 numeric `appAppleId`가 필수다.** library가 생성 시점에 거절하므로
+  `IAP_APP_APPLE_ID`가 없으면 **Production만 꺼진다**(Sandbox는 그대로). 느슨하게 만들지 않는다
+- **`.p8` / issuerId / keyId는 JWS 검증에 필요 없다.** App Store Server **API**를 부를 때만
+  필요하고 지금은 부르지 않는다. 그래서 Secret Manager에 아무것도 더하지 않았다.
+  환불 조회(B-6F)처럼 실제 API 호출이 필요해질 때 도입한다
+- **unverified payload로 verifier를 고르지 않는다.** 서명 검증 전에 `environment`를 읽어
+  Production/Sandbox를 선택하면 공격자가 그 값으로 검증 경로를 고를 수 있다.
+  대신 **서버가 허용한 verifier들을 고정 순서로 각각 시도**하고 정확히 하나만 성공해야 한다
+- **`Xcode` · `LocalTesting` verifier는 만들지 않는다.** library는 그 두 environment에서
+  **서명 검증을 아예 건너뛴다**(`signed_data_verifier.py`에서 확인). 만들면 위조 payload가
+  그대로 통과한다. `parse_allowed_environments`가 값 단계에서 버리고, verifier map에도 없다
+- 검증 실패 사유를 client에 알려주지 않는다 — 로그에 `environment` + `status`만 남긴다
 
 #### client 복구 계약 (B-6C)
 

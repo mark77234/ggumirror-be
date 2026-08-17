@@ -999,9 +999,26 @@ B-3 원장 위에 얹는다. **전부 server가 지급 / 차감한다.**
 | B-4 ✅ | 출석 — 하루 1개 | `daily_attendance` | user + reason + **KST 날짜** |
 | B-5 ✅ | AdMob rewarded — 1개, **하루 5회** | `rewarded_ad` | SSV `transaction_id` |
 | A-1A ✅ | AI 스티커 — **−6개**, 실패하면 환불 | `ai_sticker` · `refund` | 서버가 만든 `generation_id` |
-| B-6 | 조각 IAP — 10 / 50 / 100 | `iap_purchase` | App Store transaction id |
+| B-6 🔧 | 조각 IAP — 10 / 50 / 100 (서버 검증 완료, client는 B-6C) | `iap_purchase` | App Store `transactionId` |
 | B-7 | 꾸미러 Pass — ₩4,900 월 / ₩39,000 년 | (구독 혜택 정책 확정 후) | 구독 transaction id |
 | B-8 | 마켓 — 등록 20 조각, 조각으로 산 거울은 영구 소유 | `mirror_publish_fee` · `mirror_purchase` · `mirror_sale` | 주문 id |
+
+### 조각 IAP 검증 (B-6)
+
+Apple 공식 **`app-store-server-library==3.1.2`**의 `SignedDataVerifier`로 StoreKit
+transaction JWS를 검증한다. **x5c 인증서 체인 검증기를 직접 만들지 않는다.**
+
+- **Apple root certificate는 `app/iap/certs/`에 DER로 커밋한다** — 공개 값이라 secret이 아니다.
+  runtime에 외부 URL을 부르지 않는다. 출처 <https://www.apple.com/certificateauthority/>,
+  SHA-256 지문은 `CLAUDE.md`에 기록. Apple이 공개한 root **셋 다** 넣는다(G3 하나만 가정하지 않는다)
+- **`enable_online_checks=True`** — 인증서 폐기(OCSP) 확인을 켠다. 조회 실패는 **503**이고
+  검증을 건너뛰지 않는다. client가 `finish()` 전이라 그 결제는 다시 온다
+- **Production verifier에는 numeric `IAP_APP_APPLE_ID`가 필수다.** 없으면 Production만 꺼진다
+- **`.p8` / issuerId / keyId는 필요 없다** — App Store Server **API**를 부르지 않는다.
+  환불 조회처럼 실제 API 호출이 생길 때만 도입한다
+- **unverified payload의 `environment`로 verifier를 고르지 않는다.** 허용된 verifier들을
+  고정 순서로 시도하고 정확히 하나만 성공해야 한다
+- **`Xcode` verifier를 만들지 않는다.** library는 그 environment에서 **서명 검증을 건너뛴다**
 
 B-5는 **Google SSV callback만** 보상 근거로 쓴다. B-6 / B-7은 Apple 영수증 검증
 결과만 쓴다 — client의 "구매 성공했다"를 그대로 믿지 않는다.

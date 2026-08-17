@@ -75,6 +75,12 @@ class Settings:
     # `Xcode`는 값에 적어도 무시된다(`parse_allowed_environments`) —
     # 로컬 서명이라 신뢰 사슬이 없고, 받아 주면 누구나 조각을 만들 수 있다.
     iap_allowed_environments: str = ""
+    # App Store의 **numeric Apple ID**(adamId). Production verifier에 필수다 —
+    # Apple 공식 library가 `Environment.PRODUCTION`에서 이 값 없이는 verifier를
+    # 만들지도 못한다. 없으면 Production IAP만 조용히 꺼진다(fail closed).
+    # bundle id와 다른 값이고, App Store Connect > App Information에서 확인한다.
+    # secret이 아니다(공개 앱 식별자).
+    iap_app_apple_id: int | None = None
 
     @property
     def is_production(self) -> bool:
@@ -126,6 +132,16 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     ai_result_bucket = env.get("AI_RESULT_BUCKET", "").strip()
     iap_allowed_environments = env.get("IAP_ALLOWED_ENVIRONMENTS", "").strip()
 
+    raw_app_apple_id = env.get("IAP_APP_APPLE_ID", "").strip()
+    if raw_app_apple_id:
+        try:
+            iap_app_apple_id: int | None = int(raw_app_apple_id)
+        except ValueError as error:
+            # 조용히 무시하면 Production IAP가 이유 없이 꺼진 것처럼 보인다.
+            raise ValueError(f"IAP_APP_APPLE_ID={raw_app_apple_id!r} is not an integer") from error
+    else:
+        iap_app_apple_id = None
+
     return Settings(
         app_env=app_env,
         log_level=log_level,
@@ -140,6 +156,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         ai_image_quality=ai_image_quality,
         ai_result_bucket=ai_result_bucket,
         iap_allowed_environments=iap_allowed_environments,
+        iap_app_apple_id=iap_app_apple_id,
     )
 
 
