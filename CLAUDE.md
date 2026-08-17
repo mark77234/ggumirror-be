@@ -20,7 +20,7 @@ Backend repository for 꾸미러.
 - purchase / ownership
 - seller shard settlement
 
-## Current Implementation (Phase A-1B.1 완료)
+## Current Implementation (Phase A-1B.2 완료)
 
 FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth +
 server-authoritative 조각 원장 + 하루 한 번 출석 + AdMob rewarded SSV + AI 스티커 생성.
@@ -40,7 +40,7 @@ app/api/ads.py       GET /admob/rewarded/ssv (Google 서명이 곧 인증)
 app/api/ai.py        config · POST /ai/stickers · GET {id} · GET {id}/image
 app/ai/models.py     가격 · 상한 · 상태 전이표(can_transition) · lease/grace
 app/ai/prompt.py     프롬프트 정리 (저장하지 않는다)
-app/ai/provider.py   외부 image provider (투명 PNG · fail closed)
+app/ai/provider.py   외부 image provider (gpt-image-2 · valid PNG · fail closed)
 app/ai/service.py    차감 → 생성 → upload → 확정. 실패/중단이면 환불
 app/ai/store.py      GenerationStore protocol + in-memory (terminal 권위 + lease CAS)
 app/ai/firestore_store.py  ggumirror_ai_generations
@@ -375,6 +375,29 @@ Cloud Run은 요청 밖에서 CPU를 보장하지 않으므로(`min-instances=0`
 - **가격은 서버 상수 하나**(`DEFAULT_STICKER_PRICE`)이고 `GET /ai/stickers/config`로
   client에 내려간다. client가 가격을 알고 있지 않다 — 하드코딩하면 값을 바꿀 때 거짓말이 된다
 
+#### provider — production model은 `gpt-image-2` + 기기 배경제거 (A-1B.2)
+
+output contract는 **`valid PNG`**다. 투명을 요구하지 않는다.
+
+| | |
+|---|---|
+| model | **`gpt-image-2`** (현재 production model) |
+| size / quality / format | `1024x1024` / `low` / `png` |
+| `background` | **보내지 않는다** |
+| 투명 배경 | **기기가 만든다** — 기존 `PhotoStickerMaker`(Vision on-device) 재사용 |
+
+capability probe로 확인한 사실:
+
+- `gpt-image-1-mini`는 transparent를 **지원한다.** 하지만 **deprecated라 채택하지 않았다**
+- **`gpt-image-2`는 transparent를 지원하지 않는다** —
+  `400 / param=background / "Transparent background is not supported for this model."`
+
+그래서 allowlist를 억지로 넓히지 않고 **계약을 바꿨다.** 꾸미러에는 이미 사진 배경제거가
+있으므로 배경제거 API를 따로 붙이지 않는다 — 서버는 그림만 만들고 투명은 기기가 만든다.
+
+`SUPPORTED_MODELS` 기준도 "투명을 지원하는가"에서 "우리 요청 모양으로 PNG를 주는 것이
+확인됐는가"로 바뀌었다. 모르는 model이면 여전히 fail closed다.
+
 #### provider — 추측하지 않고 확인한 것만
 
 - **API key는 서버에만 있다**(`AI_IMAGE_API_KEY`). client bundle에 넣지 않는다.
@@ -387,12 +410,10 @@ Cloud Run은 요청 밖에서 CPU를 보장하지 않으므로(`min-instances=0`
 - 비어 있으면 **fail closed**다. 서비스는 뜨고 다른 기능은 그대로이며,
   `config`가 `available=false`를 돌려줘 client가 CTA를 감춘다.
   **앱을 다시 내지 않고 서버 설정만으로 기능이 열린다** — xcconfig feature flag가 필요 없다
-- model을 자유롭게 받지 않는다. `background="transparent"`를 **공식 문서에서 확인한 것만**
-  통과한다(`TRANSPARENT_MODELS`: `gpt-image-1` · `gpt-image-1.5` · `gpt-image-1-mini`).
-  **`gpt-image-2`는 투명 배경을 지원하지 않고**, Gemini / Imagen 계열은 alpha 자체를
-  내보내지 못한다. 모르는 model이면 `observed_model=`만 남기고 fail closed다(B-5와 같은 진단)
-- `background`와 `output_format`은 **짝이다.** 하나만 보내면 투명이 나오지 않는다
-- 응답이 PNG signature로 시작하지 않으면 거절한다 — client가 알파를 기대하고 깨진 것을 그린다
+- model을 자유롭게 받지 않는다(`SUPPORTED_MODELS`). 모르는 model이면 `observed_model=`만
+  남기고 fail closed다(B-5와 같은 진단)
+- 응답이 PNG signature로 시작하지 않으면 거절한다 — 기기의 배경제거가 읽지 못한다.
+  **alpha는 요구하지 않는다**
 - httpx를 runtime dependency로 올리지 않았다. stdlib urllib이다(jwks · SSV verifier와 같다)
 
 #### 저장하지 않는 것

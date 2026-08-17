@@ -6,20 +6,27 @@
 httpx를 runtime dependency로 올리지 않는다 — `app/auth/jwks.py`와
 `app/ads/verifier.py`가 이미 stdlib urllib으로 외부를 부르고 있고, 여기도 요청 하나다.
 
-## 투명 PNG
+## output contract = **valid PNG** (A-1B.2)
 
-"투명 배경을 지원한다"를 추측하지 않았다. 공식 문서에서 확인한 것만 쓴다:
+예전에는 provider가 **투명 PNG**를 주는 것이 계약이었고, 그래서
+`background="transparent"`를 보내고 그것을 지원하는 model만 통과시켰다.
 
-- OpenAI images API는 `background="transparent"`를 받는다. 값을 쓰려면
-  `output_format`이 투명을 담을 수 있어야 한다(`png` 또는 `webp`)
-- 이 parameter는 **GPT image 계열 일부만** 지원한다.
-  `gpt-image-1` · `gpt-image-1.5` · `gpt-image-1-mini`는 되고,
-  **`gpt-image-2`는 안 된다** — `background="transparent"`를 보내면 오류다
-- Google Gemini / Imagen 계열은 alpha channel 자체를 내보내지 못한다
+바뀌었다. 실제 capability probe에서 확인된 것:
 
-그래서 model 이름을 자유롭게 받지 않고 **확인된 것만 통과시킨다**(`TRANSPARENT_MODELS`).
-모르는 model이 설정되면 지급도 생성도 하지 않고 `not_configured`로 멈춘다 —
-잘못 설정한 채로 불투명한 사각형 스티커를 만들어 조각만 태우는 것보다 낫다.
+- `gpt-image-1-mini`는 transparent를 **지원한다**. 하지만 deprecated라 production
+  기본 model로 채택하지 않는다
+- **`gpt-image-2`는 transparent를 지원하지 않는다** —
+  `HTTP 400 / param=background / "Transparent background is not supported for this model."`
+  이 model이 현재 production model이다
+
+그래서 allowlist를 억지로 넓히지 않고 **계약을 바꿨다**: provider는 `valid PNG`만 주면 된다.
+**서버는 alpha를 요구하지 않는다.** 투명 배경은 client가 만든다 —
+꾸미러에는 이미 사진 배경제거(`PhotoStickerMaker`, Vision on-device)가 있고,
+AI 결과도 같은 길을 지난다. 배경제거 API를 따로 붙이지 않는다.
+
+model 이름은 여전히 자유롭게 받지 않는다(`SUPPORTED_MODELS`) — 다만 기준이
+"투명을 지원하는가"에서 "우리 요청 모양으로 PNG를 주는 것이 확인됐는가"로 바뀌었다.
+모르는 model이면 fail closed다.
 """
 
 from __future__ import annotations
@@ -38,8 +45,14 @@ logger = logging.getLogger(__name__)
 
 OPENAI_IMAGE_URL = "https://api.openai.com/v1/images/generations"
 
-# `background="transparent"`를 공식 문서에서 확인한 model만. 추측해서 늘리지 않는다.
-TRANSPARENT_MODELS = frozenset({"gpt-image-1", "gpt-image-1.5", "gpt-image-1-mini"})
+# 우리 요청 모양(`size` · `quality` · `output_format=png`)으로 **PNG를 주는 것이 확인된** model.
+# 추측해서 늘리지 않는다.
+#
+# `gpt-image-2`가 production 기본값이다. 나머지는 설정으로 바꿀 수 있는 선택지일 뿐이고
+# 자동으로 전환되지 않는다 — `gpt-image-1-mini`는 transparent까지 되지만 deprecated다.
+SUPPORTED_MODELS = frozenset({
+    "gpt-image-2", "gpt-image-1", "gpt-image-1.5", "gpt-image-1-mini",
+})
 
 # provider HTTP timeout. **Cloud Run request timeout(180초)보다 충분히 짧아야 한다.**
 #
@@ -54,11 +67,16 @@ TRANSPARENT_MODELS = frozenset({"gpt-image-1", "gpt-image-1.5", "gpt-image-1-min
 DEFAULT_TIMEOUT = 90.0
 
 # 스티커답게 나오도록 붙이는 고정 지시. 사용자 프롬프트를 대체하지 않고 감싼다.
+#
+# **투명 배경을 요구하지 않는다.** 배경은 기기에서 지운다(`PhotoStickerMaker`).
+# 대신 그 배경제거가 잘 되도록 요구한다 — 피사체 하나 · 또렷한 외곽선 ·
+# 균일한 단색 배경. Vision의 foreground mask는 이런 그림에서 가장 정확하다.
 STICKER_DIRECTION = (
     "A single die-cut sticker of: {prompt}. "
     "Centered, one subject only, thick clean outline, flat vivid colors, "
-    "cute illustration style, no text, no watermark, no drop shadow, "
-    "completely transparent background."
+    "cute illustration style, no text, no watermark, no drop shadow. "
+    "Place the subject on a plain uniform solid white background "
+    "with clear separation between the subject and the background."
 )
 
 
@@ -85,7 +103,7 @@ class UnconfiguredProvider:
 
 
 class OpenAIImageProvider:
-    """OpenAI images API. 투명 PNG를 **native로** 받는다 — 배경 제거 후처리가 없다."""
+    """OpenAI images API. **불투명 PNG를 받는다** — 배경은 기기에서 지운다."""
 
     is_configured = True
 
@@ -93,7 +111,7 @@ class OpenAIImageProvider:
         self,
         api_key: str,
         model: str,
-        quality: str = "medium",
+        quality: str = "low",
         url: str = OPENAI_IMAGE_URL,
         timeout: float = DEFAULT_TIMEOUT,
     ) -> None:
@@ -109,8 +127,9 @@ class OpenAIImageProvider:
             "prompt": STICKER_DIRECTION.format(prompt=prompt),
             "size": f"{IMAGE_SIZE}x{IMAGE_SIZE}",
             "quality": self._quality,
-            # 이 둘은 짝이다. `transparent`를 쓰려면 format이 투명을 담을 수 있어야 한다.
-            "background": "transparent",
+            # **`background`를 보내지 않는다.** production model(`gpt-image-2`)이
+            # `transparent`를 거절하고(400 / param=background), 우리는 그것이 필요 없다 —
+            # 투명은 client가 기존 배경제거로 만든다.
             "output_format": "png",
             "n": 1,
         }).encode()
@@ -162,21 +181,22 @@ class OpenAIImageProvider:
             logger.warning("ai_provider_unreadable_response error=%s", type(error).__name__)
             raise AIStickerError(AIStickerReason.PROVIDER_UNAVAILABLE) from error
 
-        # PNG signature. 다른 형식이 오면 client가 알파를 기대하고 깨진 것을 그린다.
+        # PNG signature. **이것이 계약의 전부다** — alpha는 요구하지 않는다.
+        # 형식이 다르면 기기의 배경제거가 읽지 못한다.
         if not image.startswith(b"\x89PNG\r\n\x1a\n"):
             logger.warning("ai_provider_not_png")
             raise AIStickerError(AIStickerReason.PROVIDER_UNAVAILABLE)
         return image
 
 
-def build_provider(api_key: str, model: str, quality: str = "medium") -> ImageProvider:
+def build_provider(api_key: str, model: str, quality: str = "low") -> ImageProvider:
     """설정 → provider. **하나라도 비었거나 모르는 model이면 fail closed다.**"""
     if not api_key or not model:
         logger.info("ai_provider_not_configured has_key=%s has_model=%s", bool(api_key), bool(model))
         return UnconfiguredProvider()
-    if model not in TRANSPARENT_MODELS:
+    if model not in SUPPORTED_MODELS:
         # B-5의 `observed_ad_unit`과 같은 진단이다 — 값을 추측해 넣지 않고,
         # 무엇이 설정됐는지만 안전하게 남긴다(model 이름은 secret이 아니다).
-        logger.error("ai_provider_model_lacks_transparency observed_model=%s", model)
+        logger.error("ai_provider_model_unsupported observed_model=%s", model)
         return UnconfiguredProvider()
     return OpenAIImageProvider(api_key=api_key, model=model, quality=quality)

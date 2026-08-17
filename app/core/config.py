@@ -51,14 +51,15 @@ class Settings:
     # `GET /ai/stickers/config`가 `available=false`를 돌려줘 client가 CTA를 감춘다.
     # 앱을 다시 빌드하지 않고 이 값만 채우면 기능이 열린다.
     #
-    # model은 아무거나 넣을 수 없다 — `background="transparent"`를 공식 문서에서
-    # 확인한 것만 통과한다(`app/ai/provider.py`의 `TRANSPARENT_MODELS`).
+    # model은 아무거나 넣을 수 없다 — 우리 요청 모양으로 PNG를 주는 것이 확인된 것만
+    # 통과한다(`app/ai/provider.py`의 `SUPPORTED_MODELS`). production 기본값은 `gpt-image-2`다.
+    # **투명 배경은 요구하지 않는다** — 배경제거는 기기가 한다(A-1B.2).
     # production에서는 **Secret Manager reference로 주입한다** — plain env value로 넣지 않는다.
     # (`gcloud run deploy --set-secrets=AI_IMAGE_API_KEY=ggumirror-openai-api-key:latest`)
     # 값은 로그에 남기지 않는다. 이 필드를 print / repr에 싣는 코드를 만들지 않는다.
     ai_image_api_key: str = ""
     ai_image_model: str = ""
-    ai_image_quality: str = "medium"
+    ai_image_quality: str = "low"
     # 생성 결과를 잠시 두는 꾸미러 전용 private bucket. **DailyOPIc bucket을 쓰지 않는다.**
     #
     # 비어 있으면 fail closed다 — 결과를 durable하게 두지 못하면 응답이 유실됐을 때
@@ -111,7 +112,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     # production에서도 필수가 아니다. 없으면 AI 스티커만 조용히 꺼진다.
     ai_image_api_key = env.get("AI_IMAGE_API_KEY", "").strip()
     ai_image_model = env.get("AI_IMAGE_MODEL", "").strip()
-    ai_image_quality = env.get("AI_IMAGE_QUALITY", "").strip() or "medium"
+    ai_image_quality = env.get("AI_IMAGE_QUALITY", "").strip() or "low"
     ai_result_bucket = env.get("AI_RESULT_BUCKET", "").strip()
 
     return Settings(

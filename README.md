@@ -1048,13 +1048,26 @@ B-5는 **Google SSV callback만** 보상 근거로 쓴다. B-6 / B-7은 Apple �
 | | |
 |---|---|
 | `AI_IMAGE_API_KEY` | provider API key. **비어 있으면 기능이 꺼진다**(fail closed) |
-| `AI_IMAGE_MODEL` | `gpt-image-1` · `gpt-image-1.5` · `gpt-image-1-mini` 중 하나 |
-| `AI_IMAGE_QUALITY` | 기본 `medium` |
+| `AI_IMAGE_MODEL` | **`gpt-image-2`** (production 기본값) |
+| `AI_IMAGE_QUALITY` | 기본 `low` |
 
-model을 아무거나 넣을 수 없다. `background="transparent"`를 **공식 문서에서 확인한 것만**
-통과한다 — **`gpt-image-2`는 투명 배경을 지원하지 않고**, Gemini / Imagen 계열은
-alpha channel 자체를 내보내지 못한다. 모르는 값을 넣으면 `observed_model=`만 남기고
-기능이 꺼진다(추측한 값으로 조각만 태우는 것보다 낫다).
+### 왜 `gpt-image-2` + 기기 배경제거인가 (A-1B.2)
+
+capability probe로 확인한 것:
+
+- `gpt-image-1-mini`는 `background=transparent`를 **지원한다.**
+  하지만 **deprecated라 production 기본 model로 채택하지 않았다**
+- **`gpt-image-2`는 지원하지 않는다** —
+  `400 / param=background / "Transparent background is not supported for this model."`
+  이것이 현재 production model이다
+
+그래서 allowlist를 억지로 넓히지 않고 **output contract를 바꿨다**: provider는
+`valid PNG`만 주면 되고 **서버는 alpha를 요구하지 않는다.** 요청에 `background`를 보내지 않는다.
+
+투명 배경은 **기기가 만든다.** 꾸미러에는 이미 사진 배경제거(`PhotoStickerMaker`,
+Vision on-device)가 있으므로 배경제거 API를 따로 붙이지 않는다.
+model 이름은 여전히 `SUPPORTED_MODELS`로 고정하고, 모르는 값이면
+`observed_model=`만 남기고 fail closed다.
 
 **앱을 다시 내지 않고 이 값만 채우면 기능이 열린다** — client는 `config`를 보고 CTA를 켠다.
 
@@ -1129,7 +1142,7 @@ alpha channel 자체를 내보내지 못한다. 모르는 값을 넣으면 `obse
    ```
    gcloud run deploy ggumirror-api --project=ggumirror-prod --region=asia-northeast3 \
      --image=... --timeout=180s \
-     --set-env-vars="...,AI_IMAGE_MODEL=gpt-image-1,AI_RESULT_BUCKET=ggumirror-ai-results" \
+     --set-env-vars="...,AI_IMAGE_MODEL=gpt-image-2,AI_RESULT_BUCKET=ggumirror-ai-results" \
      --set-secrets="AI_IMAGE_API_KEY=ggumirror-openai-api-key:latest"
    ```
    `--set-env-vars`는 기존 값을 **덮어쓴다** — `ADMOB_*`를 포함해 전부 다시 적는다.

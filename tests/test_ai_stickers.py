@@ -2,8 +2,9 @@
 
 여기서 고정하는 것:
 1. 프롬프트는 정리만 하고 **저장하지 않는다**
-2. `background="transparent"`를 지원한다고 **확인된 model만** 통과한다
-3. `background`와 `output_format`은 짝으로 나간다
+2. PNG를 준다고 **확인된 model만** 통과한다
+3. **`background`를 보내지 않는다** — production model이 거절하고, 우리는 필요 없다
+   (투명은 기기의 기존 배경제거가 만든다)
 4. 프롬프트 원문 · API key가 **로그에 절대 남지 않는다**
 
 작업 내구성(멱등 · 차감/환불 · 복구 · 소유자 · HTTP)은 `test_ai_durability.py`가 본다.
@@ -22,7 +23,7 @@ import pytest
 from app.ai.models import MAX_PROMPT_LENGTH, AIStickerError, AIStickerReason
 from app.ai.prompt import normalize_prompt
 from app.ai.provider import (
-    TRANSPARENT_MODELS,
+    SUPPORTED_MODELS,
     OpenAIImageProvider,
     UnconfiguredProvider,
     build_provider,
@@ -71,20 +72,26 @@ def test_prompt_at_the_limit_passes():
 
 
 def test_missing_key_or_model_is_unconfigured():
-    assert not build_provider("", "gpt-image-1").is_configured
+    assert not build_provider("", "gpt-image-2").is_configured
     assert not build_provider("sk-test", "").is_configured
     assert not build_provider("", "").is_configured
 
 
-def test_model_without_verified_transparency_is_refused():
-    """`gpt-image-2`는 `background=transparent`를 지원하지 않는다 — 추측해서 보내지 않는다."""
-    assert "gpt-image-2" not in TRANSPARENT_MODELS
-    assert not build_provider("sk-test", "gpt-image-2").is_configured
+def test_production_model_is_accepted():
+    """`gpt-image-2`가 production 기본값이다 — PNG를 주므로 통과한다."""
+    assert "gpt-image-2" in SUPPORTED_MODELS
+    assert build_provider("sk-test", "gpt-image-2").is_configured
 
 
 def test_verified_models_are_accepted():
-    for model in TRANSPARENT_MODELS:
+    for model in SUPPORTED_MODELS:
         assert build_provider("sk-test", model).is_configured
+
+
+def test_unverified_model_is_refused():
+    """확인하지 않은 이름은 통과시키지 않는다. 추측해서 늘리지 않는다."""
+    for model in ("dall-e-3", "gpt-image-9", "imagen-3"):
+        assert not build_provider("sk-test", model).is_configured
 
 
 def test_unknown_model_is_logged_with_its_name(caplog):
@@ -103,8 +110,10 @@ def test_unconfigured_provider_raises_not_configured():
 # MARK: - provider 요청 모양
 
 
-def test_request_asks_for_transparent_png(monkeypatch):
-    """`background`와 `output_format`은 짝이다 — 하나만 보내면 투명이 나오지 않는다."""
+def test_request_shape(monkeypatch):
+    """**`background`를 보내지 않는다.** production model(gpt-image-2)이 거절한다:
+    `400 / param=background / "Transparent background is not supported for this model."`
+    투명은 기기가 만든다."""
     sent: dict = {}
 
     class Response:
@@ -124,15 +133,23 @@ def test_request_asks_for_transparent_png(monkeypatch):
 
     monkeypatch.setattr("app.ai.provider.urllib.request.urlopen", fake_urlopen)
 
-    provider = OpenAIImageProvider(api_key="sk-test", model="gpt-image-1")
+    provider = OpenAIImageProvider(api_key="sk-test", model="gpt-image-2")
     assert provider.generate("귀여운 고양이") == PNG
 
-    assert sent["body"]["background"] == "transparent"
+    assert "background" not in sent["body"], "production model이 거절하는 값을 보냈다"
     assert sent["body"]["output_format"] == "png"
     assert sent["body"]["size"] == "1024x1024"
-    assert sent["body"]["model"] == "gpt-image-1"
+    assert sent["body"]["quality"] == "low"
+    assert sent["body"]["model"] == "gpt-image-2"
     # 사용자 프롬프트를 버리지 않고 감싼다.
     assert "귀여운 고양이" in sent["body"]["prompt"]
+
+
+def test_default_quality_is_low():
+    from app.ai.provider import build_provider as build
+
+    provider = build("sk-test", "gpt-image-2")
+    assert provider._quality == "low"  # noqa: SLF001 — 요청에 실리는 값을 고정한다
 
 
 def test_non_png_response_is_refused(monkeypatch):
@@ -149,7 +166,7 @@ def test_non_png_response_is_refused(monkeypatch):
 
     monkeypatch.setattr("app.ai.provider.urllib.request.urlopen", lambda *a, **k: Response())
     with pytest.raises(AIStickerError) as error:
-        OpenAIImageProvider(api_key="sk-test", model="gpt-image-1").generate("cat")
+        OpenAIImageProvider(api_key="sk-test", model="gpt-image-2").generate("cat")
     assert error.value.reason is AIStickerReason.PROVIDER_UNAVAILABLE
 
 
@@ -170,7 +187,7 @@ def test_http_errors_map_to_reasons(monkeypatch, status_code, expected):
 
     monkeypatch.setattr("app.ai.provider.urllib.request.urlopen", raise_http)
     with pytest.raises(AIStickerError) as error:
-        OpenAIImageProvider(api_key="sk-test", model="gpt-image-1").generate("cat")
+        OpenAIImageProvider(api_key="sk-test", model="gpt-image-2").generate("cat")
     assert error.value.reason is expected
 
 
@@ -180,7 +197,7 @@ def test_provider_error_log_has_no_prompt_or_key(monkeypatch, caplog):
 
     monkeypatch.setattr("app.ai.provider.urllib.request.urlopen", raise_http)
     with caplog.at_level(logging.DEBUG), pytest.raises(AIStickerError):
-        OpenAIImageProvider(api_key="sk-secret-key", model="gpt-image-1").generate("비밀 프롬프트")
+        OpenAIImageProvider(api_key="sk-secret-key", model="gpt-image-2").generate("비밀 프롬프트")
 
     assert "sk-secret-key" not in caplog.text
     assert "비밀 프롬프트" not in caplog.text
