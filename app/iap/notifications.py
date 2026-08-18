@@ -1,7 +1,7 @@
-"""App Store Server Notifications V2 (B-6F-A · B-6F-B).
+"""App Store Server Notifications V2 (B-6F-A · B-6F-B · B-6F-C).
 
-이 파일은 **검증하고 분류하는 곳**이다. 복구(`REFUND_REVERSED`, B-6F-C)는 아직 없고,
-처리할 수 없는 알림을 **200으로 삼키지 않는다** — Apple이 다시 보내게 둔다.
+이 파일은 **검증하고 분류하는 곳**이다. 처리할 수 없는 알림을 **200으로 삼키지 않는다** —
+Apple이 다시 보내게 둔다.
 
 **조각을 움직이는 코드는 여전히 여기 없다.** 환불조차 `IAPRefundService`에 맡기고
 이 파일은 어느 알림을 그리로 보낼지만 정한다 — 지급/차감 경로가 여기 섞이면
@@ -17,6 +17,7 @@ from app.iap.models import (
     ACKNOWLEDGED_NOTIFICATIONS,
     DEFERRED_NOTIFICATIONS,
     REFUND_NOTIFICATION,
+    REFUND_REVERSED_NOTIFICATION,
     AccountTokenMismatch,
     EnvironmentNotAllowed,
     IAPUnavailable,
@@ -110,12 +111,15 @@ class AppStoreNotificationService:
     def _route(self, notification: VerifiedNotification) -> NotificationOutcome:
         kind = notification.notification_type
 
-        if kind == REFUND_NOTIFICATION:
+        if kind in (REFUND_NOTIFICATION, REFUND_REVERSED_NOTIFICATION):
             if self._refunds is None:
                 logger.warning("app_store_notification_deferred type=%s reason=no_refund_handler", kind)
-                raise NotificationNotHandled("refund handling is not configured")
-            # 조각 회수는 저쪽이 한다. 여기서는 **어디로 보낼지만** 정한다.
-            self._refunds.handle(notification)
+                raise NotificationNotHandled(f"{kind} handling is not configured")
+            # 조각을 움직이는 것은 저쪽이다. 여기서는 **어디로 보낼지만** 정한다.
+            if kind == REFUND_NOTIFICATION:
+                self._refunds.handle(notification)
+            else:
+                self._refunds.handle_reversal(notification)
             return NotificationOutcome.ACKNOWLEDGED
 
         if kind in ACKNOWLEDGED_NOTIFICATIONS:

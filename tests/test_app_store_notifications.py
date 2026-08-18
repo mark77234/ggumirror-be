@@ -173,12 +173,25 @@ def test_no_op_notifications_are_acknowledged(chain, kind, with_transaction):
     assert service(chain).handle(payload) is NotificationOutcome.ACKNOWLEDGED
 
 
-@pytest.mark.parametrize("kind", sorted(DEFERRED_NOTIFICATIONS))
-def test_refund_notifications_are_deferred(chain, kind):
-    """**200으로 삼키지 않는다** — 아직 구현하지 않았으므로 재시도를 받아야 한다."""
+@pytest.mark.parametrize(
+    "kind",
+    # `DEFERRED_NOTIFICATIONS`가 비어 있으므로 그것으로 parametrize하면 **조용히 skip된다.**
+    # 실제로 deferred여야 하는 것들을 직접 적는다: 조각을 움직이는 타입 + 모르는 타입.
+    ["REFUND", "REFUND_REVERSED", "SUBSCRIBED", "SOMETHING_NEW_FROM_APPLE"],
+)
+def test_notifications_are_deferred_without_a_handler(chain, kind):
+    """**200으로 삼키지 않는다** — 처리할 수 없으면 재시도를 받아야 한다.
+
+    환불 계열은 처리기가 없을 때(fail closed), 모르는 타입은 언제나 deferred다.
+    """
     payload = notification_payload(chain, notificationType=kind)
     with pytest.raises(NotificationNotHandled):
         service(chain).handle(payload)
+
+
+def test_deferred_list_is_empty_but_the_concept_remains():
+    """비어 있어도 개념은 남긴다 — 조각에 영향 있는 새 타입이 생기면 여기 넣는다."""
+    assert DEFERRED_NOTIFICATIONS == frozenset()
 
 
 def test_unknown_type_is_deferred_not_swallowed(chain):
@@ -244,12 +257,13 @@ def test_one_time_charge_is_no_longer_unknown():
 
     assert "ONE_TIME_CHARGE" in ACKNOWLEDGED_NOTIFICATIONS
     assert "ONE_TIME_CHARGE" not in DEFERRED_NOTIFICATIONS
-    # `REFUND`는 B-6F-B에서 실제로 처리하므로 deferred가 아니다.
+    # 환불 계열은 실제로 처리하므로 deferred가 아니다(B-6F-B · B-6F-C).
     # **acknowledged allowlist에도 없다** — 검증만 하고 넘기는 알림이 아니기 때문이다.
-    assert "REFUND" not in DEFERRED_NOTIFICATIONS
-    assert "REFUND" not in ACKNOWLEDGED_NOTIFICATIONS
-    # 복구는 아직 B-6F-C다.
-    assert DEFERRED_NOTIFICATIONS == frozenset({"REFUND_REVERSED"})
+    for kind in ("REFUND", "REFUND_REVERSED"):
+        assert kind not in DEFERRED_NOTIFICATIONS
+        assert kind not in ACKNOWLEDGED_NOTIFICATIONS
+    # 이제 비어 있다. **모르는 타입은 이 목록과 무관하게 여전히 deferred다**(아래 test).
+    assert DEFERRED_NOTIFICATIONS == frozenset()
 
 
 def test_one_time_charge_logs_no_raw_values(chain, caplog):
@@ -367,9 +381,13 @@ class RecordingRefunds:
 
     def __init__(self) -> None:
         self.seen: list = []
+        self.reversed: list = []
 
     def handle(self, notification) -> None:
         self.seen.append(notification)
+
+    def handle_reversal(self, notification) -> None:
+        self.reversed.append(notification)
 
 
 def refund_payload(chain: Chain, **inner) -> str:
@@ -428,11 +446,30 @@ def test_purchase_transaction_has_no_revocation_fields(chain):
     assert transaction.revocation_percentage_milliunits is None
 
 
-def test_refund_reversed_is_still_deferred(chain):
-    """B-6F-C 미구현. **200으로 삼키지 않는다** — 처리기가 붙어 있어도 마찬가지다."""
+def test_refund_reversed_is_routed_to_the_reversal_handler(chain):
+    """B-6F-C. **회수 경로와 다른 함수**로 간다 — 되돌리기가 회수로 오해되면 안 된다."""
+    refunds = RecordingRefunds()
+
+    outcome = service(chain, refunds=refunds).handle(
+        notification_payload(chain, notificationType="REFUND_REVERSED")
+    )
+
+    assert outcome is NotificationOutcome.ACKNOWLEDGED
+    assert len(refunds.reversed) == 1
+    assert refunds.seen == [], "되돌리기가 회수 경로로 갔다"
+
+
+def test_refund_reversed_without_a_handler_is_deferred(chain):
+    """처리기가 없는데 200으로 답하면 사용자가 되돌려받을 조각을 잃는다. fail closed."""
+    with pytest.raises(NotificationNotHandled):
+        service(chain).handle(notification_payload(chain, notificationType="REFUND_REVERSED"))
+
+
+def test_unknown_type_is_still_deferred(chain):
+    """deferred 목록이 비었다고 **모르는 타입을 삼키지 않는다.**"""
     with pytest.raises(NotificationNotHandled):
         service(chain, refunds=RecordingRefunds()).handle(
-            notification_payload(chain, notificationType="REFUND_REVERSED")
+            notification_payload(chain, notificationType="SOMETHING_NEW_FROM_APPLE")
         )
 
 
@@ -449,3 +486,4 @@ def test_other_notifications_never_reach_the_refund_handler(chain, kind):
 
     assert outcome is NotificationOutcome.ACKNOWLEDGED
     assert refunds.seen == [], f"{kind}가 환불 경로로 갔다"
+    assert refunds.reversed == [], f"{kind}가 되돌리기 경로로 갔다"

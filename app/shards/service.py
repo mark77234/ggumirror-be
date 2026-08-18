@@ -30,6 +30,7 @@ from app.shards.models import (
     ShardMutationResult,
     ShardReason,
     ShardRefundResult,
+    ShardRefundReversalResult,
     ShardWallet,
     idempotency_hash,
 )
@@ -145,6 +146,31 @@ class ShardLedgerService:
             "shard_refund reason=%s requested=%d recovered=%d unrecovered=%d balance=%d applied=%s",
             ShardReason.IAP_REFUND.value, result.requested, result.recovered,
             result.unrecovered, result.wallet.balance, result.applied,
+        )
+        return result
+
+    def reverse_iap_refund(
+        self,
+        user_id: str,
+        external_event_id: str,
+        purchase: DocumentKey,
+        record: DocumentKey,
+        remaining: Callable[[dict], int],
+    ) -> ShardRefundReversalResult:
+        """Apple이 되돌린 환불만큼 복구한다. **`credit`이 아니다.**
+
+        `credit`은 `lifetime_earned`를 올리는데, 이 조각은 원래 구매 때 이미 earned로
+        세어졌다 — 또 올리면 한 결제를 두 번 센다. 그래서 projection이 다른 전용 경로다.
+
+        복구량은 `remaining`이 **환불 record를 보고** 정한다(`recovered - reversed`).
+        원본 지급량도, Apple이 요청했던 양도, catalog 값도 쓰지 않는다.
+        """
+        key = idempotency_hash(user_id, ShardReason.IAP_REFUND_REVERSED, external_event_id)
+        result = self._store.reverse_refund(user_id, purchase, record, key, remaining)
+        logger.info(
+            "shard_refund_reversed reason=%s restored=%d balance=%d applied=%s",
+            ShardReason.IAP_REFUND_REVERSED.value, result.restored,
+            result.wallet.balance, result.applied,
         )
         return result
 

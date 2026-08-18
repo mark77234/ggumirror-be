@@ -16,6 +16,7 @@ import logging
 
 from app.iap.models import (
     FAMILY_REVOKE,
+    NotificationNotHandled,
     REFUND_FULL,
     REFUND_PRORATED,
     SCHEMA_VERSION,
@@ -29,7 +30,13 @@ from app.iap.models import (
     transaction_log_id,
 )
 from app.iap.service import TRANSACTIONS
-from app.shards.models import DocumentKey, PurchaseClaimMissing, RefundPlan
+from app.shards.models import (
+    DocumentKey,
+    PurchaseClaimMissing,
+    RefundNotYetProcessed,
+    RefundPlan,
+    RefundRecordMissing,
+)
 from app.shards.service import ShardLedgerService
 
 logger = logging.getLogger(__name__)
@@ -161,6 +168,93 @@ class IAPRefundService:
             notification.environment, short, result.requested, result.recovered,
             result.unrecovered, result.applied,
         )
+
+
+    # MARK: - 되돌리기 (B-6F-C)
+
+    def handle_reversal(self, notification: VerifiedNotification) -> None:
+        """검증된 `REFUND_REVERSED` 알림 하나를 반영한다.
+
+        **복구량의 authority는 환불 record의 `recoveredAmount`**다 — 원본 지급량도,
+        Apple이 요청했던 `requestedAmount`도, catalog 값도, 알림이 말한 값도 아니다.
+        요청 50 중 10만 회수했다면 되돌릴 수 있는 것도 10이다.
+
+        환불 기록이 아직 없으면 **200으로 삼키지 않는다** — `REFUND`가 나중에 올 수 있고,
+        삼키면 사용자가 되돌려받아야 할 조각을 영구히 잃는다.
+        """
+        transaction = notification.transaction
+        if transaction is None:
+            logger.warning("app_store_refund_reversed_skipped reason=missing_transaction")
+            return
+
+        short = transaction_log_id(transaction.transaction_id)
+        user_id = account_token_user_id(transaction.app_account_token)
+        if user_id is None:
+            # 주인을 알 수 없다. 아무 지갑에도 넣지 않는다.
+            logger.warning(
+                "app_store_refund_reversed_skipped reason=missing_account_token transaction=%s", short
+            )
+            return
+
+        try:
+            result = self._shards.reverse_iap_refund(
+                user_id,
+                external_event_id=transaction.transaction_id,
+                purchase=DocumentKey(
+                    collection=TRANSACTIONS, key=transaction_claim_id(transaction.transaction_id)
+                ),
+                record=DocumentKey(
+                    collection=REFUNDS, key=refund_record_id(transaction.transaction_id)
+                ),
+                remaining=self._remaining(transaction, user_id),
+            )
+        except RefundRecordMissing:
+            # 우리가 회수한 적 없는 결제다(구매 claim도 없다). 되돌릴 것이 없고 답이 바뀌지 않는다.
+            logger.warning(
+                "app_store_refund_reversed_skipped reason=unknown_refund transaction=%s", short
+            )
+            return
+        except RefundNotYetProcessed as error:
+            # 우리가 지급한 결제인데 환불 기록이 없다 — `REFUND`가 아직 안 왔을 수 있다.
+            # **재시도를 받는다.** Apple V2 payload에는 순서 field가 없고,
+            # notification history를 조회할 credential도 우리에게 없다.
+            logger.warning(
+                "app_store_refund_reversed_deferred reason=refund_not_processed transaction=%s", short
+            )
+            raise NotificationNotHandled("refund has not been processed yet") from error
+
+        logger.info(
+            "app_store_refund_reversed environment=%s transaction=%s restored=%d applied=%s",
+            notification.environment, short, result.restored, result.applied,
+        )
+
+    def _remaining(self, transaction: VerifiedTransaction, user_id: str):
+        """환불 record를 보고 남은 복구량을 정한다. **transaction 안에서 불린다.**
+
+        여기서 예외가 나가면 아무것도 기록되지 않는다 — 대조 실패가 곧 mutation 0이다.
+        """
+
+        def remaining(record: dict) -> int:
+            if record.get("productId") != transaction.product_id:
+                logger.warning("app_store_refund_reversed_rejected reason=product_mismatch")
+                raise RefundMismatch("product does not match the refunded purchase")
+
+            if record.get("environment") != transaction.environment:
+                logger.warning("app_store_refund_reversed_rejected reason=environment_mismatch")
+                raise RefundMismatch("environment does not match the refunded purchase")
+
+            if record.get("userId") != user_id:
+                # 문자열이 정확히 같아야 한다 — 지갑 문서 ID가 문자열이다.
+                logger.warning("app_store_refund_reversed_rejected reason=owner_mismatch")
+                raise RefundMismatch("appAccountToken does not own the refunded purchase")
+
+            recovered = int(record.get("recoveredAmount") or 0)
+            # 없으면 0으로 읽는다 — B-6F-B가 만든 record에는 이 field가 없다.
+            reversed_already = int(record.get("reversedAmount") or 0)
+            # 회수한 것보다 많이 되돌리지 않는다. 음수도 만들지 않는다.
+            return max(0, recovered - reversed_already)
+
+        return remaining
 
     def _plan(self, transaction: VerifiedTransaction, user_id: str):
         """원본 구매 claim을 보고 되돌릴 양을 정한다. **transaction 안에서 불린다.**

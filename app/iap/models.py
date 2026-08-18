@@ -121,14 +121,16 @@ ACKNOWLEDGED_NOTIFICATIONS = frozenset({
 })
 
 # 검증은 하되 **아직 구현하지 않은** 것. 재시도를 받아야 한다.
-DEFERRED_NOTIFICATIONS = frozenset({
-    # `REFUND`는 B-6F-B에서 실제로 처리한다 — 여기 없다.
-    "REFUND_REVERSED",  # B-6F-C
-})
+# **지금은 비어 있다.** `REFUND`(B-6F-B) · `REFUND_REVERSED`(B-6F-C)를 실제로 처리하므로
+# 이 목록에 남은 것이 없다. 개념은 그대로 둔다 — 조각에 영향이 있을 수 있는 새 타입이
+# 생기면 여기 넣는다. 모르는 타입은 이 목록과 무관하게 여전히 deferred다.
+DEFERRED_NOTIFICATIONS: frozenset[str] = frozenset()
 
 # 환불 알림. **allowlist도 deferred도 아닌 세 번째 갈래**라 따로 둔다 —
 # 검증한 뒤 조각을 실제로 회수하기 때문이다.
 REFUND_NOTIFICATION = "REFUND"
+# 환불이 되돌려졌다(분쟁 등). **회수했던 만큼만** 복구한다.
+REFUND_REVERSED_NOTIFICATION = "REFUND_REVERSED"
 
 # `revocationType`(Apple 서명 값). library enum과 같은 문자열이고,
 # **우리가 새로 만들지 않는다.**

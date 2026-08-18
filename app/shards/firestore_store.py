@@ -24,11 +24,14 @@ from app.shards.models import (
     InsufficientShards,
     PeriodQuota,
     PurchaseClaimMissing,
+    RefundNotYetProcessed,
     RefundPlan,
+    RefundRecordMissing,
     QuotaExceeded,
     ShardLedgerEntry,
     ShardReason,
     ShardRefundResult,
+    ShardRefundReversalResult,
     ShardWallet,
     utcnow,
 )
@@ -169,6 +172,7 @@ class FirestoreShardStore:
                 lifetime_spent=current.lifetime_spent + max(-delta, 0),
                 # 일반 거래는 환불 누적을 **건드리지 않고 그대로 물려준다.**
                 lifetime_refunded=current.lifetime_refunded,
+                lifetime_refund_reversed=current.lifetime_refund_reversed,
                 created_at=current.created_at if snapshot.exists else now,
                 updated_at=now,
             )
@@ -301,6 +305,7 @@ class FirestoreShardStore:
                             lifetime_earned=current.lifetime_earned,
                             lifetime_spent=current.lifetime_spent,
                             lifetime_refunded=current.lifetime_refunded + recovered,
+                            lifetime_refund_reversed=current.lifetime_refund_reversed,
                             created_at=current.created_at if wallet_snapshot.exists else now,
                             updated_at=now,
                         )
@@ -348,6 +353,108 @@ class FirestoreShardStore:
         except gcp_exceptions.GoogleAPIError as error:
             raise self._unavailable("refund", error) from error
 
+
+    def reverse_refund(
+        self,
+        user_id: str,
+        purchase: DocumentKey,
+        record: DocumentKey,
+        idempotency_key_hash: str,
+        remaining: Callable[[dict], int],
+    ) -> ShardRefundReversalResult:
+        """환불을 되돌린다. **회수했던 만큼만** 복구한다.
+
+        멱등을 위한 별도 문서를 두지 않는다 — `recovered - reversed`가 0이 되면
+        더 복구할 것이 없으므로 record 자체가 멱등 열쇠다. 원장 문서 ID도 결정적이라
+        동시 요청에서 한쪽은 `AlreadyExists`로 깨지고 다시 돌아 0을 읽는다.
+        """
+        record_ref = self._db.collection(record.collection).document(record.key)
+        purchase_ref = self._db.collection(purchase.collection).document(purchase.key)
+        wallet_ref = self._db.collection(WALLETS).document(user_id)
+        ledger_ref = self._db.collection(LEDGER).document(idempotency_key_hash)
+
+        @firestore.transactional
+        def run(transaction: firestore.Transaction) -> ShardRefundReversalResult:
+            # 읽기를 전부 먼저. Firestore transaction의 규칙이다.
+            record_snapshot = record_ref.get(transaction=transaction)
+            wallet_snapshot = wallet_ref.get(transaction=transaction)
+
+            if not record_snapshot.exists:
+                # **"지금 없다"를 "영영 없다"로 단정하지 않는다.**
+                # 우리가 지급한 결제라면 `REFUND`가 아직 안 왔을 수 있다.
+                claim = purchase_ref.get(transaction=transaction)
+                if not claim.exists:
+                    raise RefundRecordMissing()
+                raise RefundNotYetProcessed()
+
+            current = (
+                _wallet(user_id, wallet_snapshot.to_dict() or {})
+                if wallet_snapshot.exists
+                else ShardWallet.empty(user_id)
+            )
+            data = record_snapshot.to_dict() or {}
+            restorable = remaining(data)
+
+            if restorable <= 0:
+                # 중복이거나 애초에 회수한 것이 없었다. **아무것도 쓰지 않는다.**
+                return ShardRefundReversalResult(
+                    wallet=current,
+                    restored=0,
+                    applied=False,
+                    ledger_entry_id=data.get("reversalLedgerEntryId"),
+                )
+
+            now = utcnow()
+            entry = ShardLedgerEntry(
+                id=ledger_ref.id,
+                user_id=user_id,
+                delta=restorable,
+                balance_after=current.balance + restorable,
+                reason=ShardReason.IAP_REFUND_REVERSED,
+                idempotency_key_hash=idempotency_key_hash,
+                created_at=now,
+            )
+            wallet = ShardWallet(
+                user_id=user_id,
+                balance=entry.balance_after,
+                # **원래 구매가 이미 earned를 올렸다.** 또 올리면 한 결제를 두 번 센다.
+                lifetime_earned=current.lifetime_earned,
+                lifetime_spent=current.lifetime_spent,
+                # gross라 줄지 않는다 — 되돌린 몫은 따로 쌓는다.
+                lifetime_refunded=current.lifetime_refunded,
+                lifetime_refund_reversed=current.lifetime_refund_reversed + restorable,
+                created_at=current.created_at if wallet_snapshot.exists else now,
+                updated_at=now,
+            )
+
+            transaction.create(ledger_ref, _entry_document(entry))
+            transaction.set(wallet_ref, _wallet_document(wallet))
+            # record는 이미 있는 문서라 `update`다. 환불 사실(recovered 등)은 건드리지 않는다.
+            transaction.update(
+                record_ref,
+                {
+                    "reversedAmount": int(data.get("reversedAmount") or 0) + restorable,
+                    "reversalLedgerEntryId": entry.id,
+                    "reversedAt": now,
+                },
+            )
+            return ShardRefundReversalResult(
+                wallet=wallet, restored=restorable, applied=True, ledger_entry_id=entry.id
+            )
+
+        try:
+            return run(self._db.transaction())
+        except gcp_exceptions.AlreadyExists:
+            # 같은 되돌리기가 동시에 들어왔고 상대가 먼저 commit했다. **실패가 아니다** —
+            # 다시 돌리면 `remaining`이 0이라 아무것도 쓰지 않는다.
+            logger.info("shard_refund_reversal_duplicate_ignored")
+            try:
+                return run(self._db.transaction())
+            except gcp_exceptions.GoogleAPIError as error:
+                raise self._unavailable("refund_reversal_retry", error) from error
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("refund_reversal", error) from error
+
     @staticmethod
     def _projected(current: ShardWallet, recovered: int) -> ShardWallet:
         """방금 쓴 값을 그대로 돌려준다. commit 뒤 다시 읽지 않는다."""
@@ -359,6 +466,7 @@ class FirestoreShardStore:
             lifetime_earned=current.lifetime_earned,
             lifetime_spent=current.lifetime_spent,
             lifetime_refunded=current.lifetime_refunded + recovered,
+            lifetime_refund_reversed=current.lifetime_refund_reversed,
             created_at=current.created_at,
             updated_at=utcnow(),
         )
@@ -381,6 +489,7 @@ def _wallet_document(wallet: ShardWallet) -> dict:
         "lifetimeEarned": wallet.lifetime_earned,
         "lifetimeSpent": wallet.lifetime_spent,
         "lifetimeRefunded": wallet.lifetime_refunded,
+        "lifetimeRefundReversed": wallet.lifetime_refund_reversed,
         "createdAt": wallet.created_at,
         "updatedAt": wallet.updated_at,
     }
@@ -406,6 +515,7 @@ def _wallet(user_id: str, data: dict) -> ShardWallet:
         lifetime_spent=int(data.get("lifetimeSpent") or 0),
         # 예전 문서에는 없는 field다. **migration 없이 0으로 읽는다.**
         lifetime_refunded=int(data.get("lifetimeRefunded") or 0),
+        lifetime_refund_reversed=int(data.get("lifetimeRefundReversed") or 0),
         created_at=data.get("createdAt") or utcnow(),
         updated_at=data.get("updatedAt") or utcnow(),
     )

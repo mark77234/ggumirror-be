@@ -725,9 +725,13 @@ def test_iap_refund_reason_is_not_the_ai_refund_reason():
     assert ShardReason.IAP_REFUND is not ShardReason.REFUND
 
 
-def test_reversed_reason_is_not_added_before_it_is_used():
-    """B-6F-C 전에 쓰지 않는 enum을 만들어 두지 않는다 (dead logic 금지)."""
-    assert not hasattr(ShardReason, "IAP_REFUND_REVERSED")
+def test_reversal_reason_is_distinct():
+    """되돌리기는 구매도 AI 복구도 아니다. 원장에서 셋을 구분할 수 있어야 한다."""
+    assert ShardReason.IAP_REFUND_REVERSED.value == "iap_refund_reversed"
+    assert len({
+        ShardReason.IAP_PURCHASE, ShardReason.IAP_REFUND,
+        ShardReason.IAP_REFUND_REVERSED, ShardReason.REFUND,
+    }) == 4
 
 
 def test_refund_record_stores_no_raw_credentials(store):
@@ -824,3 +828,426 @@ def test_milliunit_unit_is_named_in_the_source():
     models = (root / "app/iap/models.py").read_text()
     assert "revocation_percentage_milliunits" in models
     assert "milliunits" in models.lower()
+
+
+# MARK: - 환불 되돌리기 (B-6F-C)
+
+
+def reversal_notification(**kwargs) -> VerifiedNotification:
+    """검증을 통과한 `REFUND_REVERSED`.
+
+    되돌리기 transaction에는 `revocationType`이 의미가 없다 — 복구량은 환불 record가 정한다.
+    """
+    notification = refund_notification(**kwargs)
+    object.__setattr__(notification, "notification_type", "REFUND_REVERSED")
+    return notification
+
+
+def refunded(store: InMemoryShardStore, *, product: str = PRODUCT_10, spend: int = 0):
+    """구매 → (선택) 소비 → 전액 환불까지 끝난 상태를 만든다."""
+    shards = bought(store, product=product)
+    if spend:
+        shards.debit(USER, spend, ShardReason.AI_STICKER, external_event_id=f"ai:{spend}")
+    IAPRefundService(shards).handle(refund_notification(product_id=product))
+    return shards
+
+
+def reversal_entries(store: InMemoryShardStore):
+    return [e for e in store.entries if e.reason is ShardReason.IAP_REFUND_REVERSED]
+
+
+# MARK: - 정상 (§14 NORMAL)
+
+
+def test_reversal_restores_exactly_what_was_recovered(store):
+    shards = refunded(store)
+    assert (wallet(store).balance, wallet(store).lifetime_refunded) == (0, 10)
+
+    IAPRefundService(shards).handle_reversal(reversal_notification())
+
+    w = wallet(store)
+    assert w.balance == 10
+    assert w.lifetime_refund_reversed == 10
+    # **회수 기록은 gross라 줄지 않는다.**
+    assert w.lifetime_refunded == 10
+    # 원래 구매가 이미 earned를 올렸다 — 또 올리면 한 결제를 두 번 센다.
+    assert w.lifetime_earned == 10
+    assert w.lifetime_spent == 0
+
+    entries = reversal_entries(store)
+    assert len(entries) == 1
+    assert entries[0].delta == 10
+    assert entries[0].balance_after == 10
+
+    record = refund_record(store)
+    assert record["reversedAmount"] == 10
+    assert record["reversalLedgerEntryId"] == entries[0].id
+    assert record["reversedAt"] is not None
+    # 환불 사실 자체는 건드리지 않는다.
+    assert (record["recoveredAmount"], record["unrecoveredAmount"]) == (10, 0)
+
+
+def test_wallet_reconciles_after_reversal(store):
+    """지갑만 보고 검산할 수 있어야 한다:
+    `balance == earned - spent - refunded + refund_reversed`."""
+    shards = refunded(store, product=PRODUCT_50, spend=20)
+    IAPRefundService(shards).handle_reversal(reversal_notification(product_id=PRODUCT_50))
+
+    w = wallet(store)
+    assert w.balance == (
+        w.lifetime_earned - w.lifetime_spent - w.lifetime_refunded + w.lifetime_refund_reversed
+    )
+
+
+def test_ledger_replay_matches_balance_after_reversal(store):
+    shards = refunded(store, product=PRODUCT_50, spend=20)
+    IAPRefundService(shards).handle_reversal(reversal_notification(product_id=PRODUCT_50))
+
+    assert wallet(store).balance == sum(e.delta for e in store.entries)
+
+
+# MARK: - 부분 회수의 되돌리기 (§8)
+
+
+def test_reversal_restores_only_the_recovered_part(store):
+    """구매 50 · 잔액 10일 때 회수는 10이었다. **되돌릴 수 있는 것도 10뿐이다.**"""
+    shards = refunded(store, product=PRODUCT_50, spend=40)
+    record = refund_record(store)
+    assert (record["requestedAmount"], record["recoveredAmount"], record["unrecoveredAmount"]) == (
+        50, 10, 40,
+    )
+    assert wallet(store).balance == 0
+
+    IAPRefundService(shards).handle_reversal(reversal_notification(product_id=PRODUCT_50))
+
+    w = wallet(store)
+    assert w.balance == 10, "회수하지 않은 40까지 복구했다"
+    assert w.lifetime_refund_reversed == 10
+    assert reversal_entries(store)[0].delta == 10
+
+    record = refund_record(store)
+    assert record["reversedAmount"] == 10
+    # 미회수 40은 그대로 기록으로 남는다 — 빚도 아니고 복구 대상도 아니다.
+    assert record["unrecoveredAmount"] == 40
+
+
+def test_reversal_never_uses_the_original_or_requested_amount(store):
+    """복구량 authority는 `recoveredAmount` 하나다."""
+    shards = refunded(store, product=PRODUCT_50, spend=45)
+    record = refund_record(store)
+    assert (record["originalAmount"], record["requestedAmount"], record["recoveredAmount"]) == (
+        50, 50, 5,
+    )
+
+    IAPRefundService(shards).handle_reversal(reversal_notification(product_id=PRODUCT_50))
+
+    assert wallet(store).balance == 5
+    assert wallet(store).lifetime_refund_reversed == 5
+
+
+# MARK: - 회수 0의 되돌리기 (§9)
+
+
+def test_zero_recovery_reversal_restores_nothing(store):
+    shards = refunded(store, product=PRODUCT_50, spend=50)
+    record = refund_record(store)
+    assert (record["requestedAmount"], record["recoveredAmount"]) == (50, 0)
+    assert wallet(store).balance == 0
+
+    IAPRefundService(shards).handle_reversal(reversal_notification(product_id=PRODUCT_50))
+
+    w = wallet(store)
+    assert w.balance == 0, "회수한 적 없는 50을 줬다"
+    assert w.lifetime_refund_reversed == 0
+    # delta 0짜리 원장 줄을 만들지 않는다.
+    assert reversal_entries(store) == []
+    assert refund_record(store).get("reversedAmount") in (None, 0)
+
+
+# MARK: - 멱등 (§6, §14 DUPLICATE)
+
+
+@pytest.mark.parametrize("times", [2, 5])
+def test_duplicate_reversal_restores_once(store, times):
+    shards = refunded(store)
+    refunds = IAPRefundService(shards)
+
+    for _ in range(times):
+        refunds.handle_reversal(reversal_notification())
+
+    w = wallet(store)
+    assert w.balance == 10
+    assert w.lifetime_refund_reversed == 10, "중복 되돌리기가 또 복구했다"
+    assert len(reversal_entries(store)) == 1
+    assert refund_record(store)["reversedAmount"] == 10
+
+
+def test_duplicate_reversal_with_a_new_notification_uuid_restores_once(store):
+    """멱등 기준은 **원본 구매 transaction**이다. notificationUUID가 아니다."""
+    shards = refunded(store)
+    refunds = IAPRefundService(shards)
+
+    refunds.handle_reversal(reversal_notification())
+    second = reversal_notification()
+    object.__setattr__(second, "notification_uuid", "99999999-8888-7777-6666-555555555555")
+    refunds.handle_reversal(second)
+
+    assert wallet(store).balance == 10
+    assert wallet(store).lifetime_refund_reversed == 10
+    assert len(reversal_entries(store)) == 1
+
+
+def test_reversal_then_new_refund_is_not_double_counted(store):
+    """되돌린 뒤 같은 환불이 다시 와도 record가 이미 있어 또 빼지 않는다."""
+    shards = refunded(store)
+    refunds = IAPRefundService(shards)
+    refunds.handle_reversal(reversal_notification())
+    assert wallet(store).balance == 10
+
+    refunds.handle(refund_notification())
+
+    assert wallet(store).balance == 10
+    assert len([e for e in store.entries if e.reason is ShardReason.IAP_REFUND]) == 1
+
+
+# MARK: - 동시성 (§15)
+
+
+def test_concurrent_reversals_restore_exactly_once(store):
+    shards = refunded(store, product=PRODUCT_50)
+    refunds = IAPRefundService(shards)
+    start = threading.Barrier(8)
+
+    def run():
+        start.wait()
+        refunds.handle_reversal(reversal_notification(product_id=PRODUCT_50))
+
+    threads = [threading.Thread(target=run) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert wallet(store).balance == 50
+    assert wallet(store).lifetime_refund_reversed == 50
+    assert len(reversal_entries(store)) == 1
+    assert refund_record(store)["reversedAmount"] == 50
+
+
+# MARK: - 환불 기록이 없다 (§3)
+
+
+def test_reversal_without_any_purchase_is_a_no_op(store):
+    """구매 claim도 없다 — 우리가 지급한 적 없는 결제다. 답이 바뀌지 않으므로 삼킨다."""
+    shards = ShardLedgerService(store)
+    shards.credit(USER, 20, ShardReason.DAILY_ATTENDANCE, external_event_id="2026-08-18")
+
+    IAPRefundService(shards).handle_reversal(reversal_notification())
+
+    assert wallet(store).balance == 20
+    assert reversal_entries(store) == []
+
+
+def test_reversal_before_the_refund_is_deferred(store):
+    """구매는 우리 것인데 환불 기록이 없다 — `REFUND`가 아직 안 왔을 수 있다.
+
+    **200으로 삼키면 사용자가 되돌려받을 조각을 영구히 잃는다.** 재시도를 받는다.
+    """
+    from app.iap.models import NotificationNotHandled
+
+    shards = bought(store)          # 구매만 있고 환불은 아직 없다
+    assert refund_record(store) is None
+
+    with pytest.raises(NotificationNotHandled):
+        IAPRefundService(shards).handle_reversal(reversal_notification())
+
+    assert wallet(store).balance == 10
+    assert reversal_entries(store) == []
+
+
+def test_deferred_reversal_succeeds_after_the_refund_arrives(store):
+    """재시도가 실제로 결과를 바꾼다 — 그래서 삼키지 않는 것이 옳다."""
+    from app.iap.models import NotificationNotHandled
+
+    shards = bought(store)
+    refunds = IAPRefundService(shards)
+
+    with pytest.raises(NotificationNotHandled):
+        refunds.handle_reversal(reversal_notification())
+
+    refunds.handle(refund_notification())          # 늦게 도착한 REFUND
+    refunds.handle_reversal(reversal_notification())   # Apple 재시도
+
+    assert wallet(store).balance == 10
+    assert wallet(store).lifetime_refund_reversed == 10
+    assert len(reversal_entries(store)) == 1
+
+
+# MARK: - 대조 실패 (§11)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "why"),
+    [
+        ({"product_id": PRODUCT_50}, "다른 상품"),
+        ({"environment": "Production"}, "다른 환경"),
+        ({"app_account_token": OTHER_USER}, "다른 사람"),
+    ],
+)
+def test_reversal_mismatch_never_touches_the_economy(store, kwargs, why):
+    shards = refunded(store)
+
+    with pytest.raises(RefundMismatch):
+        IAPRefundService(shards).handle_reversal(reversal_notification(**kwargs))
+
+    assert wallet(store).balance == 0, why
+    assert wallet(store).lifetime_refund_reversed == 0
+    assert reversal_entries(store) == []
+    assert refund_record(store).get("reversedAmount") in (None, 0)
+
+
+@pytest.mark.parametrize("token", [None, "", "not-a-uuid"])
+def test_reversal_without_an_owner_restores_nothing(store, token):
+    shards = refunded(store)
+
+    IAPRefundService(shards).handle_reversal(reversal_notification(app_account_token=token))
+
+    assert wallet(store).balance == 0
+    assert reversal_entries(store) == []
+
+
+def test_reversal_without_transaction_changes_nothing(store):
+    shards = refunded(store)
+
+    IAPRefundService(shards).handle_reversal(reversal_notification(with_transaction=False))
+
+    assert wallet(store).balance == 0
+    assert reversal_entries(store) == []
+
+
+# MARK: - 회계 의미 (§10)
+
+
+def test_reversal_never_increases_lifetime_earned(store):
+    """원래 구매가 이미 earned를 올렸다. 또 올리면 한 결제를 두 번 센다."""
+    shards = refunded(store, product=PRODUCT_50)
+    assert wallet(store).lifetime_earned == 50
+
+    IAPRefundService(shards).handle_reversal(reversal_notification(product_id=PRODUCT_50))
+
+    assert wallet(store).lifetime_earned == 50
+
+
+def test_reversal_never_decreases_lifetime_refunded(store):
+    """`lifetimeRefunded`는 gross다 — `lifetimeEarned`와 같은 규칙(줄지 않는다)."""
+    shards = refunded(store)
+    IAPRefundService(shards).handle_reversal(reversal_notification())
+
+    assert wallet(store).lifetime_refunded == 10
+
+
+def test_old_wallet_without_reversal_field_reads_as_zero(store):
+    from app.shards.firestore_store import _wallet
+
+    old = _wallet(USER, {"balance": 5, "lifetimeEarned": 5, "lifetimeRefunded": 3})
+    assert old.lifetime_refund_reversed == 0
+
+
+def test_ordinary_credit_preserves_the_reversal_total(store):
+    shards = refunded(store)
+    IAPRefundService(shards).handle_reversal(reversal_notification())
+
+    shards.credit(USER, 1, ShardReason.DAILY_ATTENDANCE, external_event_id="2026-08-19")
+    shards.debit(USER, 1, ShardReason.AI_STICKER, external_event_id="ai:x")
+
+    assert wallet(store).lifetime_refund_reversed == 10
+    assert wallet(store).lifetime_refunded == 10
+
+
+# MARK: - 소스 불변식
+
+
+def test_reversal_never_uses_generic_credit():
+    from pathlib import Path
+
+    code = _code_only((Path(__file__).resolve().parent.parent / "app/iap/refunds.py").read_text())
+    for banned in [".credit(", ".debit(", "lifetime_earned", "lifetimeEarned"]:
+        assert banned not in code, f"되돌리기가 generic 경로를 쓴다 ({banned})"
+    assert "reverse_iap_refund" in code
+
+
+def test_reversal_logs_never_contain_raw_values(store, caplog):
+    shards = refunded(store)
+
+    with caplog.at_level(logging.DEBUG):
+        IAPRefundService(shards).handle_reversal(reversal_notification())
+
+    assert TXN not in caplog.text
+    assert USER not in caplog.text
+    assert "eyJ" not in caplog.text
+    assert "restored=10" in caplog.text
+
+
+# MARK: - HTTP status 매핑 (§12)
+
+
+def test_http_reversal_is_200(store):
+    refunded(store)
+    client = notification_client(store, reversal_notification())
+
+    assert post(client) == 200
+    assert wallet(store).balance == 10
+
+
+def test_http_duplicate_reversal_is_200(store):
+    refunded(store)
+    client = notification_client(store, reversal_notification())
+
+    assert [post(client), post(client), post(client)] == [200, 200, 200]
+    assert wallet(store).lifetime_refund_reversed == 10
+    assert len(reversal_entries(store)) == 1
+
+
+def test_http_zero_recovery_reversal_is_200(store):
+    shards = bought(store, product=PRODUCT_50)
+    shards.debit(USER, 50, ShardReason.AI_STICKER, external_event_id="ai:all")
+    IAPRefundService(shards).handle(refund_notification(product_id=PRODUCT_50))
+    client = notification_client(store, reversal_notification(product_id=PRODUCT_50))
+
+    assert post(client) == 200
+    assert reversal_entries(store) == []
+
+
+def test_http_reversal_before_refund_is_5xx(store):
+    """재시도가 결과를 바꿀 수 있으므로 **삼키지 않는다.**"""
+    bought(store)
+    client = notification_client(store, reversal_notification())
+
+    assert post(client) >= 500
+    assert wallet(store).balance == 10
+
+
+def test_http_reversal_without_any_purchase_is_200(store):
+    client = notification_client(store, reversal_notification())
+
+    assert post(client) == 200
+
+
+def test_http_reversal_mismatch_is_400(store):
+    refunded(store)
+    client = notification_client(store, reversal_notification(product_id=PRODUCT_50))
+
+    assert post(client) == 400
+    assert wallet(store).balance == 0
+
+
+def test_http_reversal_store_failure_is_5xx(store):
+    from app.auth.store import StoreUnavailable
+
+    class Failing:
+        def __getattr__(self, name):
+            raise StoreUnavailable("reverse_refund")
+
+    client = notification_client(Failing(), reversal_notification())
+
+    assert post(client) >= 500

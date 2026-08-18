@@ -22,11 +22,14 @@ from app.shards.models import (
     InsufficientShards,
     PeriodQuota,
     PurchaseClaimMissing,
+    RefundNotYetProcessed,
     RefundPlan,
+    RefundRecordMissing,
     QuotaExceeded,
     ShardLedgerEntry,
     ShardReason,
     ShardRefundResult,
+    ShardRefundReversalResult,
     ShardWallet,
     utcnow,
 )
@@ -104,6 +107,33 @@ class ShardStore(Protocol):
 
         `recovered == 0`도 **처리 완료된 환불**이다 — record는 남기고 delta 0짜리
         원장 줄은 만들지 않는다. 재시도를 요구하지 않는다.
+        """
+
+    def reverse_refund(
+        self,
+        user_id: str,
+        purchase: DocumentKey,
+        record: DocumentKey,
+        idempotency_key_hash: str,
+        remaining: Callable[[dict], int],
+    ) -> ShardRefundReversalResult:
+        """Apple이 되돌린 환불만큼 조각을 복구한다. **회수했던 만큼만.**
+
+        복구량의 authority는 **환불 record의 `recoveredAmount`**다 — 원본 지급량도,
+        Apple이 요청했던 `requestedAmount`도, catalog 값도 쓰지 않는다.
+        요청 50 중 10만 회수했다면 되돌릴 수 있는 것도 10이다.
+
+        한 transaction 안에서:
+
+        1. 환불 record를 읽는다. 없으면 **원본 구매 claim**을 보고 나눈다 —
+           claim도 없으면 우리가 준 적 없는 결제라 `RefundRecordMissing`,
+           claim이 있으면 `REFUND`가 아직 안 왔을 수 있어 `RefundNotYetProcessed`다
+        2. `remaining(record)`가 남은 복구량을 정한다(`recovered - reversed`)
+        3. 0이면 **아무것도 쓰지 않는다** — 중복이거나 회수한 것이 없었던 경우다
+        4. 0보다 크면 원장 한 줄(+) · 지갑 · record를 **함께** 갱신한다
+
+        `lifetime_earned`를 올리지 않는다 — 원래 구매가 이미 올렸으므로 두 번 세게 된다.
+        `lifetime_refunded`도 줄이지 않는다(gross). 대신 `lifetime_refund_reversed`가 오른다.
         """
 
 
@@ -185,6 +215,7 @@ class InMemoryShardStore:
                 lifetime_spent=current.lifetime_spent + max(-delta, 0),
                 # 일반 거래는 환불 누적을 **건드리지 않고 그대로 물려준다.**
                 lifetime_refunded=current.lifetime_refunded,
+                lifetime_refund_reversed=current.lifetime_refund_reversed,
                 created_at=current.created_at,
                 updated_at=utcnow(),
             )
@@ -255,6 +286,7 @@ class InMemoryShardStore:
                     lifetime_earned=current.lifetime_earned,
                     lifetime_spent=current.lifetime_spent,
                     lifetime_refunded=current.lifetime_refunded + recovered,
+                    lifetime_refund_reversed=current.lifetime_refund_reversed,
                     created_at=current.created_at,
                     updated_at=utcnow(),
                 )
@@ -275,4 +307,67 @@ class InMemoryShardStore:
                 recovered=recovered,
                 applied=True,
                 ledger_entry_id=entry.id if entry else None,
+            )
+
+    def reverse_refund(
+        self,
+        user_id: str,
+        purchase: DocumentKey,
+        record: DocumentKey,
+        idempotency_key_hash: str,
+        remaining: Callable[[dict], int],
+    ) -> ShardRefundReversalResult:
+        with self._lock:
+            existing = self.claims.get((record.collection, record.key))
+            if existing is None:
+                # 환불 기록이 없다. **우리가 지급한 결제인지**로 나눈다.
+                if self.claims.get((purchase.collection, purchase.key)) is None:
+                    raise RefundRecordMissing()
+                raise RefundNotYetProcessed()
+
+            restorable = remaining(existing)
+            current = self.wallet(user_id)
+
+            if restorable <= 0:
+                # 중복이거나 애초에 회수한 것이 없었다. **아무것도 쓰지 않는다.**
+                return ShardRefundReversalResult(
+                    wallet=current,
+                    restored=0,
+                    applied=False,
+                    ledger_entry_id=existing.get("reversalLedgerEntryId"),
+                )
+
+            now = utcnow()
+            entry = ShardLedgerEntry(
+                id=idempotency_key_hash,
+                user_id=user_id,
+                delta=restorable,
+                balance_after=current.balance + restorable,
+                reason=ShardReason.IAP_REFUND_REVERSED,
+                idempotency_key_hash=idempotency_key_hash,
+                created_at=now,
+            )
+            self.entries.append(entry)
+            self._applied[idempotency_key_hash] = entry
+            wallet = ShardWallet(
+                user_id=user_id,
+                balance=entry.balance_after,
+                # **둘 다 그대로다.** 원래 구매가 이미 earned를 올렸으므로 또 올리면 두 번 센다.
+                lifetime_earned=current.lifetime_earned,
+                lifetime_spent=current.lifetime_spent,
+                # gross라 줄지 않는다 — 되돌린 몫은 아래에 따로 쌓는다.
+                lifetime_refunded=current.lifetime_refunded,
+                lifetime_refund_reversed=current.lifetime_refund_reversed + restorable,
+                created_at=current.created_at,
+                updated_at=now,
+            )
+            self.wallets[user_id] = wallet
+            self.claims[(record.collection, record.key)] = {
+                **existing,
+                "reversedAmount": int(existing.get("reversedAmount") or 0) + restorable,
+                "reversalLedgerEntryId": entry.id,
+                "reversedAt": now,
+            }
+            return ShardRefundReversalResult(
+                wallet=wallet, restored=restorable, applied=True, ledger_entry_id=entry.id
             )

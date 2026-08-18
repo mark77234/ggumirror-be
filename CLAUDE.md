@@ -20,11 +20,11 @@ Backend repository for 꾸미러.
 - purchase / ownership
 - seller shard settlement
 
-## Current Implementation (Phase B-6F-B 완료)
+## Current Implementation (Phase B-6F-C 완료 · 미배포)
 
 FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth +
 server-authoritative 조각 원장 + 하루 한 번 출석 + AdMob rewarded SSV + AI 스티커 생성 +
-조각 IAP(Apple JWS 검증 + StoreKit client) + App Store 알림 V2 검증 · **환불 조각 회수**(복구는 B-6F-C).
+조각 IAP(Apple JWS 검증 + StoreKit client) + App Store 알림 V2 검증 · **환불 조각 회수 · 환불 되돌리기**.
 
 ```
 app/main.py          create_app()
@@ -53,13 +53,13 @@ app/api/deps.py      Bearer → current user
 app/shards/models.py ShardWallet, ShardLedgerEntry, ShardReason, idempotency_hash
 app/shards/store.py  ShardStore protocol + in-memory
 app/shards/firestore_store.py  Firestore transaction 구현
-app/shards/service.py  ShardLedgerService (credit · debit · refund_iap)
+app/shards/service.py  ShardLedgerService (credit · debit · refund_iap · reverse_iap_refund)
 app/shards/attendance.py  KST 날짜 규칙 + 출석 지급
 app/core/config.py   환경변수 + logging
 app/api/iap.py       POST /users/me/iap/shards (body는 signedTransaction 하나)
 app/api/app_store.py POST /app-store/notifications/v2 (Apple 서명이 곧 인증)
 app/iap/notifications.py  알림 검증 · 분류 (조각은 만지지 않고 REFUND만 넘긴다)
-app/iap/refunds.py   환불 회수 정책 (원본 claim이 금액 authority)
+app/iap/refunds.py   환불 회수 · 되돌리기 정책 (record가 금액 authority)
 app/iap/models.py    catalog(10/50/100) · 전역 claim id · appAccountToken 대조
 app/iap/verifier.py  검증 seam (protocol + fail-closed Unconfigured)
 app/iap/apple_verifier.py  Apple 공식 SignedDataVerifier wrapper (environment별)
@@ -259,7 +259,7 @@ body는 `signedPayload` 하나뿐이고 `extra="forbid"`다.
 | `REFUND_DECLINED` | 되돌릴 것 없음 | 200 |
 | **`ONE_TIME_CHARGE`** | **consumable 구매의 정상 알림.** 검증만 하고 조각 불변 | 200 |
 | `REFUND` | **조각 회수**(B-6F-B) — 아래 참고 | **200** / 400 / 503 |
-| `REFUND_REVERSED` | **B-6F-C 미구현** | **503** |
+| `REFUND_REVERSED` | **회수했던 만큼만 복구**(B-6F-C) | **200** / 400 / 503 |
 | 그 밖의/새 타입 | 조각 영향 여부를 알 수 없음 | **503** |
 
 **모르는 타입을 200으로 삼키지 않는다.** allowlist(`ACKNOWLEDGED_NOTIFICATIONS`)에
@@ -449,6 +449,106 @@ Apple IAP 환불은 **`iap_refund`**다. 기존 **`refund`는 AI 생성 실패 �
   `.p8` · issuerId · keyId · `AppStoreServerAPIClient`를 도입하지 않았다(테스트가 고정)
 - generic notification history collection을 만들지 않는다
 - `REFUND_REVERSED`(B-6F-C)는 **200으로 삼키지 않는다** — Apple이 다시 보내게 둔다
+
+`tests/test_iap_refunds.py`가 위 전부를 고정한다.
+
+#### B-6F-C — 환불 되돌리기 (`REFUND_REVERSED`)
+
+Apple이 분쟁 등으로 **환불을 되돌렸을 때** 회수했던 조각을 복구한다.
+
+##### 복구량 authority는 refund record의 `recoveredAmount`다
+
+**실제로 회수한 만큼만** 되돌린다. `originalAmount` · `requestedAmount` · catalog 값 ·
+알림이 말한 값은 쓰지 않는다.
+
+    구매 50 · 환불 요청 50 · 당시 잔액 10 → 회수 10 · 미회수 40
+    REFUND_REVERSED → **복구 10**   (50도 40도 아니다)
+
+미회수 40은 애초에 우리 지갑에서 나간 적이 없으므로 되돌릴 대상이 아니다.
+`recoveredAmount == 0`이었다면 복구도 **0**이고 원장 줄을 만들지 않는다.
+
+##### 회계 — `lifetime*`은 모두 gross이고 줄지 않는다
+
+기존 정의를 **바꾸지 않았다.** `lifetime_earned`에 이미
+*"환불이 나도 줄지 않는다 — 받았다는 사실은 사라지지 않는다"*가 박혀 있고,
+`lifetimeRefunded`도 *"recovered만 **쌓인다**"*로 쓰여 있다 — 둘 다 누적이다.
+
+| projection | 되돌릴 때 |
+|---|---|
+| `lifetimeEarned` | **불변** — 원래 구매가 이미 올렸다. 또 올리면 한 결제를 두 번 센다 |
+| `lifetimeSpent` | **불변** |
+| `lifetimeRefunded` | **불변**(gross) — 회수는 실제로 일어난 사건이다 |
+| `lifetimeRefundReversed` | `+= restored` (새 field, 뒤로 호환: 없으면 0) |
+| `balance` | `+= restored` |
+
+`lifetimeRefunded`를 줄이지 않은 이유: 그러면 `lifetime*` 중 유일하게 감소하는 field가
+되고, "gross 누적"이라는 이미 고정된 의미를 조용히 net으로 바꾸는 일이다.
+반복 구매–환불을 감시할 때도 gross가 필요한 값이다.
+
+**대신 counterpart field를 추가해 지갑만으로 검산할 수 있게 했다:**
+
+    balance == lifetimeEarned - lifetimeSpent - lifetimeRefunded + lifetimeRefundReversed
+
+이 field가 없으면 지갑이 거짓말처럼 보인다(잔액 146인데 164−18−10=136).
+authority는 여전히 **원장 replay**(`sum(delta) == balance`)이고, 테스트가 둘 다 고정한다.
+
+##### 순서를 가정하지 않는다 (`REFUND`가 늦게 올 수 있다)
+
+`REFUND_REVERSED`가 왔는데 환불 record가 없으면 두 갈래로 나눈다:
+
+| 상황 | 처리 |
+|---|---|
+| 구매 claim도 없다 | 우리가 지급한 적 없는 결제다. **200** + mutation 0 |
+| 구매 claim은 있는데 record가 없다 | `REFUND`가 아직 안 왔을 수 있다. **503 — 재시도를 받는다** |
+
+**후자를 200으로 삼키면 사용자가 되돌려받아야 할 조각을 영구히 잃는다.**
+근거: Apple V2 payload에는 순서를 알려주는 field가 없고
+(`notificationUUID` · `signedDate` · `version`뿐, 설치본 model에서 확인),
+`app-store-server-library`도 ordering 보장을 문서화하지 않는다.
+게다가 우리는 notification history를 조회할 credential(`.p8`)을 의도적으로 갖고 있지 않아
+사후 재조정 수단이 없다. 그래서 **"지금 없다"를 "영영 없다"로 단정하지 않는다.**
+
+재시도가 실제로 결과를 바꾸는 것이 테스트로 고정돼 있다
+(`test_deferred_reversal_succeeds_after_the_refund_arrives`).
+
+##### 멱등 — 원본 구매 transaction 기준
+
+`notificationUUID`를 쓰지 않는다. 남은 복구량이 곧 멱등 열쇠다:
+
+    remaining = recoveredAmount - reversedAmount
+
+첫 번째는 10을 복구하고 `reversedAmount = 10`이 된다. 두 번째부터는 `remaining == 0`이라
+**지갑도 원장도 건드리지 않고** 200이다. 별도 claim 문서를 두지 않았다 — record 자체가
+그 역할을 한다. 원장 문서 ID도 결정적이라 동시 요청에서 한쪽은 `AlreadyExists`로 깨지고
+다시 돌아 0을 읽는다(`apply`와 같은 패턴).
+
+##### record 확장 — 최소 3개
+
+기존 `ggumirror_iap_refunds/{hash}` 문서를 그대로 쓰고 **덮어쓰지 않는다**(`update`).
+
+    reversedAmount · reversalLedgerEntryId · reversedAt
+
+B-6F-B가 만든 record에는 이 field가 없으므로 **없으면 0**으로 읽는다.
+`recoveredAmount` · `unrecoveredAmount` 같은 환불 사실은 건드리지 않는다.
+raw transactionId · appAccountToken · JWS · payload는 여전히 저장하지 않는다.
+
+##### 대조 (fail closed)
+
+record의 `productId` · `environment` · `userId`가 검증된 transaction과 어긋나면
+`RefundMismatch` → **400**, 조각 mutation 0. 주인 대조는 정규화된 UUID **문자열이 정확히**
+같아야 한다. `appAccountToken`이 없거나 형식이 틀리면 복구하지 않는다.
+
+##### reason
+
+**`iap_refund_reversed`**(delta > 0). `iap_purchase` · `iap_refund` ·
+`refund`(AI 복구)와 섞지 않는다 — 원장에서 넷을 구분할 수 있어야 한다.
+
+##### `DEFERRED_NOTIFICATIONS`는 이제 비어 있다
+
+`REFUND`와 `REFUND_REVERSED`를 실제로 처리하므로 목록에 남은 것이 없다.
+개념은 그대로 둔다 — 조각에 영향이 있을 수 있는 새 타입이 생기면 여기 넣는다.
+**모르는 타입은 이 목록과 무관하게 여전히 deferred(503)**이고, 처리기가 설정되지 않은
+환불 계열도 deferred다(fail closed).
 
 `tests/test_iap_refunds.py`가 위 전부를 고정한다.
 
@@ -948,7 +1048,7 @@ B-3 원장 위에 얹는다. 전부 server가 지급 / 차감한다.
 | B-4 ✅ | 출석 — 하루 1개 (Asia/Seoul day) | `daily_attendance` |
 | B-5 ✅ | AdMob rewarded — 1개, 하루 5회, **SSV 필수** | `rewarded_ad` |
 | A-1A ✅ | AI 스티커 — **−6개**, 실패하면 환불 | `ai_sticker` · `refund` |
-| B-6 ✅ | 조각 IAP — 10 / 50 / 100, 환불 회수 | `iap_purchase` · `iap_refund` |
+| B-6 ✅ | 조각 IAP — 10 / 50 / 100, 환불 회수 · 되돌리기 | `iap_purchase` · `iap_refund` · `iap_refund_reversed` |
 | B-7 | 꾸미러 Pass — ₩4,900 월 / ₩39,000 년 | 정책 확정 후 |
 | B-8 | 마켓 — 등록 20 조각, 조각 구매 거울은 영구 소유 | `mirror_publish_fee` · `mirror_purchase` · `mirror_sale` |
 

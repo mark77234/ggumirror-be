@@ -46,6 +46,8 @@ class ShardReason(StrEnum):
     REFUND = "refund"
     # Apple 환불로 실제 회수한 조각(B-6F-B). 회수 못 한 몫은 원장에 남지 않는다.
     IAP_REFUND = "iap_refund"
+    # Apple이 환불을 되돌렸을 때 **회수했던 만큼만** 복구(B-6F-C).
+    IAP_REFUND_REVERSED = "iap_refund_reversed"
     ADMIN_ADJUSTMENT = "admin_adjustment"
 
 
@@ -61,7 +63,16 @@ class ShardWallet:
     lifetime_spent: int = 0
     # **Apple 환불로 실제 회수한 양.** requested가 아니라 recovered만 쌓인다.
     # 예전 문서에는 없는 field라 읽을 때 0으로 본다(migration 없음).
+    #
+    # **gross다 — 환불이 되돌려져도 줄지 않는다**(`lifetime_earned`와 같은 규칙).
+    # 되돌려진 몫은 아래 `lifetime_refund_reversed`에 따로 쌓인다.
     lifetime_refunded: int = 0
+    # **환불이 되돌려져 복구한 양**(B-6F-C). 이것도 줄지 않는다.
+    #
+    # 이 field가 없으면 지갑만 보고는 숫자가 맞지 않는다 —
+    # `balance == earned - spent - refunded + refund_reversed`가 성립해야
+    # 운영자가 지갑 하나로 검산할 수 있다.
+    lifetime_refund_reversed: int = 0
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)
 
@@ -181,6 +192,20 @@ class ShardRefundResult:
 
 
 @dataclass(frozen=True)
+class ShardRefundReversalResult:
+    """환불 되돌리기 결과.
+
+    `restored`는 **이번 호출이 실제로 복구한 양**이다. 이미 다 되돌렸거나 애초에
+    회수한 것이 없으면 0이고, 그때 `applied`는 `False`다 — 실패가 아니라 할 일이 없는 것이다.
+    """
+
+    wallet: ShardWallet
+    restored: int
+    applied: bool
+    ledger_entry_id: str | None = None
+
+
+@dataclass(frozen=True)
 class ShardMutationResult:
     """조각을 움직인 결과.
 
@@ -245,6 +270,25 @@ class PurchaseClaimMissing(ShardError):
 
     우리가 조각을 준 적 없는 결제라는 뜻이다 — 실패가 아니라 **할 일이 없는 것**이다.
     Apple이 다시 보내도 답이 같으므로 재시도를 요구하지 않는다.
+    """
+
+
+class RefundRecordMissing(ShardError):
+    """되돌릴 환불 기록이 없다. **아무것도 기록되지 않는다.**
+
+    우리가 회수한 적 없는 결제라는 뜻이다 — 복구할 것이 없다.
+    """
+
+
+class RefundNotYetProcessed(ShardError):
+    """환불 기록이 아직 없지만 **그 결제는 우리가 지급한 것**이다.
+
+    `REFUND`가 아직 도착하지 않았을 수 있다 — Apple V2 payload에는 순서를 알려주는
+    field가 없고(`notificationUUID` · `signedDate`뿐), 우리는 notification history를
+    조회할 수단(`.p8`)도 갖고 있지 않다. 그래서 "지금 없다"를 "영영 없다"로 단정하지 않는다.
+
+    **200으로 삼키면 사용자가 되돌려받아야 할 조각을 영구히 잃는다.**
+    재시도를 받을 수 있게 올린다.
     """
 
 
