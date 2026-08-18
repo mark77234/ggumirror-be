@@ -42,7 +42,10 @@ class ShardReason(StrEnum):
     MIRROR_PURCHASE = "mirror_purchase"
     MIRROR_SALE = "mirror_sale"
     MIRROR_PUBLISH_FEE = "mirror_publish_fee"
+    # AI 생성 실패 복구(A-1B). **Apple 환불에 재사용하지 않는다** — 다른 사건이다.
     REFUND = "refund"
+    # Apple 환불로 실제 회수한 조각(B-6F-B). 회수 못 한 몫은 원장에 남지 않는다.
+    IAP_REFUND = "iap_refund"
     ADMIN_ADJUSTMENT = "admin_adjustment"
 
 
@@ -52,8 +55,13 @@ class ShardWallet:
 
     user_id: str
     balance: int = 0
+    # **누적 획득.** 환불이 나도 줄지 않는다 — 받았다는 사실은 사라지지 않는다.
     lifetime_earned: int = 0
+    # **사용자가 실제로 쓴 양.** Apple 환불 회수를 여기 넣지 않는다 — 쓴 적이 없다.
     lifetime_spent: int = 0
+    # **Apple 환불로 실제 회수한 양.** requested가 아니라 recovered만 쌓인다.
+    # 예전 문서에는 없는 field라 읽을 때 0으로 본다(migration 없음).
+    lifetime_refunded: int = 0
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)
 
@@ -125,6 +133,54 @@ class ExclusiveClaim:
 
 
 @dataclass(frozen=True)
+class DocumentKey:
+    """문서 하나를 가리키는 값. **collection 이름은 부르는 쪽이 정한다.**
+
+    `ExclusiveClaim`과 같은 규칙이다 — 원장이 IAP collection 이름을 알고 있지 않다.
+    `key`는 이미 hash된 값이다(raw transaction id가 문서 ID에 노출되지 않는다).
+    """
+
+    collection: str
+    key: str
+
+
+@dataclass(frozen=True)
+class RefundPlan:
+    """되돌릴 양 + record에 함께 남길 값.
+
+    **원본 구매 claim을 읽어야 알 수 있다.** 그래서 저장소가 transaction 안에서
+    claim을 읽은 뒤 부르는 callback이 이것을 만든다 — 금액 정책과 claim schema는
+    IAP 계층에 남고, 원장은 "받은 값을 원자적으로 쓰는 일"만 한다.
+    """
+
+    requested: int
+    fields: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ShardRefundResult:
+    """Apple 환불 한 건의 결과.
+
+    `requested`는 **Apple이 되돌리라고 한 양**, `recovered`는 **지갑에서 실제로 뺀 양**이다.
+    잔액이 모자라면 둘이 다르고, 그 차이(`unrecovered`)는 **빚이 아니다** —
+    나중에 번 조각에서 자동으로 상계하지 않는다.
+
+    `applied`는 `ShardMutationResult`와 같은 뜻이다 — **이번 호출이 기록했는가**.
+    같은 환불이 다시 오면 `False`이고, 그때도 나머지 값은 처음 처리한 그대로다.
+    """
+
+    wallet: ShardWallet
+    requested: int
+    recovered: int
+    applied: bool
+    ledger_entry_id: str | None = None
+
+    @property
+    def unrecovered(self) -> int:
+        return self.requested - self.recovered
+
+
+@dataclass(frozen=True)
 class ShardMutationResult:
     """조각을 움직인 결과.
 
@@ -181,6 +237,14 @@ class ClaimOwnedByAnother(ShardError):
     """전역 claim을 **다른 사용자가** 이미 갖고 있다. **아무것도 기록되지 않는다.**
 
     재전송(같은 사용자)과 구분해서 올린다 — 전자는 정상이고 이것은 거절이다.
+    """
+
+
+class PurchaseClaimMissing(ShardError):
+    """되돌릴 원본 구매 기록이 없다. **아무것도 기록되지 않는다.**
+
+    우리가 조각을 준 적 없는 결제라는 뜻이다 — 실패가 아니라 **할 일이 없는 것**이다.
+    Apple이 다시 보내도 답이 같으므로 재시도를 요구하지 않는다.
     """
 
 

@@ -18,14 +18,18 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 from app.shards.models import (
     MAX_DELTA,
+    DocumentKey,
     ExclusiveClaim,
     InvalidShardAmount,
     PeriodQuota,
+    RefundPlan,
     ShardMutationResult,
     ShardReason,
+    ShardRefundResult,
     ShardWallet,
     idempotency_hash,
 )
@@ -112,6 +116,37 @@ class ShardLedgerService:
     ) -> ShardMutationResult:
         """조각을 쓴다. 잔액이 모자라면 `InsufficientShards` — 아무것도 기록되지 않는다."""
         return self._apply(user_id, -self._checked(amount), reason, external_event_id)
+
+    def refund_iap(
+        self,
+        user_id: str,
+        external_event_id: str,
+        purchase: DocumentKey,
+        record: DocumentKey,
+        document: dict,
+        plan: Callable[[dict], RefundPlan],
+    ) -> ShardRefundResult:
+        """Apple 환불을 반영한다. **`debit`이 아니다.**
+
+        `debit`의 음수 delta는 `lifetime_spent`로 집계되는데, 환불은 사용자가 쓴 것이
+        아니다. 그 칸에 넣으면 "얼마나 썼는가"가 거짓말이 되므로 projection이 다른
+        전용 경로를 쓴다 — generic debit의 의미는 그대로 둔다.
+
+        되돌릴 양은 `plan`이 **원본 구매 claim을 보고** 정한다. 알림이 말한 값도,
+        지금의 catalog 값도 쓰지 않는다(catalog는 나중에 바뀔 수 있고, 그러면
+        예전 구매를 잘못된 금액으로 되돌리게 된다).
+
+        열쇠는 다른 이유와 **같은 함수**로 만든다 — user scope도 여기서 강제한다.
+        """
+        key = idempotency_hash(user_id, ShardReason.IAP_REFUND, external_event_id)
+        result = self._store.refund(user_id, purchase, record, document, key, plan)
+        # 값만 남긴다. 누구인지 · 어떤 transaction인지는 남기지 않는다.
+        logger.info(
+            "shard_refund reason=%s requested=%d recovered=%d unrecovered=%d balance=%d applied=%s",
+            ShardReason.IAP_REFUND.value, result.requested, result.recovered,
+            result.unrecovered, result.wallet.balance, result.applied,
+        )
+        return result
 
     # MARK: - 내부
 

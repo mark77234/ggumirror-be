@@ -177,6 +177,12 @@ def _mapped(payload) -> VerifiedTransaction:
         # 서명은 맞는데 필수 field가 없다. 추측해서 채우지 않는다.
         raise InvalidTransaction("verified payload is missing required fields")
 
+    # 환불 알림에서만 채워진다. 여기서도 enum이 파싱되지 않으면 `raw*`를 그대로 들고 간다 —
+    # 모르는 값을 `None`으로 만들면 "percentage가 없다"와 구분되지 않는다.
+    revocation_type = (
+        payload.revocationType.value if payload.revocationType else payload.rawRevocationType
+    )
+
     return VerifiedTransaction(
         transaction_id=payload.transactionId,
         product_id=payload.productId,
@@ -185,6 +191,9 @@ def _mapped(payload) -> VerifiedTransaction:
         app_account_token=payload.appAccountToken,
         transaction_type=str(transaction_type or ""),
         original_transaction_id=payload.originalTransactionId,
+        revocation_type=str(revocation_type) if revocation_type else None,
+        # Apple이 보낸 raw 값을 **정규화하지 않고** 그대로 옮긴다(milliunits).
+        revocation_percentage_milliunits=payload.revocationPercentage,
     )
 
 

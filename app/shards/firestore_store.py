@@ -11,6 +11,7 @@ collection 이름은 기존 규칙(`ggumirror_` prefix)을 따른다.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 from google.api_core import exceptions as gcp_exceptions
 from google.cloud import firestore
@@ -18,12 +19,16 @@ from google.cloud import firestore
 from app.auth.store import StoreUnavailable
 from app.shards.models import (
     ClaimOwnedByAnother,
+    DocumentKey,
     ExclusiveClaim,
     InsufficientShards,
     PeriodQuota,
+    PurchaseClaimMissing,
+    RefundPlan,
     QuotaExceeded,
     ShardLedgerEntry,
     ShardReason,
+    ShardRefundResult,
     ShardWallet,
     utcnow,
 )
@@ -162,6 +167,8 @@ class FirestoreShardStore:
                 balance=balance,
                 lifetime_earned=current.lifetime_earned + max(delta, 0),
                 lifetime_spent=current.lifetime_spent + max(-delta, 0),
+                # 일반 거래는 환불 누적을 **건드리지 않고 그대로 물려준다.**
+                lifetime_refunded=current.lifetime_refunded,
                 created_at=current.created_at if snapshot.exists else now,
                 updated_at=now,
             )
@@ -212,6 +219,150 @@ class FirestoreShardStore:
             logger.info("shard_ledger_duplicate_ignored reason=%s", reason.value)
         return wallet, entry, applied
 
+
+    def refund(
+        self,
+        user_id: str,
+        purchase: DocumentKey,
+        record: DocumentKey,
+        document: dict,
+        idempotency_key_hash: str,
+        plan: Callable[[dict], RefundPlan],
+    ) -> ShardRefundResult:
+        """Apple 환불. **`apply`를 재사용하지 않는다** — projection이 다르다.
+
+        `apply`의 음수 delta는 `lifetimeSpent`로 집계된다. 환불은 사용자가 쓴 것이
+        아니므로 그 칸에 넣으면 "얼마나 썼는가"가 거짓말이 된다.
+        `lifetimeEarned` · `lifetimeSpent`는 **그대로 두고** `lifetimeRefunded`만 올린다.
+        """
+        purchase_ref = self._db.collection(purchase.collection).document(purchase.key)
+        record_ref = self._db.collection(record.collection).document(record.key)
+        wallet_ref = self._db.collection(WALLETS).document(user_id)
+        # 원장 문서 ID = 멱등 열쇠. 다른 reason과 같은 규칙이다.
+        ledger_ref = self._db.collection(LEDGER).document(idempotency_key_hash)
+
+        @firestore.transactional
+        def run(transaction: firestore.Transaction) -> ShardRefundResult:
+            # 읽기를 **전부 먼저** 한다. Firestore transaction의 규칙이다.
+            purchase_snapshot = purchase_ref.get(transaction=transaction)
+            record_snapshot = record_ref.get(transaction=transaction)
+            wallet_snapshot = wallet_ref.get(transaction=transaction)
+
+            if not purchase_snapshot.exists:
+                # 우리가 조각을 준 적 없는 결제다. 되돌릴 것이 없고, 아무것도 쓰지 않는다.
+                raise PurchaseClaimMissing()
+
+            current = (
+                _wallet(user_id, wallet_snapshot.to_dict() or {})
+                if wallet_snapshot.exists
+                else ShardWallet.empty(user_id)
+            )
+
+            # 금액의 authority는 **원본 구매 claim**이다 — 알림이 말한 값도,
+            # 지금의 catalog 값도 쓰지 않는다(catalog는 나중에 바뀔 수 있다).
+            # 대조 검사도 여기서 함께 일어나고, 어긋나면 예외가 나가 아무것도 쓰지 않는다.
+            planned = plan(purchase_snapshot.to_dict() or {})
+            amount = planned.requested
+
+            if record_snapshot.exists:
+                # 같은 환불이 다시 왔다. **두 번 빼지 않는다.**
+                data = record_snapshot.to_dict() or {}
+                return ShardRefundResult(
+                    wallet=current,
+                    requested=int(data.get("requestedAmount") or 0),
+                    recovered=int(data.get("recoveredAmount") or 0),
+                    applied=False,
+                    ledger_entry_id=data.get("ledgerEntryId"),
+                )
+
+            # **잔액은 음수가 되지 않는다**(B-3 영구 규칙). 회수하지 못한 몫은
+            # 빚으로 남기지 않는다 — 나중에 번 조각에서 자동 상계하지 않는다.
+            recovered = min(current.balance, amount)
+            now = utcnow()
+
+            if recovered > 0:
+                entry = ShardLedgerEntry(
+                    id=ledger_ref.id,
+                    user_id=user_id,
+                    delta=-recovered,
+                    balance_after=current.balance - recovered,
+                    reason=ShardReason.IAP_REFUND,
+                    idempotency_key_hash=idempotency_key_hash,
+                    created_at=now,
+                )
+                transaction.create(ledger_ref, _entry_document(entry))
+                transaction.set(
+                    wallet_ref,
+                    _wallet_document(
+                        ShardWallet(
+                            user_id=user_id,
+                            balance=entry.balance_after,
+                            # **둘 다 그대로다.** 받은 적도, 쓴 적도 바뀌지 않았다.
+                            lifetime_earned=current.lifetime_earned,
+                            lifetime_spent=current.lifetime_spent,
+                            lifetime_refunded=current.lifetime_refunded + recovered,
+                            created_at=current.created_at if wallet_snapshot.exists else now,
+                            updated_at=now,
+                        )
+                    ),
+                )
+            else:
+                # 회수할 잔액이 없다. **delta 0짜리 원장 줄을 만들지 않는다** —
+                # 원장은 조각이 움직인 기록이고, 여기서는 움직이지 않았다.
+                # 그래도 **처리 완료된 환불**이라 record는 남긴다(재시도를 요구하지 않는다).
+                entry = None
+
+            # record가 이 환불의 business 멱등이다. `create`라서 우리가 읽은 뒤
+            # 다른 요청이 먼저 자리를 잡았으면 commit이 AlreadyExists로 깨진다.
+            transaction.create(
+                record_ref,
+                {
+                    **document,
+                    **planned.fields,
+                    "userId": user_id,
+                    "requestedAmount": amount,
+                    "recoveredAmount": recovered,
+                    "unrecoveredAmount": amount - recovered,
+                    "ledgerEntryId": entry.id if entry else None,
+                    "createdAt": now,
+                },
+            )
+            return ShardRefundResult(
+                wallet=self._projected(current, recovered),
+                requested=amount,
+                recovered=recovered,
+                applied=True,
+                ledger_entry_id=entry.id if entry else None,
+            )
+
+        try:
+            return run(self._db.transaction())
+        except gcp_exceptions.AlreadyExists:
+            # 같은 환불이 동시에 두 번 들어왔고 상대가 먼저 commit했다. **실패가 아니다** —
+            # 다시 돌리면 중복 분기로 들어가 상대가 만든 record를 그대로 읽는다.
+            logger.info("shard_refund_duplicate_ignored")
+            try:
+                return run(self._db.transaction())
+            except gcp_exceptions.GoogleAPIError as error:
+                raise self._unavailable("refund_retry", error) from error
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("refund", error) from error
+
+    @staticmethod
+    def _projected(current: ShardWallet, recovered: int) -> ShardWallet:
+        """방금 쓴 값을 그대로 돌려준다. commit 뒤 다시 읽지 않는다."""
+        if recovered <= 0:
+            return current
+        return ShardWallet(
+            user_id=current.user_id,
+            balance=current.balance - recovered,
+            lifetime_earned=current.lifetime_earned,
+            lifetime_spent=current.lifetime_spent,
+            lifetime_refunded=current.lifetime_refunded + recovered,
+            created_at=current.created_at,
+            updated_at=utcnow(),
+        )
+
     # MARK: - 내부
 
     def _unavailable(self, operation: str, error: Exception) -> StoreUnavailable:
@@ -229,6 +380,7 @@ def _wallet_document(wallet: ShardWallet) -> dict:
         "balance": wallet.balance,
         "lifetimeEarned": wallet.lifetime_earned,
         "lifetimeSpent": wallet.lifetime_spent,
+        "lifetimeRefunded": wallet.lifetime_refunded,
         "createdAt": wallet.created_at,
         "updatedAt": wallet.updated_at,
     }
@@ -252,6 +404,8 @@ def _wallet(user_id: str, data: dict) -> ShardWallet:
         balance=int(data.get("balance") or 0),
         lifetime_earned=int(data.get("lifetimeEarned") or 0),
         lifetime_spent=int(data.get("lifetimeSpent") or 0),
+        # 예전 문서에는 없는 field다. **migration 없이 0으로 읽는다.**
+        lifetime_refunded=int(data.get("lifetimeRefunded") or 0),
         created_at=data.get("createdAt") or utcnow(),
         updated_at=data.get("updatedAt") or utcnow(),
     )

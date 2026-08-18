@@ -1,10 +1,12 @@
-"""App Store Server Notifications V2 (B-6F-A).
+"""App Store Server Notifications V2 (B-6F-A · B-6F-B).
 
-**이번 단계는 검증과 분류까지다.** 환불 차감(B-6F-B)과 복구(B-6F-C)는 아직 없다.
-그래서 처리할 수 없는 알림을 **200으로 삼키지 않는다** — Apple이 다시 보내게 둔다.
+이 파일은 **검증하고 분류하는 곳**이다. 복구(`REFUND_REVERSED`, B-6F-C)는 아직 없고,
+처리할 수 없는 알림을 **200으로 삼키지 않는다** — Apple이 다시 보내게 둔다.
 
-경제를 건드리는 코드가 이 파일에 **하나도 없다**: `credit` · `debit` · `apply` ·
-wallet write · claim 생성 전부 없고, 테스트가 그것을 고정한다.
+**조각을 움직이는 코드는 여전히 여기 없다.** 환불조차 `IAPRefundService`에 맡기고
+이 파일은 어느 알림을 그리로 보낼지만 정한다 — 지급/차감 경로가 여기 섞이면
+"알림이 곧 authority"가 되고, 그게 한 결제에 두 번 지급되는 길이다.
+테스트가 그것을 소스 수준에서 고정한다.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import logging
 from app.iap.models import (
     ACKNOWLEDGED_NOTIFICATIONS,
     DEFERRED_NOTIFICATIONS,
+    REFUND_NOTIFICATION,
     AccountTokenMismatch,
     EnvironmentNotAllowed,
     IAPUnavailable,
@@ -35,8 +38,12 @@ class AppStoreNotificationService:
         bundle_id: str,
         allowed_environments: frozenset[str],
         app_apple_id: int | None,
+        refunds=None,
     ) -> None:
         self._verifier = verifier
+        # 없으면 `REFUND`를 **deferred로 되돌린다**(fail closed) — 처리기가 없는데
+        # 200으로 답하면 그 환불은 영영 사라진다.
+        self._refunds = refunds
         self._bundle_id = bundle_id
         self._allowed_environments = allowed_environments
         self._app_apple_id = app_apple_id
@@ -102,6 +109,14 @@ class AppStoreNotificationService:
 
     def _route(self, notification: VerifiedNotification) -> NotificationOutcome:
         kind = notification.notification_type
+
+        if kind == REFUND_NOTIFICATION:
+            if self._refunds is None:
+                logger.warning("app_store_notification_deferred type=%s reason=no_refund_handler", kind)
+                raise NotificationNotHandled("refund handling is not configured")
+            # 조각 회수는 저쪽이 한다. 여기서는 **어디로 보낼지만** 정한다.
+            self._refunds.handle(notification)
+            return NotificationOutcome.ACKNOWLEDGED
 
         if kind in ACKNOWLEDGED_NOTIFICATIONS:
             # **경제를 건드리지 않는다.** 특히 CONSUMPTION_REQUEST는 환불 승인이 아니고,

@@ -73,7 +73,9 @@ def chain() -> Chain:
     return Chain()
 
 
-def service(chain: Chain, environments: str = "Sandbox") -> AppStoreNotificationService:
+def service(
+    chain: Chain, environments: str = "Sandbox", refunds=None
+) -> AppStoreNotificationService:
     from app.iap.apple_verifier import build_apple_verifier
 
     verifier = build_apple_verifier(
@@ -88,6 +90,7 @@ def service(chain: Chain, environments: str = "Sandbox") -> AppStoreNotification
         bundle_id=BUNDLE_ID,
         allowed_environments=parse_allowed_environments(environments),
         app_apple_id=APP_APPLE_ID,
+        refunds=refunds,
     )
 
 
@@ -232,6 +235,8 @@ def test_one_time_charge_is_not_a_fulfillment_authority():
     code = _code_only((root / "app/iap/notifications.py").read_text())
     for banned in ["shard_amount", "SHARD_PRODUCTS", "IAPService", "credit"]:
         assert banned not in code, f"알림이 지급 authority가 됐다 ({banned})"
+    # 환불은 조각을 움직이지만 **여기서 움직이지 않는다** — 넘기기만 한다.
+    assert "refund_iap" not in code, "알림 파일이 직접 조각을 회수한다"
 
 
 def test_one_time_charge_is_no_longer_unknown():
@@ -239,8 +244,12 @@ def test_one_time_charge_is_no_longer_unknown():
 
     assert "ONE_TIME_CHARGE" in ACKNOWLEDGED_NOTIFICATIONS
     assert "ONE_TIME_CHARGE" not in DEFERRED_NOTIFICATIONS
-    # 환불 계열은 여전히 deferred다.
-    assert {"REFUND", "REFUND_REVERSED"} <= DEFERRED_NOTIFICATIONS
+    # `REFUND`는 B-6F-B에서 실제로 처리하므로 deferred가 아니다.
+    # **acknowledged allowlist에도 없다** — 검증만 하고 넘기는 알림이 아니기 때문이다.
+    assert "REFUND" not in DEFERRED_NOTIFICATIONS
+    assert "REFUND" not in ACKNOWLEDGED_NOTIFICATIONS
+    # 복구는 아직 B-6F-C다.
+    assert DEFERRED_NOTIFICATIONS == frozenset({"REFUND_REVERSED"})
 
 
 def test_one_time_charge_logs_no_raw_values(chain, caplog):
@@ -297,7 +306,7 @@ def test_logs_never_contain_raw_values(chain, caplog):
     payload = notification_payload(chain)
     with caplog.at_level(logging.DEBUG):
         with pytest.raises(NotificationNotHandled):
-            service(chain).handle(notification_payload(chain, notificationType="REFUND"))
+            service(chain).handle(notification_payload(chain, notificationType="REFUND_REVERSED"))
         service(chain).handle(notification_payload(chain, withTransaction=False))
 
     assert payload not in caplog.text
@@ -348,3 +357,95 @@ def test_http_rejects_malformed_payload(client):
 def test_no_generic_mutation_endpoint(client):
     for path in ["/shards", "/shards/credit", "/app-store/credit"]:
         assert client.post(path, json={"amount": 100}).status_code in {401, 404, 405}
+
+
+# MARK: - REFUND 라우팅 (B-6F-B)
+
+
+class RecordingRefunds:
+    """알림이 **어디로 보내는지**만 본다. 경제는 test_iap_refunds.py가 본다."""
+
+    def __init__(self) -> None:
+        self.seen: list = []
+
+    def handle(self, notification) -> None:
+        self.seen.append(notification)
+
+
+def refund_payload(chain: Chain, **inner) -> str:
+    """환불 알림. 안쪽 transaction에 `revocationType`이 실린다."""
+    inner.setdefault("revocationType", "REFUND_FULL")
+    return notification_payload(
+        chain,
+        notificationType="REFUND",
+        data={"signedTransactionInfo": chain.sign(**inner)},
+    )
+
+
+def test_refund_is_routed_to_the_refund_handler(chain):
+    refunds = RecordingRefunds()
+
+    outcome = service(chain, refunds=refunds).handle(refund_payload(chain))
+
+    assert outcome is NotificationOutcome.ACKNOWLEDGED
+    assert len(refunds.seen) == 1
+    assert refunds.seen[0].notification_type == "REFUND"
+
+
+def test_refund_without_a_handler_is_deferred(chain):
+    """처리기가 없는데 200으로 답하면 그 환불은 **영영 사라진다.** fail closed."""
+    with pytest.raises(NotificationNotHandled):
+        service(chain).handle(refund_payload(chain))
+
+
+@pytest.mark.parametrize(
+    ("revocation", "percentage"),
+    # ⚠️ percentage는 **milliunits**다: 33000 = 33%.
+    [("REFUND_FULL", None), ("REFUND_PRORATED", 33_000), ("FAMILY_REVOKE", None)],
+)
+def test_revocation_fields_survive_verification(chain, revocation, percentage):
+    """Apple이 서명한 회수 정보가 **검증을 지나 그대로** 도착한다."""
+    refunds = RecordingRefunds()
+    inner = {"revocationType": revocation}
+    if percentage is not None:
+        inner["revocationPercentage"] = percentage
+
+    service(chain, refunds=refunds).handle(refund_payload(chain, **inner))
+
+    transaction = refunds.seen[0].transaction
+    assert transaction.revocation_type == revocation
+    # Apple raw 값이 정규화 없이 도착한다.
+    assert transaction.revocation_percentage_milliunits == percentage
+
+
+def test_purchase_transaction_has_no_revocation_fields(chain):
+    """일반 구매 transaction에는 회수 정보가 없다 — `None`이어야 한다."""
+    refunds = RecordingRefunds()
+    service(chain, refunds=refunds).handle(refund_payload(chain, revocationType=None))
+
+    transaction = refunds.seen[0].transaction
+    assert transaction.revocation_type is None
+    assert transaction.revocation_percentage_milliunits is None
+
+
+def test_refund_reversed_is_still_deferred(chain):
+    """B-6F-C 미구현. **200으로 삼키지 않는다** — 처리기가 붙어 있어도 마찬가지다."""
+    with pytest.raises(NotificationNotHandled):
+        service(chain, refunds=RecordingRefunds()).handle(
+            notification_payload(chain, notificationType="REFUND_REVERSED")
+        )
+
+
+@pytest.mark.parametrize(
+    "kind", ["TEST", "ONE_TIME_CHARGE", "CONSUMPTION_REQUEST", "REFUND_DECLINED"]
+)
+def test_other_notifications_never_reach_the_refund_handler(chain, kind):
+    """환불 처리기가 생겼다고 다른 알림이 조각을 건드리게 되면 안 된다."""
+    refunds = RecordingRefunds()
+
+    outcome = service(chain, refunds=refunds).handle(
+        notification_payload(chain, notificationType=kind)
+    )
+
+    assert outcome is NotificationOutcome.ACKNOWLEDGED
+    assert refunds.seen == [], f"{kind}가 환불 경로로 갔다"

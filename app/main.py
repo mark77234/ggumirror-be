@@ -24,6 +24,7 @@ from app.ai.storage import GenerationStorage, build_storage
 from app.ai.store import GenerationStore
 from app.iap.models import parse_allowed_environments
 from app.iap.notifications import AppStoreNotificationService
+from app.iap.refunds import IAPRefundService
 from app.iap.service import IAPService
 from app.iap.apple_verifier import build_apple_verifier
 from app.iap.verifier import TransactionVerifier
@@ -167,6 +168,8 @@ def create_app(
             bundle_id=settings.apple_client_id,
             allowed_environments=parse_allowed_environments(settings.iap_allowed_environments),
             app_apple_id=settings.iap_app_apple_id,
+            # 환불만 조각을 움직인다. 알림 service는 여기로 넘기기만 한다.
+            refunds=IAPRefundService(shards()),
         )
 
     app.state.apple_verifier = verifier

@@ -55,6 +55,16 @@ class VerifiedTransaction:
     # consumable의 멱등 열쇠가 **아니다**(재구매마다 transaction_id가 새로 나온다).
     # 감사용으로만 둔다.
     original_transaction_id: str | None = None
+    # 아래 둘은 **환불 알림에서만** 채워진다(구매 transaction에는 없다).
+    # `REFUND_FULL` · `REFUND_PRORATED` · `FAMILY_REVOKE` — Apple이 서명한 값이다.
+    revocation_type: str | None = None
+    # ⚠️ **milliunits다. 0..100 퍼센트가 아니다.** `100% = 100000`, `0.015% = 15`.
+    # Apple 공식 문서와 `app-store-server-library`의 field 주석이
+    # "The percentage, in milliunits"라고 말한다. 이름에 단위를 박아 둔 이유는
+    # 실제로 이것을 0..100으로 오해해 100배 적게 회수하는 버그를 냈기 때문이다.
+    #
+    # `REFUND_PRORATED`일 때만 온다. **없으면 추측하지 않는다**(mutation 0).
+    revocation_percentage_milliunits: int | None = None
 
     @property
     def shard_amount(self) -> int | None:
@@ -112,9 +122,19 @@ ACKNOWLEDGED_NOTIFICATIONS = frozenset({
 
 # 검증은 하되 **아직 구현하지 않은** 것. 재시도를 받아야 한다.
 DEFERRED_NOTIFICATIONS = frozenset({
-    "REFUND",           # B-6F-B
+    # `REFUND`는 B-6F-B에서 실제로 처리한다 — 여기 없다.
     "REFUND_REVERSED",  # B-6F-C
 })
+
+# 환불 알림. **allowlist도 deferred도 아닌 세 번째 갈래**라 따로 둔다 —
+# 검증한 뒤 조각을 실제로 회수하기 때문이다.
+REFUND_NOTIFICATION = "REFUND"
+
+# `revocationType`(Apple 서명 값). library enum과 같은 문자열이고,
+# **우리가 새로 만들지 않는다.**
+REFUND_FULL = "REFUND_FULL"
+REFUND_PRORATED = "REFUND_PRORATED"
+FAMILY_REVOKE = "FAMILY_REVOKE"
 
 
 @dataclass(frozen=True)
@@ -168,6 +188,13 @@ class TransactionAlreadyClaimed(IAPError):
     """
 
 
+class RefundMismatch(IAPError):
+    """환불 알림이 **원본 구매 기록과 다르다.** 아무것도 되돌리지 않는다.
+
+    product · environment · 주인이 어긋났다는 뜻이라 재시도해도 같다.
+    """
+
+
 def transaction_claim_id(transaction_id: str) -> str:
     """전역 claim 문서 ID.
 
@@ -182,6 +209,36 @@ def transaction_claim_id(transaction_id: str) -> str:
         f"{len(part.encode())}:{part}" for part in ("iap_transaction", transaction_id)
     )
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def refund_record_id(transaction_id: str) -> str:
+    """환불 business record의 문서 ID.
+
+    **원본 구매 transaction 하나당 record 하나**다 — `notificationUUID`를 쓰지 않는다.
+    Apple이 같은 환불을 다른 UUID로 다시 보내도 같은 자리를 겨뤄야 하기 때문이다.
+
+    `transaction_claim_id`와 같은 규칙이고 namespace만 다르다.
+    raw transaction id를 문서 ID로 쓰지 않는다.
+    """
+    canonical = "|".join(
+        f"{len(part.encode())}:{part}" for part in ("iap_refund", transaction_id)
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def account_token_user_id(token: str | None) -> str | None:
+    """`appAccountToken`을 우리 user id 표기(canonical UUID 문자열)로 정규화한다.
+
+    Apple 표기가 흔들려도 같은 UUID면 같은 사람이지만, **지갑 문서 ID는 문자열이다** —
+    정규화하지 않고 그대로 쓰면 대문자 하나 때문에 **다른 문서**를 만지게 된다.
+    우리 user id는 `str(uuid4())`라 이 표기와 같다.
+    """
+    if not token:
+        return None
+    try:
+        return str(uuid.UUID(token))
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 def transaction_log_id(transaction_id: str) -> str:
