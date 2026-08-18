@@ -16,6 +16,7 @@ from fastapi import Depends, HTTPException, Request, status
 from app.ads.service import RewardedAdService
 from app.ai.service import AIStickerService
 from app.auth.apple import AppleTokenVerifier
+from app.iap.notifications import AppStoreNotificationService
 from app.iap.service import IAPService
 from app.auth.models import User, sha256_hex
 from app.auth.store import AuthStore, StoreUnavailable
@@ -85,6 +86,15 @@ def iap_service(request: Request) -> IAPService:
         return request.app.state.iap_service()
     except Exception as error:  # Firestore client 생성 실패 (credential / network)
         logger.error("iap_service_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
+def app_store_notifications(request: Request) -> AppStoreNotificationService:
+    """App Store 알림 service. **Bearer가 없는 경로**라 세션을 보지 않는다."""
+    try:
+        return request.app.state.app_store_notifications()
+    except Exception as error:  # Firestore client 생성 실패 등
+        logger.error("app_store_notifications_unavailable error=%s", type(error).__name__)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
 
 

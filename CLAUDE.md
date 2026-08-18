@@ -20,11 +20,11 @@ Backend repository for 꾸미러.
 - purchase / ownership
 - seller shard settlement
 
-## Current Implementation (Phase B-6B 완료)
+## Current Implementation (Phase B-6F-A 완료)
 
 FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth +
 server-authoritative 조각 원장 + 하루 한 번 출석 + AdMob rewarded SSV + AI 스티커 생성 +
-조각 IAP(Apple 공식 library로 JWS 검증. client/UI는 B-6C).
+조각 IAP(Apple JWS 검증 + StoreKit client) + App Store 알림 V2 검증(환불 차감은 B-6F-B).
 
 ```
 app/main.py          create_app()
@@ -57,6 +57,8 @@ app/shards/service.py  ShardLedgerService
 app/shards/attendance.py  KST 날짜 규칙 + 출석 지급
 app/core/config.py   환경변수 + logging
 app/api/iap.py       POST /users/me/iap/shards (body는 signedTransaction 하나)
+app/api/app_store.py POST /app-store/notifications/v2 (Apple 서명이 곧 인증)
+app/iap/notifications.py  알림 검증 · 분류 (B-6F-A: 경제 mutation 0)
 app/iap/models.py    catalog(10/50/100) · 전역 claim id · appAccountToken 대조
 app/iap/verifier.py  검증 seam (protocol + fail-closed Unconfigured)
 app/iap/apple_verifier.py  Apple 공식 SignedDataVerifier wrapper (environment별)
@@ -66,7 +68,7 @@ scripts/admin_shards.py  운영자 조각 지급/회수 CLI (B-3 원장 재사�
 tests/               pytest (Apple · Firestore 호출 없음)
 ```
 
-API는 health / auth / users / admob / ai / iap뿐이다. store · listing · marketplace는 없다.
+API는 health / auth / users / admob / ai / iap / app-store뿐이다. store · listing · marketplace는 없다.
 
 조각을 움직이는 통로는 **넷뿐**이고 전부 client가 값을 정할 수 없다:
 
@@ -231,6 +233,94 @@ client가 아직 `finish()`하지 않았으므로 그 결제는 유실되지 않
   **서명 검증을 아예 건너뛴다**(`signed_data_verifier.py`에서 확인). 만들면 위조 payload가
   그대로 통과한다. `parse_allowed_environments`가 값 단계에서 버리고, verifier map에도 없다
 - 검증 실패 사유를 client에 알려주지 않는다 — 로그에 `environment` + `status`만 남긴다
+
+#### 환불 알림 (B-6F) — App Store Server Notifications V2
+
+`POST /app-store/notifications/v2`. **Apple server-to-server라 Bearer가 없다** —
+인증은 오직 Apple이 서명한 payload다(B-5의 Google SSV와 같은 모양).
+body는 `signedPayload` 하나뿐이고 `extra="forbid"`다.
+
+검증은 **B-6B verifier를 그대로 재사용**한다(`verify_and_decode_notification`).
+서명 전에 `notificationType` · `environment` · `bundleId`를 읽어 verifier를 고르지 않고,
+`Xcode` · `LocalTesting` verifier는 만들지 않는다.
+**바깥 JWS가 맞다고 안쪽 `signedTransactionInfo`를 믿지 않는다** — 따로 검증한다.
+
+##### B-6F-A 범위 — 경제 mutation 0
+
+| 알림 | 처리 | status |
+|---|---|---|
+| `TEST` | 검증만 | 200 |
+| `CONSUMPTION_REQUEST` | **환불 승인이 아니다.** 조각 불변, Apple에 응답도 안 함 | 200 |
+| `REFUND_DECLINED` | 되돌릴 것 없음 | 200 |
+| **`ONE_TIME_CHARGE`** | **consumable 구매의 정상 알림.** 검증만 하고 조각 불변 | 200 |
+| `REFUND` | **B-6F-B 미구현** | **503** |
+| `REFUND_REVERSED` | **B-6F-C 미구현** | **503** |
+| 그 밖의/새 타입 | 조각 영향 여부를 알 수 없음 | **503** |
+
+**모르는 타입을 200으로 삼키지 않는다.** allowlist(`ACKNOWLEDGED_NOTIFICATIONS`)에
+있는 것만 소비하고 나머지는 전부 deferred다 — 200으로 답하면 그 환불 알림은 영영 사라진다.
+
+##### `ONE_TIME_CHARGE`는 지급 authority가 아니다
+
+조각 IAP가 consumable이라 **구매마다 이 알림이 실제로 온다.** 그래서 deferred로 두면
+정상 알림에 503을 주게 되고 Apple이 영원히 재시도한다 — allowlist에 넣는다.
+
+다만 **이 알림으로 조각을 지급하지 않는다.** 지급 경로는 하나뿐이다:
+
+```
+client verified StoreKit transaction → POST /users/me/iap/shards
+→ Apple JWS 검증 → 전역 claim → ledger/wallet
+```
+
+알림으로 또 지급하면 **한 결제에 두 번** 들어간다. `app/iap/notifications.py`에
+`credit` · `SHARD_PRODUCTS` · `shard_amount` · `IAPService`가 **하나도 없고**
+테스트가 그것을 고정한다.
+
+**알림과 구매 endpoint의 순서를 오류로 취급하지 않는다.** 알림이 client fulfillment보다
+먼저 도착할 수 있으므로, 우리는 **claim을 조회하지 않는다** — 조회하지 않으니 race가
+성립하지 않고, claim 유무와 무관하게 200이다.
+
+status 규칙은 B-5와 같다: **재시도로 결과가 달라지는 것만 5xx.**
+서명·형식·bundle·environment 오류는 400(영구), 검증기 미설정·인증서 조회 실패는 503.
+
+##### 확정된 환불 정책 (B-6F-B/C에서 구현)
+
+- **wallet 음수는 계속 금지.** B-3 영구 규칙을 깨지 않는다
+- **잔액 부족 전액 환불**: 가능한 만큼만 회수하고 미회수량을 refund record에 남긴다
+  (요청 50 · 잔액 10 → 회수 10 · 미회수 40 · 결과 0). **부채 상계 시스템은 만들지 않는다**
+- **prorated**: `floor(originalAmount * percentage / 100)`, 단 `percentage > 0`인데
+  결과가 0이면 **최소 1** 회수
+- **`REFUND_PRORATED`인데 `revocationPercentage`가 없으면 mutation 0** — 추측하지 않는다
+- **`FAMILY_REVOKE`는 mutation 0 + 진단.** 일반 환불로 자동 매핑하지 않는다
+- Apple IAP 환불은 **별도 reason**을 쓴다: `iap_refund` · `iap_refund_reversed`.
+  기존 `refund`는 AI 생성 실패 복구용이라 섞지 않는다
+- 환불은 `lifetimeSpent`가 아니다 — `lifetimeRefunded` projection을 뒤로 호환되게 추가한다
+- generic notification history collection을 만들지 않는다.
+  필요한 business state만 `ggumirror_iap_refunds/{deterministicHash}`에 둔다
+- **Apple에 consumption data를 보내지 않는다.** 동의 흐름이 없다.
+  `.p8` · issuerId · keyId · `AppStoreServerAPIClient`를 도입하지 않았다(테스트가 고정)
+
+##### 로그 · URL
+
+로그에 raw `signedPayload` · raw `transactionId` · raw `appAccountToken` · 인증서 체인을
+남기지 않는다. 남기는 것은 `notificationType` · `subtype` · `environment` ·
+`transaction=sha256(txn)[:12]` · 결과뿐이고, **transaction이 없는 TEST에는 hash를 만들지 않는다**(`-`).
+
+##### TEST notification은 live acceptance 필수가 아니다
+
+Apple의 *Request a Test Notification* API는 **App Store Server API JWT 인증**을 요구한다
+(`.p8` · keyId · issuerId). 우리는 그 credential을 의도적으로 갖고 있지 않고,
+알림 하나를 보내려고 새로 만들지 않는다.
+
+그래서 B-6F-A의 실제 acceptance는 **Sandbox consumable 구매 1회로 오는
+`ONE_TIME_CHARGE`**로 한다. TEST 200 동작은 단위 테스트로만 고정한다.
+
+App Store Connect URL은 **Sandbox 먼저**:
+`https://ggumirror-api-cmyv4amroa-du.a.run.app/app-store/notifications/v2`
+Production URL은 출시 직전 **별도 gate**로 연결한다 — Sandbox만 설정하면
+production 알림은 전송되지 않아, 검증되지 않은 코드가 실제 결제에 닿지 않는다.
+
+`tests/test_app_store_notifications.py`가 위 전부를 고정한다.
 
 #### client 복구 계약 (B-6C)
 

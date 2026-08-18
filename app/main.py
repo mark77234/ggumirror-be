@@ -23,10 +23,11 @@ from app.ai.service import AIStickerService
 from app.ai.storage import GenerationStorage, build_storage
 from app.ai.store import GenerationStore
 from app.iap.models import parse_allowed_environments
+from app.iap.notifications import AppStoreNotificationService
 from app.iap.service import IAPService
 from app.iap.apple_verifier import build_apple_verifier
 from app.iap.verifier import TransactionVerifier
-from app.api import ads, ai, auth, health, iap, users
+from app.api import ads, ai, app_store, auth, health, iap, users
 from app.auth.apple import AppleTokenVerifier
 from app.auth.store import AuthStore
 from app.shards.service import ShardLedgerService
@@ -153,12 +154,28 @@ def create_app(
             allowed_environments=parse_allowed_environments(settings.iap_allowed_environments),
         )
 
+    @lru_cache(maxsize=1)
+    def notifications() -> AppStoreNotificationService:
+        # 같은 verifier를 쓴다 — 알림도 결제와 **같은 신뢰 사슬**을 지난다.
+        return AppStoreNotificationService(
+            transaction_verifier
+            or build_apple_verifier(
+                bundle_id=settings.apple_client_id,
+                allowed_environments=parse_allowed_environments(settings.iap_allowed_environments),
+                app_apple_id=settings.iap_app_apple_id,
+            ),
+            bundle_id=settings.apple_client_id,
+            allowed_environments=parse_allowed_environments(settings.iap_allowed_environments),
+            app_apple_id=settings.iap_app_apple_id,
+        )
+
     app.state.apple_verifier = verifier
     app.state.auth_store = store
     app.state.shard_service = shards
     app.state.rewarded_ad_service = rewarded_ads
     app.state.ai_sticker_service = ai_stickers
     app.state.iap_service = shard_iap
+    app.state.app_store_notifications = notifications
 
     app.include_router(health.router)
     app.include_router(auth.router)
@@ -166,6 +183,7 @@ def create_app(
     app.include_router(ads.router)
     app.include_router(ai.router)
     app.include_router(iap.router)
+    app.include_router(app_store.router)
 
     logger.info("app created env=%s log_level=%s", settings.app_env, settings.log_level)
     return app

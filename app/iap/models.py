@@ -62,6 +62,62 @@ class VerifiedTransaction:
 
 
 @dataclass(frozen=True)
+class VerifiedNotification:
+    """서명 검증을 통과한 App Store Server Notification V2.
+
+    **여기 오는 값은 전부 Apple이 서명한 것**이고, 안쪽 transaction도 따로 검증됐다.
+    """
+
+    notification_type: str
+    subtype: str | None
+    notification_uuid: str
+    bundle_id: str
+    app_apple_id: int | None
+    environment: str
+    # `signedTransactionInfo`가 있는 알림만 채워진다(TEST에는 없다).
+    transaction: VerifiedTransaction | None = None
+
+
+class NotificationOutcome(StrEnum):
+    """알림 처리 결과. **응답 status를 여기서 정한다.**"""
+
+    # 검증했고 우리 경제에 할 일이 없다. Apple이 다시 보낼 필요가 없다.
+    ACKNOWLEDGED = "acknowledged"
+    # 검증은 됐지만 **아직 처리할 수 없다**(B-6F-B/C 미구현, 모르는 타입).
+    # **200으로 삼키지 않는다** — Apple이 다시 보내게 둔다.
+    DEFERRED = "deferred"
+
+
+# 검증만 하고 **경제를 건드리지 않는** 알림. 여기 없는 타입은 전부 deferred다.
+#
+# "모르는 타입이면 일단 200"으로 두면, 조각에 영향을 주는 새 알림이 조용히 사라진다.
+# 그래서 **allowlist**로 간다 — 우리가 no-op이라고 판단한 것만 소비한다.
+ACKNOWLEDGED_NOTIFICATIONS = frozenset({
+    # Apple이 URL 설정을 확인할 때 보낸다. transaction이 없다.
+    "TEST",
+    # **환불 승인이 아니다.** Apple이 소비 정보를 물어보는 것뿐이고,
+    # 우리는 동의 흐름이 없어 응답하지 않는다(조각도 건드리지 않는다).
+    "CONSUMPTION_REQUEST",
+    # 환불이 거절됐다. 되돌릴 것이 없다.
+    "REFUND_DECLINED",
+    # **consumable 구매의 정상 알림이다.** 조각 IAP가 consumable이므로 실제로 온다.
+    #
+    # ⚠️ **지급 authority가 아니다.** 조각은 client가 가져온 서명 transaction을
+    # `POST /users/me/iap/shards`가 검증해 지급하고, 그 경로에만 전역 claim이 걸린다.
+    # 이 알림으로 또 지급하면 **한 결제에 두 번 지급**된다.
+    #
+    # deferred로 두면 안 된다 — 정상 알림에 503을 주면 Apple이 영원히 재시도한다.
+    "ONE_TIME_CHARGE",
+})
+
+# 검증은 하되 **아직 구현하지 않은** 것. 재시도를 받아야 한다.
+DEFERRED_NOTIFICATIONS = frozenset({
+    "REFUND",           # B-6F-B
+    "REFUND_REVERSED",  # B-6F-C
+})
+
+
+@dataclass(frozen=True)
 class IAPResult:
     """지급 결과. `credited`는 **이번 요청이 원장에 적었는가**다.
 
@@ -92,6 +148,10 @@ class UnknownProduct(IAPError):
 
 class EnvironmentNotAllowed(IAPError):
     """허용되지 않은 환경(기본은 아무것도 허용하지 않는다)."""
+
+
+class NotificationNotHandled(IAPError):
+    """검증은 됐지만 아직 처리할 수 없다. **재시도 가능한 실패로 올린다.**"""
 
 
 class AccountTokenMismatch(IAPError):

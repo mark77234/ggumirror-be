@@ -29,6 +29,7 @@ from app.iap.models import (
     IAPEnvironment,
     IAPUnavailable,
     InvalidTransaction,
+    VerifiedNotification,
     VerifiedTransaction,
 )
 from app.iap.verifier import TransactionVerifier, UnconfiguredVerifier
@@ -81,6 +82,45 @@ class AppleTransactionVerifier:
         environment와 자기 environment를 대조하므로(`INVALID_ENVIRONMENT`),
         Production JWS는 Production verifier만 통과한다.
         """
+        return _mapped(self._attempt("transaction", lambda v: v.verify_and_decode_signed_transaction(signed_transaction)))
+
+    def verify_notification(self, signed_payload: str) -> VerifiedNotification:
+        """App Store Server Notification V2. **transaction과 같은 규칙으로 검증한다.**
+
+        서명 전에 `notificationType` · `environment` · `bundleId`를 읽어 verifier를
+        고르지 않는다. 허용된 verifier로 차례로 시도하고 정확히 하나만 성공해야 한다.
+
+        안쪽 `signedTransactionInfo`는 **따로 검증한다** — 바깥 JWS가 맞다고
+        안쪽을 그대로 믿지 않는다.
+        """
+        payload = self._attempt(
+            "notification", lambda v: v.verify_and_decode_notification(signed_payload)
+        )
+        data = payload.data
+        transaction: VerifiedTransaction | None = None
+        if data is not None and data.signedTransactionInfo:
+            transaction = self.verify(data.signedTransactionInfo)
+
+        notification_type = (
+            payload.notificationType.value if payload.notificationType else payload.rawNotificationType
+        )
+        subtype = payload.subtype.value if payload.subtype else payload.rawSubtype
+        environment = None
+        if data is not None:
+            environment = data.environment.value if data.environment else data.rawEnvironment
+
+        return VerifiedNotification(
+            notification_type=str(notification_type or ""),
+            subtype=str(subtype or "") or None,
+            notification_uuid=payload.notificationUUID or "",
+            bundle_id=(data.bundleId if data else None) or "",
+            app_apple_id=data.appAppleId if data else None,
+            environment=str(environment or ""),
+            transaction=transaction,
+        )
+
+    def _attempt(self, kind: str, decode):
+        """허용된 verifier들로 차례로 시도한다. **정확히 하나만** 성공해야 한다."""
         if not self._verifiers:
             raise IAPUnavailable("no transaction verifier is configured")
 
@@ -92,7 +132,7 @@ class AppleTransactionVerifier:
             if verifier is None:
                 continue
             try:
-                verified.append((name, verifier.verify_and_decode_signed_transaction(signed_transaction)))
+                verified.append((name, decode(verifier)))
             except VerificationException as error:
                 # 어떤 환경에서 왜 실패했는지는 **로그에만** 남긴다.
                 # client에 알려주면 어느 값을 고치면 되는지 가르쳐 주는 셈이다.
@@ -100,27 +140,28 @@ class AppleTransactionVerifier:
                 if status in _RETRYABLE:
                     retryable = True
                 logger.info(
-                    "iap_verify_failed environment=%s status=%s", name, getattr(status, "name", status)
+                    "iap_verify_failed kind=%s environment=%s status=%s",
+                    kind, name, getattr(status, "name", status),
                 )
             except Exception as error:  # library가 올리는 형식 오류 등
-                logger.info("iap_verify_failed environment=%s error=%s", name, type(error).__name__)
+                logger.info(
+                    "iap_verify_failed kind=%s environment=%s error=%s",
+                    kind, name, type(error).__name__,
+                )
 
         if not verified:
             if retryable:
                 # 인증서 폐기 조회가 안 됐다. **검증을 건너뛰지 않는다.**
-                # client가 아직 `finish()`하지 않았으므로 StoreKit이 다시 가져온다.
-                logger.warning("iap_verify_retryable_failure")
+                logger.warning("iap_verify_retryable_failure kind=%s", kind)
                 raise IAPUnavailable("certificate verification could not be completed")
             raise InvalidTransaction("signature verification failed")
 
         if len(verified) > 1:
             # 일어나면 안 된다 — library가 environment를 대조하기 때문이다.
-            # 그래도 애매한 상태로 지급하지 않는다.
-            logger.error("iap_verify_ambiguous environments=%d", len(verified))
-            raise InvalidTransaction("transaction verified in more than one environment")
+            logger.error("iap_verify_ambiguous kind=%s environments=%d", kind, len(verified))
+            raise InvalidTransaction("verified in more than one environment")
 
-        _, payload = verified[0]
-        return _mapped(payload)
+        return verified[0][1]
 
 
 def _mapped(payload) -> VerifiedTransaction:
