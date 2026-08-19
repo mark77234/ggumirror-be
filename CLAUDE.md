@@ -598,10 +598,23 @@ production 알림은 전송되지 않아, 검증되지 않은 코드가 실제 �
   marketplace 밖의 임의 조각 이동은 제품에 없다. 테스트가 소스에서 금지한다
 - 방향은 `delta` 부호 + 호출부가 고른 `reason`이 함께 정한다
   (`mirror_purchase` −, `mirror_sale` +, `mirror_publish_fee` −)
-- **같은 transaction에서 같은 지갑을 두 번 바꾸면 `WalletAlreadyChanged`다.**
+- **같은 attempt에서 같은 지갑을 두 번 바꾸면 `WalletAlreadyChanged`다.**
   Firestore transaction의 읽기는 시작 시점 snapshot이라 두 번째가 첫 번째를 못 보고
   덮어쓴다 — 조각이 조용히 사라지는 경로다. 자기 자신에게 파는 경우가 정확히 이 모양이라
   상위 service의 검사에만 기대지 않고 저장소에서 막는다
+- ⚠️ **그 기록은 `ShardTransactionContext`에 담고, transaction 객체에 붙이지 않는다.**
+  Firestore는 commit이 `ABORTED`되면 **같은 Python `Transaction` 객체로** callable을
+  다시 부른다(설치본 2.22.0 `_Transactional.__call__`이 loop 안에서 같은 객체를 넘긴다).
+  `_clean_up()`이 지우는 것은 `_write_pbs`와 `_id`뿐이라, transaction에 붙인 표시는
+  **다음 시도까지 살아남아** 아무것도 commit되지 않았는데 재시도가 거절된다.
+  실제 SDK wrapper로 재현했고(B-7B.1), 그래서 호출부가 attempt마다 새 context를 만든다:
+
+      @firestore.transactional
+      def run(transaction):
+          scoped = shards.context(transaction)   # ← 시도마다 새 기록
+          shards.apply_in_transaction(scoped, buyer, -price, MIRROR_PURCHASE, listing_id)
+
+  재시도는 **지갑을 다시 읽는다** — 이전 시도가 본 잔액으로 계산하지 않는다
 - 잔액 부족은 `InsufficientShards` — **호출자의 transaction 전체가 취소된다.** 음수 불가
 - 멱등 열쇠는 다른 이유와 **같은 `idempotency_hash`**다. 구매자/판매자/수수료가
   각각 다른 문서 ID를 갖는다(user_id와 reason이 섞이므로)

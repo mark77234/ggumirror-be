@@ -27,7 +27,7 @@ from app.shards.models import (
     RefundPlan,
     RefundRecordMissing,
     QuotaExceeded,
-    WalletAlreadyChanged,
+    ShardTransactionContext,
     ShardLedgerEntry,
     ShardReason,
     ShardRefundResult,
@@ -142,9 +142,12 @@ class ShardStore(Protocol):
     def transaction(self):
         """호출자가 소유하는 transaction을 연다. **commit은 호출자가 한다.**"""
 
+    def context(self, transaction) -> ShardTransactionContext:
+        """**transactional callable 안에서 매번** 부른다 — attempt마다 새 기록이다."""
+
     def apply_in_transaction(
         self,
-        transaction,
+        context: ShardTransactionContext,
         user_id: str,
         delta: int,
         reason: ShardReason,
@@ -177,7 +180,6 @@ class InMemoryTransaction:
 
     def __init__(self) -> None:
         self._writes: list = []
-        self.changed_wallets: set[str] = set()
         self.commits = 0
 
     def add(self, write) -> None:
@@ -435,9 +437,12 @@ class InMemoryShardStore:
             yield tx
             tx.commit()
 
+    def context(self, transaction) -> ShardTransactionContext:
+        return ShardTransactionContext(transaction=transaction)
+
     def apply_in_transaction(
         self,
-        transaction: InMemoryTransaction,
+        context: ShardTransactionContext,
         user_id: str,
         delta: int,
         reason: ShardReason,
@@ -447,9 +452,7 @@ class InMemoryShardStore:
         if existing := self._applied.get(idempotency_key_hash):
             return self.wallet(user_id), existing, False
 
-        if user_id in transaction.changed_wallets:
-            raise WalletAlreadyChanged(user_id)
-        transaction.changed_wallets.add(user_id)
+        context.claim(user_id)
 
         current = self.wallet(user_id)
         if current.balance + delta < 0:
@@ -482,5 +485,5 @@ class InMemoryShardStore:
             self.entries.append(entry)
             self._applied[idempotency_key_hash] = entry
 
-        transaction.add(write)
+        context.transaction.add(write)
         return wallet, entry, True

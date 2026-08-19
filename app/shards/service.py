@@ -30,6 +30,7 @@ from app.shards.models import (
     ShardMutationResult,
     ShardReason,
     ShardRefundResult,
+    ShardTransactionContext,
     ShardRefundReversalResult,
     ShardWallet,
     idempotency_hash,
@@ -180,9 +181,17 @@ class ShardLedgerService:
         """marketplace처럼 **다른 문서와 함께 commit해야 하는** 호출자가 transaction을 연다."""
         return self._store.transaction()
 
+    def context(self, transaction) -> ShardTransactionContext:
+        """**transactional callable 안에서 매번** 부른다.
+
+        Firestore는 commit이 `ABORTED`되면 **같은 transaction 객체로** callable을 다시
+        부른다. 시도마다 새 기록으로 시작해야 재시도가 잘못 거절되지 않는다.
+        """
+        return self._store.context(transaction)
+
     def apply_in_transaction(
         self,
-        transaction,
+        context: ShardTransactionContext,
         user_id: str,
         delta: int,
         reason: ShardReason,
@@ -203,7 +212,7 @@ class ShardLedgerService:
         """
         key = idempotency_hash(user_id, reason, external_event_id)
         wallet, entry, applied = self._store.apply_in_transaction(
-            transaction, user_id, self._moved(delta), reason, key
+            context, user_id, self._moved(delta), reason, key
         )
         event = "shard_ledger_credit" if entry.delta > 0 else "shard_ledger_debit"
         logger.info(

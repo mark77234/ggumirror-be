@@ -47,9 +47,13 @@ def seed(shards: ShardLedgerService, user: str, amount: int) -> None:
 
 
 def purchase(shards: ShardLedgerService, tx, price: int, listing: str = LISTING) -> None:
-    """marketplace 구매가 하게 될 그대로 — 한 transaction에 두 번 얹는다."""
-    shards.apply_in_transaction(tx, BUYER, -price, ShardReason.MIRROR_PURCHASE, listing)
-    shards.apply_in_transaction(tx, SELLER, price, ShardReason.MIRROR_SALE, listing)
+    """marketplace 구매가 하게 될 그대로 — 한 transaction에 두 번 얹는다.
+
+    `context`는 **attempt마다** 만든다 — 재시도가 이전 시도의 기록을 물려받지 않는다.
+    """
+    scoped = shards.context(tx)
+    shards.apply_in_transaction(scoped, BUYER, -price, ShardReason.MIRROR_PURCHASE, listing)
+    shards.apply_in_transaction(scoped, SELLER, price, ShardReason.MIRROR_SALE, listing)
 
 
 # MARK: - 두 지갑, 한 transaction (§7)
@@ -88,7 +92,7 @@ def test_publish_fee_moves_one_wallet_in_a_caller_transaction(store, shards):
 
     with store.transaction() as tx:
         shards.apply_in_transaction(
-            tx, SELLER, -20, ShardReason.MIRROR_PUBLISH_FEE, LISTING
+                shards.context(tx), SELLER, -20, ShardReason.MIRROR_PUBLISH_FEE, LISTING
         )
 
     wallet = store.wallet(SELLER)
@@ -133,7 +137,8 @@ def test_failure_after_buyer_debit_rolls_back(store, shards):
 
     with pytest.raises(RuntimeError):
         with store.transaction() as tx:
-            shards.apply_in_transaction(tx, BUYER, -30, ShardReason.MIRROR_PURCHASE, LISTING)
+            shards.apply_in_transaction(
+                shards.context(tx), BUYER, -30, ShardReason.MIRROR_PURCHASE, LISTING)
             # ownership 생성 실패 같은 상황
             raise RuntimeError("ownership write failed")
 
@@ -147,9 +152,11 @@ def test_failure_on_seller_leg_rolls_back_the_buyer(store, shards):
 
     with pytest.raises(WalletAlreadyChanged):
         with store.transaction() as tx:
-            shards.apply_in_transaction(tx, BUYER, -30, ShardReason.MIRROR_PURCHASE, LISTING)
+            # **같은 attempt**이므로 context 하나를 공유한다 — 실제 호출부와 같은 모양이다.
+            scoped = shards.context(tx)
+            shards.apply_in_transaction(scoped, BUYER, -30, ShardReason.MIRROR_PURCHASE, LISTING)
             # 자기 자신에게 파는 상황 — 판매자 leg이 거절된다
-            shards.apply_in_transaction(tx, BUYER, 30, ShardReason.MIRROR_SALE, LISTING)
+            shards.apply_in_transaction(scoped, BUYER, 30, ShardReason.MIRROR_SALE, LISTING)
 
     assert store.wallet(BUYER).balance == 100
     assert [e for e in store.entries if e.reason is ShardReason.MIRROR_PURCHASE] == []
@@ -164,7 +171,8 @@ def test_balance_never_goes_negative(store, shards, price):
 
     with pytest.raises(InsufficientShards):
         with store.transaction() as tx:
-            shards.apply_in_transaction(tx, BUYER, -price, ShardReason.MIRROR_PURCHASE, LISTING)
+            shards.apply_in_transaction(
+                shards.context(tx), BUYER, -price, ShardReason.MIRROR_PURCHASE, LISTING)
 
     assert store.wallet(BUYER).balance == 10
 
@@ -172,7 +180,8 @@ def test_balance_never_goes_negative(store, shards, price):
 def test_exact_balance_is_allowed(store, shards):
     seed(shards, BUYER, 30)
     with store.transaction() as tx:
-        shards.apply_in_transaction(tx, BUYER, -30, ShardReason.MIRROR_PURCHASE, LISTING)
+        shards.apply_in_transaction(
+                shards.context(tx), BUYER, -30, ShardReason.MIRROR_PURCHASE, LISTING)
     assert store.wallet(BUYER).balance == 0
 
 
@@ -181,7 +190,8 @@ def test_invalid_delta_is_rejected(store, shards, delta):
     seed(shards, BUYER, 100)
     with pytest.raises(InvalidShardAmount):
         with store.transaction() as tx:
-            shards.apply_in_transaction(tx, BUYER, delta, ShardReason.MIRROR_PURCHASE, LISTING)
+            shards.apply_in_transaction(
+                shards.context(tx), BUYER, delta, ShardReason.MIRROR_PURCHASE, LISTING)
     assert store.wallet(BUYER).balance == 100
 
 
@@ -198,8 +208,9 @@ def test_same_wallet_twice_in_one_transaction_is_refused(store, shards):
 
     with pytest.raises(WalletAlreadyChanged):
         with store.transaction() as tx:
-            shards.apply_in_transaction(tx, BUYER, -30, ShardReason.MIRROR_PURCHASE, LISTING)
-            shards.apply_in_transaction(tx, BUYER, 30, ShardReason.MIRROR_SALE, LISTING)
+            scoped = shards.context(tx)
+            shards.apply_in_transaction(scoped, BUYER, -30, ShardReason.MIRROR_PURCHASE, LISTING)
+            shards.apply_in_transaction(scoped, BUYER, 30, ShardReason.MIRROR_SALE, LISTING)
 
     assert store.wallet(BUYER).balance == 100
 
@@ -244,9 +255,11 @@ def test_repeating_the_same_purchase_moves_shards_once(store, shards, times):
 def test_duplicate_reports_applied_false_without_writing(store, shards):
     seed(shards, BUYER, 100)
     with store.transaction() as tx:
-        first = shards.apply_in_transaction(tx, BUYER, -30, ShardReason.MIRROR_PURCHASE, LISTING)
+        first = shards.apply_in_transaction(
+                shards.context(tx), BUYER, -30, ShardReason.MIRROR_PURCHASE, LISTING)
     with store.transaction() as tx:
-        second = shards.apply_in_transaction(tx, BUYER, -30, ShardReason.MIRROR_PURCHASE, LISTING)
+        second = shards.apply_in_transaction(
+                shards.context(tx), BUYER, -30, ShardReason.MIRROR_PURCHASE, LISTING)
 
     assert (first.applied, second.applied) == (True, False)
     assert second.wallet.balance == 70, "중복도 정상 잔액을 돌려준다"
@@ -257,7 +270,7 @@ def test_different_listings_are_different_events(store, shards):
     for listing in ("listing-a", "listing-b"):
         with store.transaction() as tx:
             shards.apply_in_transaction(
-                tx, BUYER, -30, ShardReason.MIRROR_PURCHASE, listing
+                shards.context(tx), BUYER, -30, ShardReason.MIRROR_PURCHASE, listing
             )
     assert store.wallet(BUYER).balance == 40
 
@@ -276,7 +289,7 @@ def test_concurrent_debits_cannot_overdraw(store, shards):
         try:
             with store.transaction() as tx:
                 result = shards.apply_in_transaction(
-                    tx, BUYER, -30, ShardReason.MIRROR_PURCHASE, f"listing-{index % 2}"
+                shards.context(tx), BUYER, -30, ShardReason.MIRROR_PURCHASE, f"listing-{index % 2}"
                 )
             # **`applied`가 authority다.** 예외가 없다고 뺀 것이 아니다 —
             # 같은 열쇠의 재전송은 조용히 `False`로 끝난다(정상).
@@ -351,3 +364,204 @@ def test_no_generic_transfer_endpoint(client_app=None):
     )
     for path in ["/shards/transfer", "/users/me/shards/transfer", "/shards", "/marketplace/purchase"]:
         assert client.post(path, json={"amount": 10}).status_code in {401, 404, 405}
+
+
+# MARK: - Firestore 자동 재시도 (B-7B.1)
+#
+# Firestore는 commit이 `ABORTED`되면 **같은 Python Transaction 객체로** callable을
+# 다시 부른다(설치본 2.22.0 `_Transactional.__call__`). `_clean_up()`이 지우는 것은
+# `_write_pbs`와 `_id`뿐이라, transaction 객체에 붙인 표시는 다음 시도까지 살아남는다.
+#
+# 그래서 표시를 transaction이 아니라 **attempt마다 새로 만드는 context**에 담는다.
+# 아래 test들은 **실제 SDK wrapper**로 그 동작을 고정한다 — production Firestore를 부르지 않는다.
+
+
+class AbortingTransaction:
+    """실제 `@firestore.transactional`이 부르는 것만 구현한 가짜 transaction.
+
+    `_commit()`이 정해진 횟수만큼 `Aborted`를 던져 **진짜 재시도 loop**를 돌린다.
+    """
+
+    _max_attempts = 5
+    _read_only = False
+
+    def __init__(self, store: InMemoryShardStore, aborts: int) -> None:
+        self._store = store
+        self._aborts = aborts
+        self.commits = 0
+        self.rollbacks = 0
+        self.staged: list = []
+
+    # --- SDK가 부르는 부분 ---
+
+    def _clean_up(self) -> None:
+        # SDK가 지우는 것은 이 둘뿐이다. **우리 표시는 건드리지 않는다.**
+        self._write_pbs = []
+        self._id = None
+        # 이전 시도의 staged write는 버린다(rollback과 같은 뜻).
+        self.staged = []
+
+    def _begin(self, retry_id=None) -> None:
+        self._id = b"tx"
+
+    def _commit(self):
+        from google.api_core import exceptions
+
+        if self._aborts > 0:
+            self._aborts -= 1
+            raise exceptions.Aborted("simulated contention")
+        for write in self.staged:
+            write()
+        self.staged = []
+        self.commits += 1
+        return []
+
+    def _rollback(self) -> None:
+        self.rollbacks += 1
+        self.staged = []
+
+    # --- 조각 저장소가 부르는 부분 ---
+
+    def add(self, write) -> None:
+        self.staged.append(write)
+
+
+def transactional_purchase(shards: ShardLedgerService, price: int = 30):
+    """실제 SDK wrapper로 감싼 구매 한 건. marketplace가 쓰게 될 모양 그대로다."""
+    from google.cloud import firestore
+
+    attempts: list[int] = []
+
+    @firestore.transactional
+    def run(transaction):
+        attempts.append(len(attempts) + 1)
+        # **attempt마다 새 context** — 이 한 줄이 재시도 안전성의 전부다.
+        scoped = shards.context(transaction)
+        shards.apply_in_transaction(scoped, BUYER, -price, ShardReason.MIRROR_PURCHASE, LISTING)
+        shards.apply_in_transaction(scoped, SELLER, price, ShardReason.MIRROR_SALE, LISTING)
+        return "done"
+
+    return run, attempts
+
+
+def test_retry_after_abort_reapplies_cleanly(store, shards):
+    """§8 — ABORTED 후 재시도가 **정확히 한 번** 반영된다."""
+    seed(shards, BUYER, 100)
+    seed(shards, SELLER, 10)
+    run, attempts = transactional_purchase(shards)
+
+    result = run(AbortingTransaction(store, aborts=1))
+
+    assert result == "done"
+    assert attempts == [1, 2], "재시도가 일어나지 않았다"
+
+    buyer, seller = store.wallet(BUYER), store.wallet(SELLER)
+    assert (buyer.balance, seller.balance) == (70, 40), "두 번 반영됐다"
+    assert buyer.lifetime_spent == 30
+    assert seller.lifetime_earned == 40
+    assert len([e for e in store.entries if e.reason is ShardReason.MIRROR_PURCHASE]) == 1
+    assert len([e for e in store.entries if e.reason is ShardReason.MIRROR_SALE]) == 1
+
+
+@pytest.mark.parametrize("aborts", [1, 2, 4])
+def test_retry_never_raises_wallet_already_changed(store, shards, aborts):
+    """회귀: 표시를 transaction 객체에 붙였을 때 **재시도가 잘못 거절됐다.**"""
+    seed(shards, BUYER, 100)
+    seed(shards, SELLER, 10)
+    run, attempts = transactional_purchase(shards)
+
+    run(AbortingTransaction(store, aborts=aborts))   # WalletAlreadyChanged가 나오면 실패
+
+    assert len(attempts) == aborts + 1
+    assert store.wallet(BUYER).balance == 70
+
+
+def test_same_wallet_guard_survives_retry(store, shards):
+    """§9 — 재시도가 있다고 같은 attempt 안의 guard를 없애지 않는다."""
+    from google.cloud import firestore
+
+    seed(shards, BUYER, 100)
+    attempts: list[int] = []
+
+    @firestore.transactional
+    def run(transaction):
+        attempts.append(len(attempts) + 1)
+        scoped = shards.context(transaction)
+        shards.apply_in_transaction(scoped, BUYER, -30, ShardReason.MIRROR_PURCHASE, LISTING)
+        # 같은 attempt · 같은 지갑 — 여전히 거절된다.
+        shards.apply_in_transaction(scoped, BUYER, 30, ShardReason.MIRROR_SALE, LISTING)
+
+    with pytest.raises(WalletAlreadyChanged):
+        run(AbortingTransaction(store, aborts=1))
+
+    assert store.wallet(BUYER).balance == 100
+    assert attempts == [1], "도메인 거절은 재시도 대상이 아니다"
+
+
+def test_retry_reads_the_current_balance(store, shards):
+    """§10 — 재시도는 **다시 읽는다.** 이전 시도가 본 잔액을 쓰지 않는다."""
+    from google.api_core import exceptions
+    from google.cloud import firestore
+
+    seed(shards, BUYER, 30)
+    attempts: list[int] = []
+
+    class DrainingTransaction(AbortingTransaction):
+        def _commit(self):
+            if self._aborts > 0:
+                self._aborts -= 1
+                # 첫 시도가 깨지는 동안 **다른 요청이 잔액을 다 써버렸다.**
+                self._store.wallets[BUYER] = self._store.wallet(BUYER).__class__(
+                    user_id=BUYER,
+                    balance=0,
+                    lifetime_earned=30,
+                    lifetime_spent=30,
+                )
+                raise exceptions.Aborted("simulated contention")
+            return super()._commit()
+
+    @firestore.transactional
+    def run(transaction):
+        attempts.append(len(attempts) + 1)
+        scoped = shards.context(transaction)
+        shards.apply_in_transaction(scoped, BUYER, -30, ShardReason.MIRROR_PURCHASE, LISTING)
+
+    with pytest.raises(InsufficientShards):
+        run(DrainingTransaction(store, aborts=1))
+
+    # stale한 30을 그대로 써서 -30을 만들지 않았다.
+    assert store.wallet(BUYER).balance == 0
+    assert attempts == [1, 2], "재시도가 없었다"
+
+
+def test_retry_keeps_idempotency(store, shards):
+    """§11 — 재시도가 원장을 두 줄 만들지 않는다. 같은 요청 재호출도 여전히 한 번이다."""
+    seed(shards, BUYER, 100)
+    seed(shards, SELLER, 10)
+
+    run, _ = transactional_purchase(shards)
+    run(AbortingTransaction(store, aborts=2))
+
+    # 같은 business 요청을 다시 보낸다(네트워크 재시도).
+    run2, _ = transactional_purchase(shards)
+    run2(AbortingTransaction(store, aborts=1))
+
+    assert (store.wallet(BUYER).balance, store.wallet(SELLER).balance) == (70, 40)
+    assert len([e for e in store.entries if e.reason is ShardReason.MIRROR_PURCHASE]) == 1
+    assert len([e for e in store.entries if e.reason is ShardReason.MIRROR_SALE]) == 1
+
+
+def test_context_state_never_lives_on_the_transaction(store, shards):
+    """표시를 transaction 객체에 붙이면 재시도 사이에 살아남는다 — 구조로 막는다."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    for path in ["app/shards/firestore_store.py", "app/shards/store.py"]:
+        code = _code_only((root / path).read_text())
+        for banned in ["transaction._ggumirror", "setattr(transaction", "getattr(transaction"]:
+            assert banned not in code, f"{path}: transaction 객체에 상태를 붙인다 ({banned})"
+
+    # context는 attempt마다 새로 만들어져야 한다 — 두 번 부르면 서로 다른 객체다.
+    tx = object()
+    assert shards.context(tx) is not shards.context(tx)
+    assert shards.context(tx).changed_wallets == set()

@@ -28,7 +28,7 @@ from app.shards.models import (
     RefundPlan,
     RefundRecordMissing,
     QuotaExceeded,
-    WalletAlreadyChanged,
+    ShardTransactionContext,
     ShardLedgerEntry,
     ShardReason,
     ShardRefundResult,
@@ -469,9 +469,13 @@ class FirestoreShardStore:
         """호출자가 transaction을 소유할 수 있게 열어 준다. **commit은 호출자가 한다.**"""
         return self._db.transaction()
 
+    def context(self, transaction) -> ShardTransactionContext:
+        """**transactional callable 안에서 매번** 부른다 — attempt마다 새 기록이다."""
+        return ShardTransactionContext(transaction=transaction)
+
     def apply_in_transaction(
         self,
-        transaction,
+        context: ShardTransactionContext,
         user_id: str,
         delta: int,
         reason: ShardReason,
@@ -490,10 +494,12 @@ class FirestoreShardStore:
 
         안 되는 것: quota · 전역 claim. 필요하면 `apply`를 쓴다.
         """
+        transaction = context.transaction
         ledger_ref = self._db.collection(LEDGER).document(idempotency_key_hash)
         wallet_ref = self._db.collection(WALLETS).document(user_id)
 
         # 읽기는 쓰기보다 먼저. Firestore transaction의 규칙이다.
+        # **재시도마다 다시 읽는다** — 이전 attempt가 본 잔액을 쓰지 않는다.
         existing = ledger_ref.get(transaction=transaction)
         wallet_snapshot = wallet_ref.get(transaction=transaction)
 
@@ -507,8 +513,8 @@ class FirestoreShardStore:
             # 같은 사건이 다시 왔다. **쓰지 않는다** — 지갑 표시도 하지 않는다.
             return current, _entry(existing.id, existing.to_dict() or {}), False
 
-        # 여기서부터 쓴다. 지갑을 두 번 바꾸는 것은 이 시점에 막는다.
-        _claim_wallet(transaction, user_id)
+        # 여기서부터 쓴다. 같은 attempt에서 지갑을 두 번 바꾸는 것을 막는다.
+        context.claim(user_id)
 
         if current.balance + delta < 0:
             # 호출자의 transaction이 통째로 취소된다 — 부분 반영이 없다.
@@ -557,21 +563,6 @@ def _moved(current: ShardWallet, delta: int, now, *, existed: bool) -> ShardWall
         updated_at=now,
     )
 
-
-def _claim_wallet(transaction, user_id: str) -> None:
-    """이 transaction에서 이 지갑을 이미 바꿨는지 표시한다.
-
-    Firestore transaction의 읽기는 **시작 시점 snapshot**이라, 같은 지갑을 두 번 바꾸면
-    두 번째가 첫 번째의 결과를 보지 못하고 덮어쓴다. 조각이 조용히 사라지는 경로다.
-    transaction 객체에 붙여 두므로 transaction과 함께 사라진다.
-    """
-    changed = getattr(transaction, "_ggumirror_changed_wallets", None)
-    if changed is None:
-        changed = set()
-        transaction._ggumirror_changed_wallets = changed
-    if user_id in changed:
-        raise WalletAlreadyChanged(user_id)
-    changed.add(user_id)
 
 
 # MARK: - 문서 변환

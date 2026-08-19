@@ -191,6 +191,43 @@ class ShardRefundResult:
         return self.requested - self.recovered
 
 
+@dataclass
+class ShardTransactionContext:
+    """한 transaction **시도(attempt)** 동안의 조각 변경 기록.
+
+    ⚠️ **수명이 attempt 하나여야 한다.** Firestore는 commit이 `ABORTED`되면
+    **같은 Python `Transaction` 객체로** callable을 다시 부른다(설치본 2.22.0의
+    `_Transactional.__call__`이 loop 안에서 같은 객체를 넘긴다). 그때 `_clean_up()`이
+    지우는 것은 `_write_pbs`와 `_id`뿐이라, transaction 객체에 우리가 붙인 표시는
+    **다음 attempt까지 살아남는다.**
+
+    그러면 아무것도 commit되지 않았는데 재시도가 `WalletAlreadyChanged`로 거절된다 —
+    실제로 재현했다. 그래서 표시를 transaction이 아니라 **이 객체**에 담고,
+    callable 안에서 매번 새로 만든다:
+
+        @firestore.transactional
+        def run(transaction):
+            scoped = shards.context(transaction)   # ← attempt마다 새로 생긴다
+            shards.apply_in_transaction(scoped, buyer, -price, ...)
+
+    **commit 권한이 없다.** 여전히 호출자의 Firestore transaction이 commit한다.
+    """
+
+    transaction: object
+    changed_wallets: set[str] = field(default_factory=set)
+
+    def claim(self, user_id: str) -> None:
+        """이 attempt에서 이 지갑을 바꾼다고 표시한다.
+
+        같은 attempt에서 같은 지갑을 두 번 바꾸면 두 번째가 첫 번째를 덮어쓴다 —
+        Firestore transaction의 읽기가 시작 시점 snapshot이기 때문이다.
+        자기 자신에게 파는 경우가 정확히 그 모양이라 여기서 막는다.
+        """
+        if user_id in self.changed_wallets:
+            raise WalletAlreadyChanged(user_id)
+        self.changed_wallets.add(user_id)
+
+
 @dataclass(frozen=True)
 class ShardRefundReversalResult:
     """환불 되돌리기 결과.
