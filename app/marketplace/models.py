@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -61,6 +62,16 @@ class MarketplacePublishPolicy:
         ContentType.STICKER: ShardReason.STICKER_PUBLISH_FEE,
     }
 
+    #: 구매자 차감 / 판매자 지급의 이유. 등록비와 **같은 규칙**으로 종류별로 나눈다.
+    PURCHASE_REASONS: dict[ContentType, ShardReason] = {
+        ContentType.MIRROR: ShardReason.MIRROR_PURCHASE,
+        ContentType.STICKER: ShardReason.STICKER_PURCHASE,
+    }
+    SALE_REASONS: dict[ContentType, ShardReason] = {
+        ContentType.MIRROR: ShardReason.MIRROR_SALE,
+        ContentType.STICKER: ShardReason.STICKER_SALE,
+    }
+
     @classmethod
     def fee(cls, content_type: ContentType) -> int:
         return cls.FEES[content_type]
@@ -68,6 +79,14 @@ class MarketplacePublishPolicy:
     @classmethod
     def reason(cls, content_type: ContentType) -> ShardReason:
         return cls.REASONS[content_type]
+
+    @classmethod
+    def purchase_reason(cls, content_type: ContentType) -> ShardReason:
+        return cls.PURCHASE_REASONS[content_type]
+
+    @classmethod
+    def sale_reason(cls, content_type: ContentType) -> ShardReason:
+        return cls.SALE_REASONS[content_type]
 
 
 @dataclass(frozen=True)
@@ -150,6 +169,46 @@ class MarketplaceSort(StrEnum):
 
 
 @dataclass(frozen=True)
+class Ownership:
+    """**"이 사람이 이것을 갖고 있다"** — 구매와 소유를 한 문서로 합쳤다(MVP 결정).
+
+    구매 당시의 `snapshotId` · `sellerUserId` · `pricePaid`를 **고정 저장한다.**
+    나중에 판매자가 내리거나 정책이 바뀌어도 산 사람의 권리가 흔들리지 않는다.
+
+    만든 뒤 **고치지 않는다.** 같은 사람이 같은 상품을 다시 사도 이 문서를
+    조용히 교체하지 않는다(`create`만 쓴다).
+    """
+
+    id: str
+    user_id: str
+    listing_id: str
+    seller_user_id: str
+    snapshot_id: str
+    price_paid: int
+    #: 무료면 둘 다 `None` — 조각이 움직이지 않았으므로 원장 줄이 없다.
+    buyer_ledger_entry_id: str | None = None
+    seller_ledger_entry_id: str | None = None
+    created_at: datetime = field(default_factory=utcnow)
+    schema_version: int = SCHEMA_VERSION
+
+
+@dataclass(frozen=True)
+class PurchaseResult:
+    """획득 결과.
+
+    `purchased`는 **이번 요청이 소유권을 만들었는가**다. 이미 갖고 있으면 `False`이고
+    그때도 실패가 아니다 — 재시도·연타는 정상 동작이다(B-4 `claimed`와 같은 뜻).
+    """
+
+    ownership: Ownership
+    purchased: bool
+    already_owned: bool
+    price_paid: int
+    balance: int
+    download_count: int
+
+
+@dataclass(frozen=True)
 class PublishResult:
     """게시 결과.
 
@@ -182,8 +241,33 @@ class InvalidListing(MarketplaceError):
     """제목 · 설명 · 가격 · 종류가 규칙에 맞지 않는다."""
 
 
+class SelfPurchase(MarketplaceError):
+    """자기 상품은 살 수 없다.
+
+    경제적으로 no-op인데 원장에 -P/+P 두 줄이 쌓여 판매 통계가 오염되고,
+    같은 지갑을 한 transaction에서 두 번 만지는 특수 경로가 생긴다.
+    판매자는 **사지 않고도** 자기 상품을 쓸 권리가 있다.
+    """
+
+
 class InvalidTransition(MarketplaceError):
     """그 상태에서 할 수 없는 일이다(예: draft를 내리기)."""
+
+
+def ownership_id(user_id: str, listing_id: str) -> str:
+    """소유권 문서 ID. **`(구매자, 상품)` 조합이 곧 business 멱등 열쇠다.**
+
+    이 자리에 `create()`로 쓰므로 중복 구매가 **구조적으로** 막힌다 —
+    "조회해서 없으면 만든다"로 바꾸지 않는다(그 사이에 틈이 생긴다).
+
+    raw user id · listing id를 문서 ID에 노출하지 않는다. 길이 접두사 canonical
+    encoding은 원장(`idempotency_hash`) · IAP claim과 **같은 규칙**이다.
+    """
+    canonical = "|".join(
+        f"{len(part.encode())}:{part}"
+        for part in ("marketplace_ownership", user_id, listing_id)
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def normalized_title(raw: str) -> str:

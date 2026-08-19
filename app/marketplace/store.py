@@ -16,18 +16,24 @@ from typing import Protocol
 from app.marketplace.models import (
     ContentType,
     Listing,
+    Ownership,
     ListingNotFound,
     ListingStatus,
     MarketplacePublishPolicy,
     PublishResult,
+    PurchaseResult,
+    SelfPurchase,
     Snapshot,
     SnapshotNotFound,
+    ownership_id,
 )
 from app.shards.models import utcnow
 from app.shards.service import ShardLedgerService
 
 LISTINGS = "ggumirror_marketplace_listings"
 SNAPSHOTS = "ggumirror_marketplace_snapshots"
+#: 구매와 소유를 한 문서로 합쳤다(MVP). 별도 purchases collection을 만들지 않는다.
+OWNERSHIP = "ggumirror_marketplace_ownership"
 
 
 def _is_public(listing: Listing) -> bool:
@@ -79,6 +85,27 @@ class MarketplaceStore(Protocol):
         """공개 상세. `published`가 아니면 `ListingNotFound` —
         **판매자 자신이라도** 공개 endpoint로는 draft를 볼 수 없다."""
 
+    def acquire(self, listing_id: str, buyer_user_id: str, shards) -> PurchaseResult:
+        """**상품 하나를 획득한다. 전부 한 commit이다.**
+
+        한 transaction 안에서:
+
+        1. **읽기를 먼저** — listing · 소유권 (그 뒤에 조각 primitive가 자기 읽기를 한다)
+        2. 검증 — published인가 · 내 상품이 아닌가 · 이미 갖고 있지 않은가 · 잔액이 되는가
+        3. 유료면 **구매자 차감 + 판매자 지급**(같은 금액, 수수료 0%)
+        4. 소유권 `create` — 문서 ID가 `(구매자, 상품)` hash라 중복이 구조적으로 막힌다
+        5. `downloadCount + 1`
+
+        **"돈만 나가고 소유권 실패"도, "소유권만 생기고 지급 실패"도 없다.**
+        counter를 별도 transaction으로 올리지 않는다 — 죽으면 수가 어긋난다.
+
+        이미 갖고 있으면 아무것도 쓰지 않고 `already_owned=True`로 끝난다.
+        무료(`priceShards == 0`)면 지갑도 원장도 건드리지 않고 소유권과 counter만 생긴다.
+        """
+
+    def ownerships(self, user_id: str) -> list[Ownership]:
+        """내가 가진 것 전부. **내린 상품도 남는다** — 돈을 냈으면 계속 쓸 수 있어야 한다."""
+
 
 class InMemoryMarketplaceStore:
     """test / local용. 실제 Firestore transaction의 **의미**를 흉내 낸다.
@@ -90,6 +117,7 @@ class InMemoryMarketplaceStore:
     def __init__(self, shard_store) -> None:
         self.listings: dict[str, Listing] = {}
         self.snapshots: dict[str, Snapshot] = {}
+        self.ownership: dict[str, Ownership] = {}
         self._shard_store = shard_store
         self._lock = threading.RLock()
 
@@ -210,3 +238,101 @@ class InMemoryMarketplaceStore:
             )
             self.listings[listing.id] = unlisted
             return unlisted
+
+    # MARK: - 획득 (한 transaction)
+
+    def acquire(self, listing_id: str, buyer_user_id: str, shards) -> PurchaseResult:
+        with self._lock:
+            # 읽기를 먼저 한다 — Firestore 구현과 같은 순서다.
+            listing = self.get_published(listing_id)
+            key = ownership_id(buyer_user_id, listing_id)
+            owned = self.ownership.get(key)
+
+            if owned is not None:
+                # 이미 갖고 있다. **아무것도 쓰지 않는다** — counter도 올리지 않는다.
+                return PurchaseResult(
+                    ownership=owned, purchased=False, already_owned=True,
+                    price_paid=owned.price_paid,
+                    balance=shards.wallet(buyer_user_id).balance,
+                    download_count=listing.download_count,
+                )
+
+            if listing.seller_user_id == buyer_user_id:
+                raise SelfPurchase(listing_id)
+
+            price = listing.price_shards
+            balance = shards.wallet(buyer_user_id).balance
+
+            with self._shard_store.transaction() as tx:
+                buyer_entry = seller_entry = None
+                if price > 0:
+                    scoped = shards.context(tx)
+                    debit = shards.apply_in_transaction(
+                        scoped, buyer_user_id, -price,
+                        MarketplacePublishPolicy.purchase_reason(listing.content_type),
+                        key,
+                    )
+                    credit = shards.apply_in_transaction(
+                        scoped, listing.seller_user_id, price,
+                        MarketplacePublishPolicy.sale_reason(listing.content_type),
+                        key,
+                    )
+                    balance = debit.wallet.balance
+                    buyer_entry, seller_entry = debit.entry_id, credit.entry_id
+
+                ownership = Ownership(
+                    id=key,
+                    user_id=buyer_user_id,
+                    listing_id=listing_id,
+                    seller_user_id=listing.seller_user_id,
+                    snapshot_id=listing.snapshot_id,
+                    price_paid=price,
+                    buyer_ledger_entry_id=buyer_entry,
+                    seller_ledger_entry_id=seller_entry,
+                )
+                counted = self._with_download_count(listing, listing.download_count + 1)
+
+                def write_ownership():
+                    if key in self.ownership:
+                        # `create` 의미다 — 조용히 덮어쓰지 않는다.
+                        raise KeyError(key)
+                    self.ownership[key] = ownership
+                    return lambda: self.ownership.pop(key, None)
+
+                def write_counter():
+                    previous = self.listings.get(listing_id)
+                    self.listings[listing_id] = counted
+                    return lambda: self.listings.__setitem__(listing_id, previous)
+
+                tx.add(write_ownership)
+                tx.add(write_counter)
+
+            return PurchaseResult(
+                ownership=ownership, purchased=True, already_owned=False,
+                price_paid=price, balance=balance,
+                download_count=counted.download_count,
+            )
+
+    def ownerships(self, user_id: str) -> list[Ownership]:
+        return [x for x in self.ownership.values() if x.user_id == user_id]
+
+    # MARK: - 내부
+
+    @staticmethod
+    def _with_download_count(listing: Listing, count: int) -> Listing:
+        return Listing(
+            id=listing.id,
+            seller_user_id=listing.seller_user_id,
+            content_type=listing.content_type,
+            title=listing.title,
+            description=listing.description,
+            price_shards=listing.price_shards,
+            snapshot_id=listing.snapshot_id,
+            status=listing.status,
+            publish_fee_paid=listing.publish_fee_paid,
+            download_count=count,
+            like_count=listing.like_count,
+            created_at=listing.created_at,
+            updated_at=listing.updated_at,
+            published_at=listing.published_at,
+        )

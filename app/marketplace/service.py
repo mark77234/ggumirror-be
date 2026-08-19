@@ -12,8 +12,11 @@ from app.auth.models import User
 from app.marketplace.models import (
     ContentType,
     MarketplaceSort,
+    Ownership,
+    PurchaseResult,
     InvalidListing,
     Listing,
+    ListingNotFound,
     ListingStatus,
     MarketplacePublishPolicy,
     PublishResult,
@@ -113,6 +116,40 @@ class MarketplaceService:
     def listing(self, listing_id: str) -> Listing:
         """공개 상세. draft · unlisted · 없는 것은 모두 `ListingNotFound`다."""
         return self._store.get_published(listing_id)
+
+    # MARK: - 획득 (B-7E)
+
+    def purchase(self, user: User, listing_id: str) -> PurchaseResult:
+        """상품을 획득한다. **경제 전체가 한 commit이다**(저장소가 보장한다).
+
+        요청에 가격 · 판매자 · 수량을 실을 자리가 없다 — 값은 transaction 안에서
+        읽은 listing이 정한다. 이미 갖고 있으면 `already_owned=True`로 조용히 끝난다.
+        """
+        result = self._store.acquire(listing_id, user.id, self._shards)
+        logger.info(
+            "marketplace_purchase purchased=%s already_owned=%s price=%d balance=%d downloads=%d",
+            result.purchased, result.already_owned,
+            result.price_paid, result.balance, result.download_count,
+        )
+        return result
+
+    def purchases(self, user: User) -> list[tuple[Ownership, Listing | None]]:
+        """내가 가진 것. **내려간 상품도 남는다** — 돈을 냈으면 계속 쓸 수 있어야 한다.
+
+        화면에 필요한 listing metadata를 함께 붙인다. 소유권 하나마다 listing을
+        조회하므로 N+1이지만 **"내가 산 것"은 사용자당 수십 건 규모**다 —
+        많아지면 그때 listing 일괄 조회나 소유권에 표시용 값 복사를 검토한다.
+        """
+        owned = sorted(self._store.ownerships(user.id), key=lambda x: x.created_at, reverse=True)
+        pairs: list[tuple[Ownership, Listing | None]] = []
+        for ownership in owned:
+            try:
+                # 내려간 상품도 보여야 하므로 **공개 조회가 아니라 판매자 무관 조회**가 필요하다.
+                listing = self._store.listing(ownership.listing_id, ownership.seller_user_id)
+            except ListingNotFound:
+                listing = None
+            pairs.append((ownership, listing))
+        return pairs
 
     @staticmethod
     def fee(content_type: ContentType) -> int:

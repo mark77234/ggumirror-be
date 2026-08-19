@@ -202,6 +202,7 @@ def create_app(
     app.include_router(iap.router)
     app.include_router(app_store.router)
     app.include_router(marketplace.router)
+    app.include_router(marketplace.purchases_router)
 
     logger.info("app created env=%s log_level=%s", settings.app_env, settings.log_level)
     return app

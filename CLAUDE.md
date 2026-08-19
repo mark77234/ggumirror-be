@@ -20,7 +20,7 @@ Backend repository for 꾸미러.
 - purchase / ownership
 - seller shard settlement
 
-## Current Implementation (Phase B-7D 완료 · 미배포)
+## Current Implementation (Phase B-7E 완료 · 미배포)
 
 FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth +
 server-authoritative 조각 원장 + 하루 한 번 출석 + AdMob rewarded SSV + AI 스티커 생성 +
@@ -60,7 +60,8 @@ app/core/config.py   환경변수 + logging
 app/api/iap.py       POST /users/me/iap/shards (body는 signedTransaction 하나)
 app/api/app_store.py POST /app-store/notifications/v2 (Apple 서명이 곧 인증)
 app/api/marketplace.py  GET(공개) /marketplace/listings · {id}
-                     POST /marketplace/listings · {id}/publish · {id}/unpublish
+                     POST /marketplace/listings · {id}/publish · {id}/unpublish · {id}/purchase
+                     GET /users/me/marketplace/purchases
 app/marketplace/models.py  Listing · Snapshot · 상태 · 등록비 정책
 app/marketplace/store.py   MarketplaceStore protocol + in-memory
 app/marketplace/firestore_store.py  등록비 + 게시가 **한 transaction**
@@ -713,6 +714,70 @@ application에서 한다. 정렬 셋마다 index를 만들면 production에 inde
 
 목록에서 snapshot을 추가 조회하지 않는다(N+1 금지) — 공개에 필요한 값은
 listing 문서에 이미 다 있고, snapshot 검증은 게시 시점(B-7C)에 끝났다.
+
+#### 구매 · 소유권 (B-7E)
+
+```
+POST /marketplace/listings/{id}/purchase     (인증, **body 없음**)
+GET  /users/me/marketplace/purchases         (인증)
+```
+
+**구매자 차감 · 판매자 지급 · 소유권 생성 · `downloadCount +1`이 한 Firestore commit**이다.
+counter를 별도 transaction으로 올리지 않는다 — 죽으면 수가 어긋난다.
+
+- **가격의 authority는 transaction 안에서 읽은 listing**이다. 요청 body가 아예 없어
+  가격 · 판매자 · 수량 · counter를 client가 정할 자리가 없다
+- **거래 수수료 0%** — 구매자가 낸 만큼 판매자가 정확히 받는다
+- **무료(`priceShards=0`)**: 지갑도 원장도 건드리지 않고 소유권과 counter만 생긴다.
+  delta 0짜리 원장 줄을 만들지 않는다
+- **자기 상품은 살 수 없다.** 판매자는 사지 않고도 쓸 권리가 있다 —
+  접근 판단은 `소유권 있음 OR 판매자 본인`이다
+- 내려간(`unlisted`) 상품은 **살 수 없지만 이미 산 사람의 권리는 그대로다**
+
+##### 소유권 = 구매 기록 (한 문서)
+
+`ggumirror_marketplace_ownership/{sha256(len:"marketplace_ownership"|len:userId|len:listingId)}`
+
+**문서 ID가 곧 business 멱등 열쇠**다. `create()`로 쓰므로 중복 구매가 구조적으로 막힌다.
+별도 `purchases` collection을 만들지 않았다(MVP 결정).
+
+구매 당시의 `snapshotId` · `sellerUserId` · `pricePaid`를 **고정 저장한다** —
+나중에 정책이 바뀌어도 산 사람의 권리가 흔들리지 않는다. 만든 뒤 고치지 않는다.
+
+##### ⚠️ 원장 event id는 소유권 id다 (listingId가 아니다)
+
+```
+buyer  : idempotency_hash(buyer,  {mirror|sticker}_purchase, ownershipId)
+seller : idempotency_hash(seller, {mirror|sticker}_sale,     ownershipId)
+```
+
+`listingId`를 쓰면 판매자 쪽 열쇠가 `(판매자, sale, listingId)`가 되어
+**구매자가 달라도 같은 원장 문서를 겨룬다** — 8명이 사면 판매자가 한 번만 받는다.
+동시성 test가 실제로 그것을 잡았다(`applied=False`).
+
+##### reason
+
+등록비와 **같은 규칙**으로 종류별로 나눈다:
+
+```
+mirror_purchase · mirror_sale · sticker_purchase · sticker_sale
+```
+
+`mirror_*` 값은 바꾸지 않았다 — 이름이 "거울 전용"이라는 뜻이 됐을 뿐이고,
+rename하면 과거 원장을 읽는 코드가 깨진다.
+
+##### `downloadCount`
+
+의미는 **"최초 소유권 획득 성공"**이다. 중복 요청 · 재시도 · 판매자 본인 · 미리보기 ·
+조회는 **올리지 않는다**. listing을 transaction에서 읽고 `읽은 값 + 1`을 쓰므로
+동시 구매는 충돌로 재시도되어 정확히 직렬화된다(8명 → 정확히 +8).
+
+##### 읽기 순서
+
+Firestore transaction은 읽기가 쓰기보다 먼저여야 한다. **marketplace 문서(listing ·
+소유권)를 전부 먼저 읽고** 그 뒤에 조각 primitive를 부른다 — primitive가 읽는 것은
+원장·지갑이라 서로 다른 문서이고, 그 뒤로 marketplace 문서를 다시 읽지 않는다.
+테스트가 소스에서 이 순서를 고정한다.
 
 `tests/test_marketplace.py`가 위 전부를 고정한다.
 

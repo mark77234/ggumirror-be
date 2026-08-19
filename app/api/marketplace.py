@@ -21,6 +21,7 @@ from app.marketplace.models import (
     ContentType,
     InvalidListing,
     MarketplaceSort,
+    SelfPurchase,
     InvalidTransition,
     ListingNotFound,
     SnapshotNotFound,
@@ -213,6 +214,68 @@ def publish_listing(
     )
 
 
+class PurchaseResponse(BaseModel):
+    """획득 결과.
+
+    `purchased`는 **이번 요청이 소유권을 만들었는가**다. `alreadyOwned`가 true여도
+    실패가 아니다 — 재시도·연타는 정상 동작이다.
+
+    내부 값(`sellerUserId` · `snapshotId`)을 담지 않는다. 템플릿을 내려줄 때
+    서버가 소유권을 직접 조회하면 되므로 client가 알 필요가 없다.
+    """
+
+    purchased: bool
+    already_owned: bool = Field(serialization_alias="alreadyOwned")
+    price_paid: int = Field(serialization_alias="pricePaid")
+    #: 잔액의 authority는 서버다.
+    balance: int
+    download_count: int = Field(serialization_alias="downloadCount")
+    listing_id: str = Field(serialization_alias="listingId")
+    acquired_at: str = Field(serialization_alias="acquiredAt")
+
+
+class PurchasedListingResponse(BaseModel):
+    """"내가 산 것" 한 줄. 상품이 내려가도 남는다."""
+
+    listing_id: str = Field(serialization_alias="listingId")
+    price_paid: int = Field(serialization_alias="pricePaid")
+    acquired_at: str = Field(serialization_alias="acquiredAt")
+    #: 상품이 내려갔거나 사라지면 `null` — 소유권 자체는 유지된다.
+    listing: PublicListingResponse | None
+
+
+@router.post("/listings/{listing_id}/purchase")
+def purchase_listing(
+    listing_id: str,
+    user: Annotated[User, Depends(current_user)],
+    service: Annotated[MarketplaceService, Depends(marketplace_service)],
+) -> PurchaseResponse:
+    """**body가 없다.** 가격 · 판매자 · 수량을 client가 정하는 자리를 만들지 않는다.
+
+    구매자 차감 · 판매자 지급 · 소유권 · 다운로드 수가 **한 commit**이다.
+    """
+    try:
+        result = service.purchase(user, listing_id)
+    except ListingNotFound as error:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "listing not found") from error
+    except SelfPurchase as error:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot buy your own listing") from error
+    except InsufficientShards as error:
+        raise HTTPException(status.HTTP_409_CONFLICT, "not enough shards") from error
+    except StoreUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+
+    return PurchaseResponse(
+        purchased=result.purchased,
+        already_owned=result.already_owned,
+        price_paid=result.price_paid,
+        balance=result.balance,
+        download_count=result.download_count,
+        listing_id=result.ownership.listing_id,
+        acquired_at=result.ownership.created_at.isoformat(),
+    )
+
+
 @router.post("/listings/{listing_id}/unpublish")
 def unpublish_listing(
     listing_id: str,
@@ -227,3 +290,32 @@ def unpublish_listing(
     except StoreUnavailable as error:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
     return _listing(listing)
+
+
+purchases_router = APIRouter(prefix="/users/me/marketplace", tags=["marketplace"])
+
+
+@purchases_router.get("/purchases")
+def my_purchases(
+    user: Annotated[User, Depends(current_user)],
+    service: Annotated[MarketplaceService, Depends(marketplace_service)],
+) -> list[PurchasedListingResponse]:
+    """내가 산 것. **`/users/me/...`뿐이다** — 임의 userId로 남의 소유권을 조회하는
+    경로를 만들지 않는다.
+
+    상품이 내려갔어도 목록에 남는다(돈을 냈으면 계속 쓸 수 있어야 한다).
+    """
+    try:
+        owned = service.purchases(user)
+    except StoreUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+
+    return [
+        PurchasedListingResponse(
+            listing_id=ownership.listing_id,
+            price_paid=ownership.price_paid,
+            acquired_at=ownership.created_at.isoformat(),
+            listing=_public(listing) if listing and listing.published_at else None,
+        )
+        for ownership, listing in owned
+    ]

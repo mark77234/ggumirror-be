@@ -39,8 +39,15 @@ class ShardReason(StrEnum):
     REWARDED_AD = "rewarded_ad"
     IAP_PURCHASE = "iap_purchase"
     AI_STICKER = "ai_sticker"
+    # 상점 구매/판매. **콘텐츠 종류마다 나눈다** — 등록비(`*_publish_fee`)와 같은 규칙이다.
+    # 원장만 보고 거울인지 스티커인지 알 수 있어야 한다.
+    #
+    # `mirror_*` 값은 **바꾸지 않는다.** 이름이 이제 "거울 전용"이라는 뜻이 됐을 뿐이고,
+    # rename하면 과거 원장을 읽는 코드가 조용히 깨진다.
     MIRROR_PURCHASE = "mirror_purchase"
     MIRROR_SALE = "mirror_sale"
+    STICKER_PURCHASE = "sticker_purchase"
+    STICKER_SALE = "sticker_sale"
     # 상점 등록 비용. **콘텐츠 종류마다 값이 다르므로 reason도 나눈다** —
     # 하나로 합치면 원장만 보고 거울인지 스티커인지 알 수 없다.
     #
@@ -266,6 +273,9 @@ class ShardMutationResult:
 
     wallet: ShardWallet
     applied: bool
+    #: 그 사건의 원장 문서 ID(= 멱등 열쇠). 소유권 기록처럼 **원장을 가리켜야 하는**
+    #: 호출부가 다시 계산하지 않게 함께 돌려준다.
+    entry_id: str | None = None
 
 
 def idempotency_hash(user_id: str, reason: ShardReason, external_event_id: str) -> str:

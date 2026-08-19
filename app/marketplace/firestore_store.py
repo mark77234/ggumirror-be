@@ -18,14 +18,18 @@ from app.auth.store import StoreUnavailable
 from app.marketplace.models import (
     ContentType,
     Listing,
+    Ownership,
     ListingNotFound,
     ListingStatus,
     MarketplacePublishPolicy,
     PublishResult,
+    PurchaseResult,
+    SelfPurchase,
     Snapshot,
     SnapshotNotFound,
+    ownership_id,
 )
-from app.marketplace.store import LISTINGS, SNAPSHOTS, _is_public
+from app.marketplace.store import LISTINGS, OWNERSHIP, SNAPSHOTS, _is_public
 from app.shards.models import utcnow
 from app.shards.service import ShardLedgerService
 
@@ -221,6 +225,109 @@ class FirestoreMarketplaceStore:
         except gcp_exceptions.GoogleAPIError as error:
             raise self._unavailable("listing_unpublish", error) from error
 
+    # MARK: - 획득 (한 transaction)
+
+    def acquire(self, listing_id: str, buyer_user_id: str, shards) -> PurchaseResult:
+        """구매자 차감 · 판매자 지급 · 소유권 · counter가 **하나의 commit**이다."""
+        listing_ref = self._db.collection(LISTINGS).document(listing_id)
+        key = ownership_id(buyer_user_id, listing_id)
+        ownership_ref = self._db.collection(OWNERSHIP).document(key)
+
+        @firestore.transactional
+        def run(transaction) -> PurchaseResult:
+            # ⚠️ context는 attempt마다 새로 만든다(B-7B.1).
+            scoped = shards.context(transaction)
+
+            # **marketplace 읽기를 전부 먼저 한다.** 그 뒤 조각 primitive가 자기
+            # 문서(원장 · 지갑)를 읽고 쓴다 — 서로 다른 문서라 순서가 섞여도 안전하고,
+            # 여기서 읽은 값 이후에 marketplace 문서를 다시 읽지 않는다.
+            listing_snapshot = listing_ref.get(transaction=transaction)
+            owned_snapshot = ownership_ref.get(transaction=transaction)
+
+            if not listing_snapshot.exists:
+                raise ListingNotFound(listing_id)
+            listing = _listing_from(listing_id, listing_snapshot.to_dict() or {})
+            if not _is_public(listing):
+                # 내려간 상품은 살 수 없다 — 이미 산 사람의 권리는 그대로다.
+                raise ListingNotFound(listing_id)
+
+            if owned_snapshot.exists:
+                # 이미 갖고 있다. **아무것도 쓰지 않는다** — counter도 올리지 않는다.
+                owned = _ownership_from(key, owned_snapshot.to_dict() or {})
+                return PurchaseResult(
+                    ownership=owned, purchased=False, already_owned=True,
+                    price_paid=owned.price_paid,
+                    balance=shards.wallet(buyer_user_id).balance,
+                    download_count=listing.download_count,
+                )
+
+            if listing.seller_user_id == buyer_user_id:
+                raise SelfPurchase(listing_id)
+
+            price = listing.price_shards
+            balance = shards.wallet(buyer_user_id).balance
+            buyer_entry = seller_entry = None
+
+            if price > 0:
+                # 잔액이 모자라면 여기서 끝나고 **소유권도 counter도 바뀌지 않는다.**
+                #
+                # ⚠️ 원장 event id는 **소유권 id**(= `(구매자, 상품)` hash)다.
+                # `listingId`를 쓰면 판매자 쪽 열쇠가 `(판매자, sale, listingId)`가 되어
+                # **구매자가 달라도 같은 문서를 겨룬다** — 8명이 사면 판매자가 한 번만
+                # 받는다. 동시성 test가 실제로 그것을 잡았다.
+                # 구매자 쪽은 어차피 구매자별로 다르지만 **양쪽을 같은 열쇠로** 둬서
+                # 한 거래의 두 줄이 같은 사건에서 나왔다는 것이 드러나게 한다.
+                debit = shards.apply_in_transaction(
+                    scoped, buyer_user_id, -price,
+                    MarketplacePublishPolicy.purchase_reason(listing.content_type),
+                    key,
+                )
+                credit = shards.apply_in_transaction(
+                    scoped, listing.seller_user_id, price,
+                    MarketplacePublishPolicy.sale_reason(listing.content_type),
+                    key,
+                )
+                balance = debit.wallet.balance
+                buyer_entry, seller_entry = debit.entry_id, credit.entry_id
+
+            ownership = Ownership(
+                id=key,
+                user_id=buyer_user_id,
+                listing_id=listing_id,
+                seller_user_id=listing.seller_user_id,
+                snapshot_id=listing.snapshot_id,
+                price_paid=price,
+                buyer_ledger_entry_id=buyer_entry,
+                seller_ledger_entry_id=seller_entry,
+            )
+            # `create`다 — 우리가 읽은 뒤 다른 요청이 먼저 자리를 잡았으면 commit이 깨진다.
+            transaction.create(ownership_ref, _ownership_document(ownership))
+            # counter는 **읽은 값 + 1**이다. listing을 transaction에서 읽었으므로
+            # 동시 구매는 충돌로 재시도되고, 그래서 정확히 직렬화된다.
+            count = listing.download_count + 1
+            transaction.update(listing_ref, {"downloadCount": count})
+
+            return PurchaseResult(
+                ownership=ownership, purchased=True, already_owned=False,
+                price_paid=price, balance=balance, download_count=count,
+            )
+
+        try:
+            return run(shards.transaction())
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("listing_acquire", error) from error
+
+    def ownerships(self, user_id: str) -> list[Ownership]:
+        try:
+            found = (
+                self._db.collection(OWNERSHIP)
+                .where(filter=firestore.FieldFilter("userId", "==", user_id))
+                .stream()
+            )
+            return [_ownership_from(x.id, x.to_dict() or {}) for x in found]
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("ownership_list", error) from error
+
     # MARK: - 내부
 
     def _unavailable(self, operation: str, error: Exception) -> StoreUnavailable:
@@ -291,4 +398,33 @@ def _owned_snapshot(found, snapshot_id: str, seller_user_id: str) -> Snapshot:
         seller_user_id=seller_user_id,
         content_type=ContentType(data.get("contentType") or ContentType.MIRROR.value),
         created_at=data.get("createdAt") or utcnow(),
+    )
+
+
+def _ownership_document(ownership: Ownership) -> dict:
+    return {
+        "userId": ownership.user_id,
+        "listingId": ownership.listing_id,
+        "sellerUserId": ownership.seller_user_id,
+        "snapshotId": ownership.snapshot_id,
+        "pricePaid": ownership.price_paid,
+        "buyerLedgerEntryId": ownership.buyer_ledger_entry_id,
+        "sellerLedgerEntryId": ownership.seller_ledger_entry_id,
+        "createdAt": ownership.created_at,
+        "schemaVersion": ownership.schema_version,
+    }
+
+
+def _ownership_from(ownership_id_value: str, data: dict) -> Ownership:
+    return Ownership(
+        id=ownership_id_value,
+        user_id=str(data.get("userId") or ""),
+        listing_id=str(data.get("listingId") or ""),
+        seller_user_id=str(data.get("sellerUserId") or ""),
+        snapshot_id=str(data.get("snapshotId") or ""),
+        price_paid=int(data.get("pricePaid") or 0),
+        buyer_ledger_entry_id=data.get("buyerLedgerEntryId"),
+        seller_ledger_entry_id=data.get("sellerLedgerEntryId"),
+        created_at=data.get("createdAt") or utcnow(),
+        schema_version=int(data.get("schemaVersion") or 1),
     )

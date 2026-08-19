@@ -219,7 +219,7 @@ class ShardLedgerService:
             "%s reason=%s delta=%d balance=%d applied=%s scoped=True",
             event, reason.value, entry.delta, wallet.balance, applied,
         )
-        return ShardMutationResult(wallet=wallet, applied=applied)
+        return ShardMutationResult(wallet=wallet, applied=applied, entry_id=entry.id)
 
     @staticmethod
     def _moved(delta: int) -> int:

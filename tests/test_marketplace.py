@@ -801,13 +801,15 @@ def test_mutations_still_require_auth(client):
     assert client.post("/marketplace/listings/abc/unpublish").status_code == 401
 
 
-def test_no_asset_or_purchase_routes(client):
-    """§18 · purchase는 B-7E다 — 가짜 preview URL도 만들지 않는다."""
+def test_no_asset_routes(client):
+    """§18 — asset 전달은 B-7F다. 가짜 preview URL도 만들지 않는다.
+
+    (purchase는 B-7E에서 구현됐다 — 인증 test가 따로 있다.)
+    """
     for path in [
         "/marketplace/listings/abc/preview",
         "/marketplace/listings/abc/template",
         "/marketplace/listings/abc/image",
-        "/marketplace/listings/abc/purchase",
         "/marketplace/listings/abc/like",
     ]:
         assert client.get(path).status_code in {404, 405}
@@ -825,3 +827,539 @@ def test_no_n_plus_one_snapshot_reads():
     end = source.index("def get_published")
     body = _code_only(source[start:end])
     assert "SNAPSHOTS" not in body, "목록에서 snapshot을 읽는다"
+
+
+# MARK: - 획득 · 소유권 (B-7E)
+#
+# 여기서 보는 것: **구매자 차감 · 판매자 지급 · 소유권 · 다운로드 수가 한 commit인가.**
+# 하나라도 갈라지면 돈이나 권리가 사라진다.
+
+from app.marketplace.models import Ownership, SelfPurchase, ownership_id   # noqa: E402
+
+BUYER = "22222222-3333-4444-8555-666666666666"
+
+
+def sale(store, listing_id: str = "for-sale", *, price: int = 30, downloads: int = 0,
+         kind: ContentType = ContentType.MIRROR, owner: str = SELLER) -> Listing:
+    return published(store, listing_id, kind=kind, price=price, downloads=downloads, owner=owner)
+
+
+def entries(shard_store, reason: ShardReason):
+    return [e for e in shard_store.entries if e.reason is reason]
+
+
+def purchase_reasons(kind: ContentType = ContentType.MIRROR):
+    return (
+        MarketplacePublishPolicy.purchase_reason(kind),
+        MarketplacePublishPolicy.sale_reason(kind),
+    )
+
+
+# MARK: - 유료 구매 (§8)
+
+
+@pytest.mark.parametrize("kind", list(ContentType))
+def test_paid_purchase_moves_everything_in_one_commit(store, shards, service, shard_store, kind):
+    seed(shards, 100, who=BUYER)
+    seed(shards, 10)
+    listing = sale(store, kind=kind, downloads=7)
+    buy_reason, sell_reason = purchase_reasons(kind)
+
+    result = service.purchase(user(BUYER), listing.id)
+
+    assert (result.purchased, result.already_owned) == (True, False)
+    assert result.price_paid == 30
+    assert result.balance == 70
+    assert result.download_count == 8
+
+    buyer_wallet = shard_store.wallet(BUYER)
+    seller_wallet = shard_store.wallet(SELLER)
+    assert (buyer_wallet.balance, buyer_wallet.lifetime_spent) == (70, 30)
+    assert (seller_wallet.balance, seller_wallet.lifetime_earned) == (40, 40)
+    # 판매는 "쓴 것"이 아니다.
+    assert seller_wallet.lifetime_spent == 0
+
+    assert [e.delta for e in entries(shard_store, buy_reason)] == [-30]
+    assert [e.delta for e in entries(shard_store, sell_reason)] == [30]
+    assert store.listings[listing.id].download_count == 8
+
+
+def test_purchase_fee_is_zero_percent(store, shards, service, shard_store):
+    """구매자가 낸 만큼 판매자가 정확히 받는다."""
+    seed(shards, 100, who=BUYER)
+    listing = sale(store, price=77)
+
+    service.purchase(user(BUYER), listing.id)
+
+    assert shard_store.wallet(BUYER).balance == 23
+    assert shard_store.wallet(SELLER).balance == 77
+
+
+def test_ownership_freezes_the_purchase(store, shards, service):
+    seed(shards, 100, who=BUYER)
+    listing = sale(store)
+
+    owned = service.purchase(user(BUYER), listing.id).ownership
+
+    assert owned.id == ownership_id(BUYER, listing.id)
+    assert owned.user_id == BUYER
+    assert owned.seller_user_id == SELLER
+    assert owned.snapshot_id == listing.snapshot_id
+    assert owned.price_paid == 30
+    assert owned.buyer_ledger_entry_id is not None
+    assert owned.seller_ledger_entry_id is not None
+    # raw id를 문서 ID에 노출하지 않는다.
+    assert BUYER not in owned.id and listing.id not in owned.id
+
+
+# MARK: - 무료 획득 (§9)
+
+
+def test_free_acquisition_creates_ownership_without_ledger(store, shards, service, shard_store):
+    seed(shards, 100, who=BUYER)
+    listing = sale(store, price=0, downloads=3)
+    buy_reason, sell_reason = purchase_reasons()
+
+    result = service.purchase(user(BUYER), listing.id)
+
+    assert result.purchased is True
+    assert result.price_paid == 0
+    assert result.download_count == 4
+
+    # 지갑도 원장도 건드리지 않는다 — 조각이 움직이지 않았다.
+    assert shard_store.wallet(BUYER).balance == 100
+    assert shard_store.wallet(BUYER).lifetime_spent == 0
+    assert shard_store.wallet(SELLER).balance == 0
+    assert entries(shard_store, buy_reason) == []
+    assert entries(shard_store, sell_reason) == []
+
+    owned = result.ownership
+    assert owned.price_paid == 0
+    assert owned.buyer_ledger_entry_id is None
+    assert owned.seller_ledger_entry_id is None
+
+
+# MARK: - 거절 (§7, §10)
+
+
+def test_insufficient_shards_changes_nothing(store, shards, service, shard_store):
+    seed(shards, 29, who=BUYER)
+    seed(shards, 10)
+    listing = sale(store, downloads=5)
+    buy_reason, sell_reason = purchase_reasons()
+
+    with pytest.raises(InsufficientShards):
+        service.purchase(user(BUYER), listing.id)
+
+    assert shard_store.wallet(BUYER).balance == 29
+    assert shard_store.wallet(SELLER).balance == 10
+    assert store.ownership == {}
+    assert store.listings[listing.id].download_count == 5
+    assert entries(shard_store, buy_reason) == []
+    assert entries(shard_store, sell_reason) == []
+
+
+def test_self_purchase_is_refused(store, shards, service, shard_store):
+    seed(shards, 100)
+    listing = sale(store, downloads=4)
+
+    with pytest.raises(SelfPurchase):
+        service.purchase(user(SELLER), listing.id)
+
+    assert shard_store.wallet(SELLER).balance == 100
+    assert store.ownership == {}
+    assert store.listings[listing.id].download_count == 4
+
+
+@pytest.mark.parametrize("status", [ListingStatus.DRAFT, ListingStatus.UNLISTED])
+def test_unavailable_listings_cannot_be_bought(store, shards, service, shard_store, status):
+    seed(shards, 100, who=BUYER)
+    published(store, "hidden", status=status,
+              published_at=None if status is ListingStatus.DRAFT else ...)
+
+    with pytest.raises(ListingNotFound):
+        service.purchase(user(BUYER), "hidden")
+
+    assert shard_store.wallet(BUYER).balance == 100
+    assert store.ownership == {}
+
+
+# MARK: - 멱등 (§11, §12)
+
+
+@pytest.mark.parametrize("times", [2, 5])
+def test_repeated_purchase_acquires_once(store, shards, service, shard_store, times):
+    seed(shards, 100, who=BUYER)
+    listing = sale(store, downloads=1)
+    buy_reason, sell_reason = purchase_reasons()
+
+    results = [service.purchase(user(BUYER), listing.id) for _ in range(times)]
+
+    assert results[0].purchased is True and results[0].already_owned is False
+    for later in results[1:]:
+        assert later.purchased is False
+        assert later.already_owned is True
+        assert later.balance == 70, "중복 요청도 정상 잔액을 돌려준다"
+        assert later.download_count == 2, "중복 요청이 counter를 올렸다"
+
+    assert shard_store.wallet(BUYER).balance == 70
+    assert shard_store.wallet(SELLER).balance == 30
+    assert len(entries(shard_store, buy_reason)) == 1
+    assert len(entries(shard_store, sell_reason)) == 1
+    assert len(store.ownership) == 1
+    assert store.listings[listing.id].download_count == 2
+
+
+def test_ledger_keys_do_not_collide(store, shards, service, shard_store):
+    """구매자/판매자는 user도 reason도 다르므로 서로 다른 원장 문서다."""
+    seed(shards, 100, who=BUYER)
+    listing = sale(store)
+
+    owned = service.purchase(user(BUYER), listing.id).ownership
+
+    assert owned.buyer_ledger_entry_id != owned.seller_ledger_entry_id
+    ids = {e.id for e in shard_store.entries}
+    assert owned.buyer_ledger_entry_id in ids
+    assert owned.seller_ledger_entry_id in ids
+
+
+def test_different_listings_are_different_purchases(store, shards, service, shard_store):
+    seed(shards, 100, who=BUYER)
+    first = sale(store, "one")
+    second = sale(store, "two")
+
+    service.purchase(user(BUYER), first.id)
+    service.purchase(user(BUYER), second.id)
+
+    assert shard_store.wallet(BUYER).balance == 40
+    assert len(store.ownership) == 2
+
+
+# MARK: - 동시성 (§14, §15, §16)
+
+
+def test_same_buyer_concurrency_acquires_once(store, shards, service, shard_store):
+    """§14 — 같은 구매자 8 동시 요청. counter가 7 → 8이어야 한다."""
+    seed(shards, 100, who=BUYER)
+    listing = sale(store, downloads=7)
+    start = threading.Barrier(8)
+    acquired: list[bool] = []
+
+    def run():
+        start.wait()
+        acquired.append(service.purchase(user(BUYER), listing.id).purchased)
+
+    threads = [threading.Thread(target=run) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sum(acquired) == 1, f"소유권이 {sum(acquired)}번 생겼다"
+    assert shard_store.wallet(BUYER).balance == 70
+    assert shard_store.wallet(SELLER).balance == 30
+    assert len(store.ownership) == 1
+    assert store.listings[listing.id].download_count == 8, "counter가 여러 번 올랐다"
+
+
+def test_different_buyers_concurrency_counts_each(store, shards, service, shard_store):
+    """§15 — 8명이 동시에 획득. lost update가 없어야 한다."""
+    buyers = [f"buyer-{i}" for i in range(8)]
+    for buyer in buyers:
+        seed(shards, 100, who=buyer)
+    listing = sale(store, price=10, downloads=0)
+    start = threading.Barrier(len(buyers))
+
+    def run(buyer: str):
+        start.wait()
+        service.purchase(user(buyer), listing.id)
+
+    threads = [threading.Thread(target=run, args=(b,)) for b in buyers]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(store.ownership) == 8
+    for buyer in buyers:
+        assert shard_store.wallet(buyer).balance == 90
+    assert shard_store.wallet(SELLER).balance == 80, "판매 대금이 유실됐다"
+    assert store.listings[listing.id].download_count == 8, "counter가 어긋났다"
+
+
+def test_balance_limits_concurrent_purchases(store, shards, service, shard_store):
+    """§16 — 잔액 30으로 30짜리 둘을 동시에. 정확히 하나만 성공한다."""
+    seed(shards, 30, who=BUYER)
+    first = sale(store, "one", price=30)
+    second = sale(store, "two", price=30)
+    start = threading.Barrier(2)
+    outcome: list[bool] = []
+
+    def run(listing_id: str):
+        start.wait()
+        try:
+            outcome.append(service.purchase(user(BUYER), listing_id).purchased)
+        except InsufficientShards:
+            outcome.append(False)
+
+    threads = [threading.Thread(target=run, args=(x,)) for x in (first.id, second.id)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sum(outcome) == 1
+    assert shard_store.wallet(BUYER).balance == 0, "잔액이 음수가 됐다"
+    assert len(store.ownership) == 1
+    assert shard_store.wallet(SELLER).balance == 30
+
+
+# MARK: - 내리기 경합 (§17, §23)
+
+
+def test_ownership_survives_unpublish(store, shards, service, shard_store):
+    """§23 — 돈을 냈는데 판매자가 내려서 잃으면 안 된다."""
+    seed(shards, 100, who=BUYER)
+    listing = sale(store)
+    service.purchase(user(BUYER), listing.id)
+
+    service.unpublish(user(SELLER), listing.id)
+
+    # 공개 목록에서는 사라지지만 소유권은 남는다.
+    assert service.browse() == []
+    owned = service.purchases(user(BUYER))
+    assert len(owned) == 1
+    assert owned[0][0].listing_id == listing.id
+    assert owned[0][1].status is ListingStatus.UNLISTED
+
+
+def test_purchase_after_unpublish_changes_nothing(store, shards, service, shard_store):
+    """§17-B — 내려간 뒤 도착한 구매는 경제를 건드리지 않는다."""
+    seed(shards, 100, who=BUYER)
+    listing = sale(store)
+    service.unpublish(user(SELLER), listing.id)
+
+    with pytest.raises(ListingNotFound):
+        service.purchase(user(BUYER), listing.id)
+
+    assert shard_store.wallet(BUYER).balance == 100
+    assert store.ownership == {}
+
+
+# MARK: - 원자성 (§25)
+
+
+def test_ownership_failure_rolls_back_the_money(store, shards, service, shard_store):
+    """§25-B — 조각이 오간 뒤 소유권 생성이 터지면 **전부 되돌아간다.**"""
+    seed(shards, 100, who=BUYER)
+    seed(shards, 10)
+    listing = sale(store, downloads=2)
+    buy_reason, sell_reason = purchase_reasons()
+
+    class FailingOwnership(dict):
+        def __setitem__(self, key, value):
+            raise RuntimeError("ownership write failed")
+
+    store.ownership = FailingOwnership(store.ownership)
+
+    with pytest.raises(RuntimeError):
+        service.purchase(user(BUYER), listing.id)
+
+    assert shard_store.wallet(BUYER).balance == 100, "구매자만 차감됐다"
+    assert shard_store.wallet(SELLER).balance == 10, "판매자만 지급됐다"
+    assert entries(shard_store, buy_reason) == []
+    assert entries(shard_store, sell_reason) == []
+    assert store.listings[listing.id].download_count == 2
+
+
+def test_counter_failure_rolls_back_everything(store, shards, service, shard_store):
+    """§25-C — counter 쓰기가 터지면 소유권과 돈도 되돌아간다."""
+    seed(shards, 100, who=BUYER)
+    listing = sale(store)
+
+    class FailingListings(dict):
+        def __setitem__(self, key, value):
+            raise RuntimeError("counter write failed")
+
+    store.listings = FailingListings(store.listings)
+
+    with pytest.raises(RuntimeError):
+        service.purchase(user(BUYER), listing.id)
+
+    assert shard_store.wallet(BUYER).balance == 100
+    assert shard_store.wallet(SELLER).balance == 0
+    assert store.ownership == {}
+
+
+def test_ownership_is_never_overwritten(store, shards, service):
+    """§20 — 이미 있는 소유권을 조용히 교체하지 않는다."""
+    seed(shards, 100, who=BUYER)
+    listing = sale(store)
+    first = service.purchase(user(BUYER), listing.id).ownership
+
+    again = service.purchase(user(BUYER), listing.id).ownership
+
+    assert again.created_at == first.created_at, "소유권이 새로 만들어졌다"
+    assert again.price_paid == first.price_paid
+
+
+# MARK: - 판매자 지갑이 없을 때 (§24)
+
+
+def test_seller_without_a_wallet_still_gets_paid(store, shards, service, shard_store):
+    seed(shards, 100, who=BUYER)
+    listing = sale(store)
+    assert SELLER not in shard_store.wallets
+
+    service.purchase(user(BUYER), listing.id)
+
+    wallet = shard_store.wallet(SELLER)
+    assert (wallet.balance, wallet.lifetime_earned) == (30, 30)
+
+
+# MARK: - 내 구매 목록 (§22)
+
+
+def test_my_purchases_lists_owned_items(store, shards, service):
+    seed(shards, 100, who=BUYER)
+    first = sale(store, "one", price=10)
+    second = sale(store, "two", price=0)
+    service.purchase(user(BUYER), first.id)
+    service.purchase(user(BUYER), second.id)
+
+    owned = service.purchases(user(BUYER))
+
+    assert {x[0].listing_id for x in owned} == {"one", "two"}
+    assert {x[0].price_paid for x in owned} == {10, 0}
+
+
+def test_my_purchases_is_scoped_to_the_user(store, shards, service):
+    seed(shards, 100, who=BUYER)
+    listing = sale(store)
+    service.purchase(user(BUYER), listing.id)
+
+    assert service.purchases(user(BUYER)) != []
+    assert service.purchases(user(OTHER)) == []
+
+
+# MARK: - HTTP (§3, §21, §27)
+
+
+def test_purchase_endpoint_takes_no_body():
+    from app.api import marketplace as api
+
+    import inspect
+
+    signature = inspect.signature(api.purchase_listing)
+    assert "request" not in signature.parameters, "구매 요청이 body를 받는다"
+    for banned in ["price", "amount", "fee", "seller", "snapshot", "downloadCount"]:
+        assert banned not in signature.parameters
+
+
+def test_purchase_response_hides_internal_values(client, store, shards):
+    seed(shards, 100, who=BUYER)
+    sale(store)
+
+    from app.api.marketplace import PurchaseResponse
+
+    fields = set(PurchaseResponse.model_fields)
+    for banned in ["seller_user_id", "sellerUserId", "snapshot_id", "snapshotId"]:
+        assert banned not in fields
+
+
+def test_purchase_and_my_purchases_require_auth(client):
+    assert client.post("/marketplace/listings/abc/purchase").status_code == 401
+    assert client.get("/users/me/marketplace/purchases").status_code == 401
+
+
+def test_no_arbitrary_user_ownership_route(client):
+    """남의 소유권을 임의 userId로 조회하는 경로를 만들지 않는다."""
+    for path in [
+        f"/users/{SELLER}/marketplace/purchases",
+        "/marketplace/ownership",
+        f"/marketplace/ownership/{SELLER}",
+    ]:
+        assert client.get(path).status_code in {404, 405}
+
+
+def test_no_like_route_yet(client):
+    """§28 — like는 B-7E.1이다."""
+    for method in ("get", "post"):
+        assert getattr(client, method)("/marketplace/listings/abc/like").status_code in {404, 405}
+
+
+# MARK: - 읽기 순서 · 소스 불변식 (§19, §13, §26, §29)
+
+
+def test_marketplace_reads_come_before_writes():
+    """§19 — Firestore transaction은 읽기를 쓰기보다 먼저 해야 한다.
+
+    조각 primitive가 자기 문서를 읽고 쓰므로, marketplace 문서 읽기가 그 뒤에 오면
+    안 된다. 소스에서 순서를 고정한다.
+    """
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parent.parent / "app/marketplace/firestore_store.py"
+    ).read_text()
+    body = source[source.index("def acquire"):source.index("def ownerships")]
+
+    listing_read = body.index("listing_ref.get(transaction=transaction)")
+    ownership_read = body.index("ownership_ref.get(transaction=transaction)")
+    first_shard_call = body.index("shards.apply_in_transaction")
+    ownership_write = body.index("transaction.create(ownership_ref")
+    counter_write = body.index("transaction.update(listing_ref")
+
+    assert listing_read < first_shard_call, "listing을 조각 이동 뒤에 읽는다"
+    assert ownership_read < first_shard_call, "소유권을 조각 이동 뒤에 읽는다"
+    assert first_shard_call < ownership_write < counter_write
+
+
+def test_counter_and_ownership_share_one_transaction():
+    """§13 — counter를 별도 transaction으로 올리지 않는다."""
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parent.parent / "app/marketplace/firestore_store.py"
+    ).read_text()
+    body = source[source.index("def acquire"):source.index("def ownerships")]
+
+    assert body.count("@firestore.transactional") == 1
+    assert "downloadCount" in body
+    assert body.count("shards.transaction()") == 1
+
+
+def test_purchase_uses_a_fresh_context_each_attempt():
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parent.parent / "app/marketplace/firestore_store.py"
+    ).read_text()
+    body = source[source.index("def acquire"):source.index("def ownerships")]
+    assert body.index("@firestore.transactional") < body.index("shards.context(transaction)")
+
+
+def test_no_counter_or_price_spoofing_in_source():
+    """§6 · §26 — client가 가격/counter를 정하는 경로가 없다."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    api = _code_only((root / "app/api/marketplace.py").read_text())
+    # 구매 응답 model에만 downloadCount가 있고, 요청 model에는 없다.
+    from app.api.marketplace import DraftRequest
+
+    for banned in ["downloadCount", "download_count", "priceShards", "price_shards"]:
+        assert banned not in {f for f in DraftRequest.model_fields} or banned in {"price_shards"}
+    assert "downloadCount +" not in api and "download_count +" not in api
+
+
+def test_still_no_gcs_or_asset_delivery():
+    """§29 — asset 전달은 B-7F다."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    for path in ["app/marketplace/models.py", "app/marketplace/store.py",
+                 "app/marketplace/firestore_store.py", "app/marketplace/service.py"]:
+        code = _code_only((root / path).read_text()).lower()
+        for banned in ["bucket", "signed_url", "generate_signed_url", "gcs"]:
+            assert banned not in code, f"{path}: {banned}"
