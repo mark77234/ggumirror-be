@@ -435,6 +435,47 @@ class FirestoreMarketplaceStore:
         except gcp_exceptions.GoogleAPIError as error:
             raise self._unavailable("like_list", error) from error
 
+    # MARK: - snapshot / 전달 (B-7F)
+
+    def create_snapshot(self, snapshot: Snapshot) -> Snapshot:
+        """**asset이 전부 올라간 뒤에만** 부른다. `create`라 같은 자리를 덮어쓰지 않는다."""
+        try:
+            self._db.collection(SNAPSHOTS).document(snapshot.id).create(
+                _snapshot_document(snapshot)
+            )
+        except gcp_exceptions.AlreadyExists as error:
+            raise SnapshotNotFound(snapshot.id) from error
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("snapshot_create", error) from error
+        return snapshot
+
+    def snapshot_for_delivery(self, snapshot_id: str) -> Snapshot:
+        try:
+            found = self._db.collection(SNAPSHOTS).document(snapshot_id).get()
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("snapshot_delivery_read", error) from error
+        if not found.exists:
+            raise SnapshotNotFound(snapshot_id)
+        return _snapshot_from(snapshot_id, found.to_dict() or {})
+
+    def ownership(self, listing_id: str, user_id: str) -> Ownership | None:
+        key = ownership_id(user_id, listing_id)
+        try:
+            found = self._db.collection(OWNERSHIP).document(key).get()
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("ownership_read", error) from error
+        return _ownership_from(key, found.to_dict() or {}) if found.exists else None
+
+    def any_listing(self, listing_id: str) -> Listing:
+        """상태·주인과 무관하게. **템플릿 전달에만** 쓴다."""
+        try:
+            found = self._db.collection(LISTINGS).document(listing_id).get()
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("listing_any_read", error) from error
+        if not found.exists:
+            raise ListingNotFound(listing_id)
+        return _listing_from(listing_id, found.to_dict() or {})
+
     # MARK: - 내부
 
     def _unavailable(self, operation: str, error: Exception) -> StoreUnavailable:
@@ -500,11 +541,31 @@ def _owned_snapshot(found, snapshot_id: str, seller_user_id: str) -> Snapshot:
     data = found.to_dict() or {}
     if data.get("sellerUserId") != seller_user_id:
         raise SnapshotNotFound(snapshot_id)
+    return _snapshot_from(snapshot_id, data)
+
+
+def _snapshot_document(snapshot: Snapshot) -> dict:
+    return {
+        "sellerUserId": snapshot.seller_user_id,
+        "contentType": snapshot.content_type.value,
+        "manifestChecksum": snapshot.manifest_checksum,
+        "assetCount": snapshot.asset_count,
+        "totalBytes": snapshot.total_bytes,
+        "createdAt": snapshot.created_at,
+        "schemaVersion": snapshot.schema_version,
+    }
+
+
+def _snapshot_from(snapshot_id: str, data: dict) -> Snapshot:
     return Snapshot(
         id=snapshot_id,
-        seller_user_id=seller_user_id,
+        seller_user_id=str(data.get("sellerUserId") or ""),
         content_type=ContentType(data.get("contentType") or ContentType.MIRROR.value),
+        manifest_checksum=str(data.get("manifestChecksum") or ""),
+        asset_count=int(data.get("assetCount") or 0),
+        total_bytes=int(data.get("totalBytes") or 0),
         created_at=data.get("createdAt") or utcnow(),
+        schema_version=int(data.get("schemaVersion") or 1),
     )
 
 

@@ -93,13 +93,35 @@ class MarketplacePublishPolicy:
 class Snapshot:
     """게시되는 **불변 내용물**. 판매자가 나중에 바꿔도 구매자 권리가 깨지지 않는다.
 
-    이번 단계에서는 존재와 주인만 확인한다 — 실제 asset 업로드는 B-7F다.
+    ⚠️ **이 문서가 있다는 것은 asset이 전부 올라갔다는 뜻이다.** 업로드가 반쪽으로
+    끝나면 문서를 만들지 않는다 — 그래서 listing이 반쪽 snapshot을 참조할 수 없다.
+
+    한 번 만들어진 `id`가 가리키는 내용은 **영원히 같다.** 수정 기능이 생기면
+    새 `id`를 만든다(같은 자리를 덮어쓰지 않는다).
     """
 
     id: str
     seller_user_id: str
     content_type: ContentType
+    #: 서버가 계산한 manifest SHA-256. client가 보낸 값을 authority로 쓰지 않는다.
+    manifest_checksum: str = ""
+    asset_count: int = 0
+    total_bytes: int = 0
     created_at: datetime = field(default_factory=utcnow)
+    schema_version: int = SCHEMA_VERSION
+
+    @staticmethod
+    def new_id() -> str:
+        return str(uuid.uuid4())
+
+    @property
+    def is_complete(self) -> bool:
+        """B-7C 시절 fixture처럼 asset 없이 만들어진 문서를 구분한다.
+
+        불완전한 snapshot으로는 **미리보기도 템플릿도 내보내지 않는다** —
+        거짓 그림을 만들지 않는다.
+        """
+        return bool(self.manifest_checksum)
 
 
 @dataclass(frozen=True)

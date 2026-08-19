@@ -50,6 +50,7 @@ def create_app(
     generation_store: GenerationStore | None = None,
     generation_storage: GenerationStorage | None = None,
     marketplace_store=None,
+    marketplace_assets=None,
 ) -> FastAPI:
     """store를 주면 그것을 쓴다 — test는 in-memory fake와 test key를 넣는다."""
     settings = settings or load_settings()
@@ -180,9 +181,19 @@ def create_app(
 
         # 조각 원장과 **같은 Firestore client**를 쓴다 — 등록비와 listing이
         # 한 transaction에서 commit되려면 같은 database여야 한다.
+        from app.marketplace.assets import GCSMarketplaceAssetStorage
+
+        # **AI 결과 bucket을 재사용하지 않는다** — 그쪽은 7일 lifecycle이고 이쪽은 영구다.
+        # bucket 이름이 없으면 storage가 `None`이고 업로드/전달만 503이 된다(fail closed).
         return MarketplaceService(
             store=marketplace_store or FirestoreMarketplaceStore(_firestore()),
             shards=shards(),
+            assets=marketplace_assets
+            or (
+                GCSMarketplaceAssetStorage(settings.marketplace_asset_bucket)
+                if settings.marketplace_asset_bucket
+                else None
+            ),
         )
 
     app.state.apple_verifier = verifier

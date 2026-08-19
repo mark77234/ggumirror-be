@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from pydantic import BaseModel, Field
 
 from app.api.deps import current_user, marketplace_service
@@ -28,6 +28,17 @@ from app.marketplace.models import (
     ListingNotFound,
     SnapshotNotFound,
 )
+from app.marketplace.assets import (
+    MAX_ASSETS,
+    MAX_IMAGE_BYTES,
+    MAX_MANIFEST_BYTES,
+    AssetError,
+    AssetNotFound,
+    AssetStorageUnavailable,
+    AssetTooLarge,
+    checked_package,
+)
+from app.marketplace.models import SnapshotNotFound as SnapshotMissing
 from app.marketplace.service import MarketplaceService
 from app.shards.models import InsufficientShards
 
@@ -121,6 +132,154 @@ def _listing(listing) -> ListingResponse:
         like_count=listing.like_count,
         published_at=listing.published_at.isoformat() if listing.published_at else None,
     )
+
+
+class SnapshotResponse(BaseModel):
+    """올린 내용물. **bucket · object key · gs:// URL을 담지 않는다.**"""
+
+    snapshot_id: str = Field(serialization_alias="snapshotId")
+    content_type: str = Field(serialization_alias="contentType")
+    asset_count: int = Field(serialization_alias="assetCount")
+    total_bytes: int = Field(serialization_alias="totalBytes")
+    #: 다운로드 손상 확인용. 서버가 계산한 값이다.
+    manifest_checksum: str = Field(serialization_alias="manifestChecksum")
+
+
+async def _read_capped(upload: UploadFile, limit: int, label: str) -> bytes:
+    """**`Content-Length`를 믿지 않는다** — 실제로 읽은 바이트로 판단한다.
+
+    상한보다 한 바이트 더 읽어 초과를 확인한다. 통째로 메모리에 담기 전에 끊는다.
+    """
+    data = await upload.read(limit + 1)
+    if len(data) > limit:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, f"{label} is too large")
+    return data
+
+
+@router.post("/snapshots", status_code=status.HTTP_201_CREATED)
+async def create_snapshot(
+    user: Annotated[User, Depends(current_user)],
+    service: Annotated[MarketplaceService, Depends(marketplace_service)],
+    contentType: Annotated[str, Form()],
+    manifest: Annotated[UploadFile, File()],
+    preview: Annotated[UploadFile, File()],
+    assets: Annotated[list[UploadFile] | None, File()] = None,
+) -> SnapshotResponse:
+    """내용물을 올린다. **`snapshotId` · 판매자 · checksum · object key는 서버가 만든다.**
+
+    asset을 전부 올린 뒤에만 snapshot 문서가 생긴다 — 반쪽 업로드는 문서가 없으므로
+    어떤 listing도 참조할 수 없다.
+
+    파일 이름은 **assetID(UUID)만** 허용한다. 경로를 담을 자리가 없다.
+    """
+    uploaded = assets or []
+    if len(uploaded) > MAX_ASSETS:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "too many assets")
+
+    try:
+        package = checked_package(
+            manifest=await _read_capped(manifest, MAX_MANIFEST_BYTES, "manifest"),
+            preview=await _read_capped(preview, MAX_IMAGE_BYTES, "preview"),
+            assets={
+                # 확장자를 떼고 남은 것이 UUID여야 한다 — 검증은 `checked_package`가 한다.
+                (item.filename or "").removesuffix(".png"): await _read_capped(
+                    item, MAX_IMAGE_BYTES, "asset"
+                )
+                for item in uploaded
+            },
+        )
+    except AssetTooLarge as error:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "package is too large") from error
+    except AssetError as error:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "package is not valid") from error
+
+    try:
+        snapshot = service.create_snapshot(user, content_type=contentType, package=package)
+    except InvalidListing as error:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "contentType is not valid") from error
+    except (AssetError, SnapshotMissing) as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+    except StoreUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+
+    return SnapshotResponse(
+        snapshot_id=snapshot.id,
+        content_type=snapshot.content_type.value,
+        asset_count=snapshot.asset_count,
+        total_bytes=snapshot.total_bytes,
+        manifest_checksum=snapshot.manifest_checksum,
+    )
+
+
+def _streamed(stored, *, cache: str) -> Response:
+    """저장된 바이트를 그대로 흘려보낸다. **signed URL을 만들지 않는다.**"""
+    return Response(
+        content=stored.data,
+        media_type=stored.content_type,
+        headers={"Content-Length": str(len(stored.data)), "Cache-Control": cache},
+    )
+
+
+@router.get("/listings/{listing_id}/preview")
+def listing_preview(
+    listing_id: str,
+    service: Annotated[MarketplaceService, Depends(marketplace_service)],
+) -> Response:
+    """**공개다.** `published`만 — draft · unlisted · 없는 것 모두 404.
+
+    내부 GCS object key를 응답에 담지 않는다. 우리가 읽어서 흘려보낸다.
+    """
+    try:
+        stored = service.preview(listing_id)
+    except AssetStorageUnavailable as error:
+        # 상품은 있고 우리 bucket 설정이 없다 — 404로 뭉개면 오진을 부른다.
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+    except (ListingNotFound, SnapshotMissing, AssetNotFound) as error:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "preview not found") from error
+    except StoreUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+    # snapshot은 불변이라 오래 캐시해도 안전하다.
+    return _streamed(stored, cache="public, max-age=86400, immutable")
+
+
+@router.get("/listings/{listing_id}/template")
+def listing_template(
+    listing_id: str,
+    user: Annotated[User, Depends(current_user)],
+    service: Annotated[MarketplaceService, Depends(marketplace_service)],
+) -> Response:
+    """원본 템플릿. **판매자 또는 구매자만.**
+
+    `published`를 요구하지 않는다 — 판매자가 내려도 산 사람은 받아야 한다.
+    """
+    try:
+        stored = service.template(user, listing_id)
+    except AssetStorageUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+    except (ListingNotFound, SnapshotMissing, AssetNotFound) as error:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "template not found") from error
+    except StoreUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+    return _streamed(stored, cache="private, max-age=3600, immutable")
+
+
+@router.get("/listings/{listing_id}/template/assets/{asset_id}")
+def listing_template_asset(
+    listing_id: str,
+    asset_id: str,
+    user: Annotated[User, Depends(current_user)],
+    service: Annotated[MarketplaceService, Depends(marketplace_service)],
+) -> Response:
+    """템플릿이 참조하는 이미지 하나. 권한은 템플릿과 같다."""
+    try:
+        stored = service.template_asset(user, listing_id, asset_id)
+    except AssetStorageUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+    except (ListingNotFound, SnapshotMissing, AssetNotFound, AssetError) as error:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "asset not found") from error
+    except StoreUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+    return _streamed(stored, cache="private, max-age=3600, immutable")
 
 
 @router.get("/listings")

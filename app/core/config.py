@@ -65,6 +65,9 @@ class Settings:
     # 비어 있으면 fail closed다 — 결과를 durable하게 두지 못하면 응답이 유실됐을 때
     # 복구할 방법이 없고, 그건 A-1A의 구멍 그대로다.
     ai_result_bucket: str = ""
+    #: Marketplace snapshot asset bucket. **AI 결과 bucket과 다른 것**이다 —
+    #: 그쪽은 7일 lifecycle, 이쪽은 영구 보존이다. 비어 있으면 업로드/전달이 fail closed.
+    marketplace_asset_bucket: str = ""
     # 조각 IAP가 받아들일 Apple 환경. 쉼표로 나눈다 — 예: `Production,Sandbox`.
     #
     # **비어 있으면 아무것도 허용하지 않는다(fail closed).** 지금이 그 상태다.
@@ -130,6 +133,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     ai_image_model = env.get("AI_IMAGE_MODEL", "").strip()
     ai_image_quality = env.get("AI_IMAGE_QUALITY", "").strip() or "low"
     ai_result_bucket = env.get("AI_RESULT_BUCKET", "").strip()
+    marketplace_asset_bucket = env.get("MARKETPLACE_ASSET_BUCKET", "").strip()
     iap_allowed_environments = env.get("IAP_ALLOWED_ENVIRONMENTS", "").strip()
 
     raw_app_apple_id = env.get("IAP_APP_APPLE_ID", "").strip()
@@ -155,6 +159,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         ai_image_model=ai_image_model,
         ai_image_quality=ai_image_quality,
         ai_result_bucket=ai_result_bucket,
+        marketplace_asset_bucket=marketplace_asset_bucket,
         iap_allowed_environments=iap_allowed_environments,
         iap_app_apple_id=iap_app_apple_id,
     )

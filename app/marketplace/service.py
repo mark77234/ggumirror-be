@@ -14,6 +14,8 @@ from app.marketplace.models import (
     MarketplaceSort,
     LikeResult,
     Ownership,
+    Snapshot,
+    SnapshotNotFound,
     PurchaseResult,
     InvalidListing,
     Listing,
@@ -25,6 +27,15 @@ from app.marketplace.models import (
     normalized_description,
     normalized_title,
 )
+from app.marketplace.assets import (
+    AssetNotFound,
+    AssetStorageUnavailable,
+    MarketplaceAssetStorage,
+    SnapshotPackage,
+    asset_key,
+    manifest_key,
+    preview_key,
+)
 from app.marketplace.store import MarketplaceStore
 from app.shards.service import ShardLedgerService
 
@@ -32,9 +43,15 @@ logger = logging.getLogger(__name__)
 
 
 class MarketplaceService:
-    def __init__(self, store: MarketplaceStore, shards: ShardLedgerService) -> None:
+    def __init__(
+        self,
+        store: MarketplaceStore,
+        shards: ShardLedgerService,
+        assets: MarketplaceAssetStorage | None = None,
+    ) -> None:
         self._store = store
         self._shards = shards
+        self._assets = assets
 
     def create_draft(
         self,
@@ -172,6 +189,112 @@ class MarketplaceService:
     def liked_listing_ids(self, user: User) -> list[str]:
         """내가 좋아요한 상품 id. **관계만** 돌려준다 — 내부 userId를 담지 않는다."""
         return sorted(x.listing_id for x in self._store.likes(user.id))
+
+    # MARK: - snapshot 업로드 (B-7F)
+
+    def create_snapshot(
+        self, user: User, *, content_type: str, package: SnapshotPackage
+    ) -> Snapshot:
+        """asset을 먼저 올리고 **성공한 뒤에만** Firestore 문서를 만든다.
+
+        순서가 핵심이다 — 반쪽 업로드로 끝나면 문서가 없으므로 listing이 그것을
+        참조할 수 없다. 남은 GCS object는 orphan이고 **best-effort로 치운다**
+        (실패해도 경제와 권리는 안전하다).
+
+        `snapshotId` · `sellerUserId` · checksum · object key를 **서버가 만든다.**
+        """
+        try:
+            kind = ContentType(content_type)
+        except ValueError as error:
+            raise InvalidListing("contentType") from error
+        if self._assets is None:
+            raise AssetStorageUnavailable("marketplace asset bucket is not configured")
+
+        snapshot_id = Snapshot.new_id()
+        keys = [
+            (manifest_key(snapshot_id), package.manifest, "application/json"),
+            (preview_key(snapshot_id), package.preview, "image/png"),
+        ] + [
+            (asset_key(snapshot_id, asset_id), data, "image/png")
+            for asset_id, data in sorted(package.assets.items())
+        ]
+
+        written: list[str] = []
+        try:
+            for key, data, content in keys:
+                self._assets.put(key, data, content)
+                written.append(key)
+        except Exception:
+            for key in written:
+                self._assets.delete(key)
+            raise
+
+        snapshot = self._store.create_snapshot(
+            Snapshot(
+                id=snapshot_id,
+                seller_user_id=user.id,
+                content_type=kind,
+                manifest_checksum=package.manifest_checksum,
+                asset_count=len(package.assets),
+                total_bytes=package.total_bytes,
+            )
+        )
+        logger.info(
+            "marketplace_snapshot_created type=%s assets=%d bytes=%d snapshot=%s",
+            kind.value, snapshot.asset_count, snapshot.total_bytes,
+            snapshot.manifest_checksum[:12],
+        )
+        return snapshot
+
+    # MARK: - 전달 (B-7F)
+
+    def preview(self, listing_id: str):
+        """공개 미리보기. **`published`만** — draft · unlisted는 없는 것처럼 404다."""
+        listing = self._store.get_published(listing_id)
+        snapshot = self._complete_snapshot(listing.snapshot_id)
+        return self._read(preview_key(snapshot.id))
+
+    def template(self, user: User, listing_id: str):
+        """원본 템플릿. **판매자 또는 소유자만.**
+
+        `published`를 요구하지 않는다 — 판매자가 내려도 산 사람은 받아야 한다.
+        구경만 한 사람은 어떤 경로로도 받을 수 없다.
+        """
+        listing = self._store.any_listing(listing_id)
+        is_seller = listing.seller_user_id == user.id
+        if not is_seller and self._store.ownership(listing_id, user.id) is None:
+            # 없는 것과 권한 없는 것을 구분해 알려주지 않는다.
+            raise ListingNotFound(listing_id)
+
+        snapshot = self._complete_snapshot(listing.snapshot_id)
+        return self._read(manifest_key(snapshot.id))
+
+    def template_asset(self, user: User, listing_id: str, asset_id: str):
+        """템플릿이 참조하는 이미지 하나. 권한 규칙은 `template`과 같다."""
+        listing = self._store.any_listing(listing_id)
+        if listing.seller_user_id != user.id and self._store.ownership(listing_id, user.id) is None:
+            raise ListingNotFound(listing_id)
+
+        snapshot = self._complete_snapshot(listing.snapshot_id)
+        return self._read(asset_key(snapshot.id, asset_id))
+
+    def _complete_snapshot(self, snapshot_id: str) -> Snapshot:
+        """**불완전한 snapshot으로는 아무것도 내보내지 않는다.**
+
+        B-7C 시절 fixture처럼 asset 없이 만들어진 문서가 있을 수 있다 —
+        거짓 미리보기를 만들지 않고 없는 것으로 취급한다.
+        """
+        snapshot = self._store.snapshot_for_delivery(snapshot_id)
+        if not snapshot.is_complete:
+            logger.error("marketplace_snapshot_incomplete")
+            raise SnapshotNotFound(snapshot_id)
+        return snapshot
+
+    def _read(self, key: str):
+        if self._assets is None:
+            # 404가 아니다 — 상품은 있고 우리 설정이 없다.
+            raise AssetStorageUnavailable("marketplace asset bucket is not configured")
+        return self._assets.get(key)
 
     @staticmethod
     def fee(content_type: ContentType) -> int:

@@ -20,7 +20,7 @@ Backend repository for 꾸미러.
 - purchase / ownership
 - seller shard settlement
 
-## Current Implementation (Phase B-7E.1 완료 · 미배포)
+## Current Implementation (Phase B-7F 완료 · 미배포)
 
 FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth +
 server-authoritative 조각 원장 + 하루 한 번 출석 + AdMob rewarded SSV + AI 스티커 생성 +
@@ -59,14 +59,17 @@ app/shards/attendance.py  KST 날짜 규칙 + 출석 지급
 app/core/config.py   환경변수 + logging
 app/api/iap.py       POST /users/me/iap/shards (body는 signedTransaction 하나)
 app/api/app_store.py POST /app-store/notifications/v2 (Apple 서명이 곧 인증)
-app/api/marketplace.py  GET(공개) /marketplace/listings · {id}
+app/api/marketplace.py  GET(공개) /marketplace/listings · {id} · {id}/preview
                      POST /marketplace/listings · {id}/publish · {id}/unpublish · {id}/purchase
+                     POST /marketplace/snapshots (multipart)
+                     GET  /marketplace/listings/{id}/template · template/assets/{assetId}
                      PUT/DELETE /marketplace/listings/{id}/like
                      GET /users/me/marketplace/purchases · likes
 app/marketplace/models.py  Listing · Snapshot · 상태 · 등록비 정책
 app/marketplace/store.py   MarketplaceStore protocol + in-memory
 app/marketplace/firestore_store.py  등록비 + 게시가 **한 transaction**
 app/marketplace/service.py  client가 정할 수 있는 것과 서버가 정하는 것의 경계
+app/marketplace/assets.py  **GCS를 아는 유일한 파일.** 검증 + create-only 업로드
 app/iap/notifications.py  알림 검증 · 분류 (조각은 만지지 않고 REFUND만 넘긴다)
 app/iap/refunds.py   환불 회수 · 되돌리기 정책 (record가 금액 authority)
 app/iap/models.py    catalog(10/50/100) · 전역 claim id · appAccountToken 대조
@@ -816,6 +819,78 @@ republish는 `likeCount`를 건드리지 않고, 좋아요는 `downloadCount`를
 `tests/test_marketplace.py`가 위 전부를 고정한다. 여기에는 **최소 fake db로
 `FirestoreMarketplaceStore`를 직접 돌리는 harness**가 있어, 실제 `@firestore.transactional`
 재시도 loop에서 count가 두 번 오르지 않는 것을 확인한다(production Firestore를 부르지 않는다).
+
+#### Snapshot asset (B-7F)
+
+```
+POST /marketplace/snapshots                              (인증, multipart/form-data)
+GET  /marketplace/listings/{id}/preview                  (**공개**)
+GET  /marketplace/listings/{id}/template                 (인증, 판매자 또는 구매자)
+GET  /marketplace/listings/{id}/template/assets/{assetId}(인증, 같은 권한)
+```
+
+**새 template schema를 만들지 않았다.** client를 먼저 읽고 확인한 것:
+
+- `MyMirror` · `StickerProject`에 이미 완전한 `Codable`이 있다
+- 모델에 **파일 경로가 없다** — 이미지는 `assetID`(UUID)로만 참조한다
+- master geometry(1080 × 2340, insets)는 **상수**이고 좌표는 0…1 정규화다
+
+그래서 package는 *client가 이미 저장하는 JSON + `assetID` 이름의 PNG*다.
+서버는 manifest를 **해석하지 않는다** — 검증만 하고 바이트로 보관한다.
+꾸미러 geometry가 문서에 없으므로 버전이 갈려도 좌표가 뒤틀리지 않는다.
+
+저장 배치 — snapshotId마다 독립 prefix다:
+
+```
+marketplace/snapshots/{snapshotId}/manifest.json
+marketplace/snapshots/{snapshotId}/preview.png
+marketplace/snapshots/{snapshotId}/assets/{assetId}.png
+```
+
+**불변성은 저장소가 보증한다.** 업로드는 전부 `if_generation_match=0`이다 —
+이미 있으면 412이고 우리는 `AssetAlreadyExists`로 바꾼다. snapshotId는 서버가 만들고,
+덮어쓰기 · 수정 · 삭제 API가 **없다.** 구매자의 권리가 이 바이트에 걸려 있어서,
+판매자가 나중에 내용을 바꾸면 산 것과 다른 것을 갖게 된다.
+
+**문서를 마지막에 쓴다.** object를 전부 올린 다음 Firestore snapshot 문서를 만든다.
+중간에 실패하면 문서가 없고, 문서가 없으면 어떤 listing도 그 snapshot을 참조할 수 없다.
+이미 올라간 object는 best-effort로 치우고, 남더라도 참조 불가능한 orphan이다 —
+**반쪽 snapshot이 상품이 되는 것보다 orphan이 낫다.**
+
+검증(신뢰 경계) — 확장자·Content-Type을 믿지 않고 **바이트를 본다**:
+
+| 대상 | 규칙 |
+|---|---|
+| manifest | UTF-8 JSON object · ≤ 256 KB |
+| 이미지 | `\x89PNG\r\n\x1a\n` magic · 각 ≤ 2 MB |
+| snapshot 전체 | ≤ 10 MB · asset ≤ 32개 |
+| `assetId` | UUID 형식만. `../` · `/`가 애초에 통과하지 못한다 |
+| manifest 내용 | `../` · `file://` · `http(s)://` · `data:` · `<script` 금지 |
+| 선언 ↔ 업로드 | `assetIds`와 실제 업로드가 **정확히 일치**해야 한다 |
+
+`manifest_checksum`은 **서버가 계산한다** — client가 보낸 값을 믿지 않는다.
+`assetId`가 UUID로 제한되므로 경로 조작은 문자 수준에서 불가능하다.
+
+전달 규칙:
+
+- **미리보기는 공개다.** `published`만 — draft · unlisted · 없는 것 모두 404.
+  로그인 없이 상점을 구경할 수 있어야 한다(Core Product Policy)
+- **원본은 판매자 또는 구매자만.** 구경한 사람은 어떤 endpoint로도 원본을 못 받는다
+- **원본은 `published`를 요구하지 않는다** — 판매자가 내려도 산 사람은 계속 받는다.
+  이미 지불했고, 판매자의 나중 결정으로 회수되지 않는다
+- 무료 상품도 소유권이 생기므로 규칙이 같다
+- **signed URL을 만들지 않는다.** URL 자체가 credential이 되고 유출되면 회수할 수 없다.
+  우리가 읽어서 흘려보낸다. 응답에 bucket · `gs://` · object key가 없다
+- **조회가 counter를 올리지 않는다.** preview · template · asset을 10번 받아도
+  `downloadCount` · `likeCount`는 그대로다. `downloadCount`는 소유권 획득뿐이다
+
+bucket은 **`MARKETPLACE_ASSET_BUCKET`로 따로 받는다.**
+**AI 결과 bucket(`AI_RESULT_BUCKET`)을 재사용하지 않는다** — 그쪽은 7일 lifecycle이고,
+판매한 템플릿이 7일 뒤 사라지면 구매자가 산 것을 잃는다(환불로도 되돌릴 수 없다).
+비어 있으면 **fail closed**다: 업로드·전달이 503이다. `AssetStorageUnavailable`을
+`AssetNotFound`와 구분한다 — 404로 뭉개면 운영자가 설정 누락을 "데이터 없음"으로 오진한다.
+
+**client production code는 아직 붙이지 않았다**(B-7G).
 
 ### Admin Shard CLI (A-2) — 운영자 조정은 CLI 하나뿐
 

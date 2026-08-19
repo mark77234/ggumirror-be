@@ -135,6 +135,19 @@ class MarketplaceStore(Protocol):
     def likes(self, user_id: str) -> list[Like]:
         """내가 좋아요한 것 전부."""
 
+    def create_snapshot(self, snapshot: Snapshot) -> Snapshot:
+        """**asset이 전부 올라간 뒤에만** 부른다 — 이 문서가 완결의 증거다."""
+
+    def snapshot_for_delivery(self, snapshot_id: str) -> Snapshot:
+        """전달용 조회. 주인을 묻지 않는다 — 권한은 listing/소유권이 판단한다."""
+
+    def ownership(self, listing_id: str, user_id: str) -> Ownership | None:
+        """그 사람이 그 상품을 갖고 있는가. 템플릿 접근 판단에 쓴다."""
+
+    def any_listing(self, listing_id: str) -> Listing:
+        """상태·주인과 무관하게 listing 하나. **템플릿 전달에만** 쓴다 —
+        판매자가 내려도 기존 구매자는 받아야 하기 때문이다."""
+
 
 class InMemoryMarketplaceStore:
     """test / local용. 실제 Firestore transaction의 **의미**를 흉내 낸다.
@@ -146,7 +159,7 @@ class InMemoryMarketplaceStore:
     def __init__(self, shard_store) -> None:
         self.listings: dict[str, Listing] = {}
         self.snapshots: dict[str, Snapshot] = {}
-        self.ownership: dict[str, Ownership] = {}
+        self.ownership_records: dict[str, Ownership] = {}
         self.likes_by_id: dict[str, Like] = {}
         self._shard_store = shard_store
         self._lock = threading.RLock()
@@ -276,7 +289,7 @@ class InMemoryMarketplaceStore:
             # 읽기를 먼저 한다 — Firestore 구현과 같은 순서다.
             listing = self.get_published(listing_id)
             key = ownership_id(buyer_user_id, listing_id)
-            owned = self.ownership.get(key)
+            owned = self.ownership_records.get(key)
 
             if owned is not None:
                 # 이미 갖고 있다. **아무것도 쓰지 않는다** — counter도 올리지 않는다.
@@ -323,11 +336,11 @@ class InMemoryMarketplaceStore:
                 counted = self._with_download_count(listing, listing.download_count + 1)
 
                 def write_ownership():
-                    if key in self.ownership:
+                    if key in self.ownership_records:
                         # `create` 의미다 — 조용히 덮어쓰지 않는다.
                         raise KeyError(key)
-                    self.ownership[key] = ownership
-                    return lambda: self.ownership.pop(key, None)
+                    self.ownership_records[key] = ownership
+                    return lambda: self.ownership_records.pop(key, None)
 
                 def write_counter():
                     previous = self.listings.get(listing_id)
@@ -344,7 +357,7 @@ class InMemoryMarketplaceStore:
             )
 
     def ownerships(self, user_id: str) -> list[Ownership]:
-        return [x for x in self.ownership.values() if x.user_id == user_id]
+        return [x for x in self.ownership_records.values() if x.user_id == user_id]
 
     # MARK: - 내부
 
@@ -418,6 +431,30 @@ class InMemoryMarketplaceStore:
 
     def likes(self, user_id: str) -> list[Like]:
         return [x for x in self.likes_by_id.values() if x.user_id == user_id]
+
+    # MARK: - snapshot / 전달 (B-7F)
+
+    def create_snapshot(self, snapshot: Snapshot) -> Snapshot:
+        with self._lock:
+            if snapshot.id in self.snapshots:
+                raise SnapshotNotFound(snapshot.id)   # 같은 자리를 덮어쓰지 않는다
+            self.snapshots[snapshot.id] = snapshot
+            return snapshot
+
+    def snapshot_for_delivery(self, snapshot_id: str) -> Snapshot:
+        found = self.snapshots.get(snapshot_id)
+        if found is None:
+            raise SnapshotNotFound(snapshot_id)
+        return found
+
+    def ownership(self, listing_id: str, user_id: str) -> Ownership | None:
+        return self.ownership_records.get(ownership_id(user_id, listing_id))
+
+    def any_listing(self, listing_id: str) -> Listing:
+        found = self.listings.get(listing_id)
+        if found is None:
+            raise ListingNotFound(listing_id)
+        return found
 
 
 def _checked_like_count(listing: Listing) -> int:

@@ -14,3 +14,8 @@ google-cloud-storage==3.4.1
 # 체인·만료·폐기 판단을 우리가 지면 틀렸을 때 조각이 공짜가 된다.
 # App Store Server **API**는 부르지 않으므로 .p8 / issuerId / keyId가 필요 없다.
 app-store-server-library==3.1.2
+
+# Marketplace snapshot 업로드(multipart/form-data)에 필요하다.
+# multipart 파싱을 직접 만들지 않는다 — 경계 처리·인코딩·크기 제한을 우리가 지면
+# 틀렸을 때 그대로 취약점이 된다. FastAPI가 권장하는 표준 구현을 쓴다.
+python-multipart==0.0.32

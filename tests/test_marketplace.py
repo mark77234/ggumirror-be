@@ -482,16 +482,16 @@ def test_publish_uses_a_fresh_context_each_attempt():
     assert decorator < context_line, "context를 transactional callable 밖에서 만들었다"
 
 
-def test_no_gcs_yet():
-    """§23 — 실제 asset 저장은 B-7F다."""
+def test_gcs_is_confined_to_the_asset_module():
+    """§B-7F — GCS를 아는 파일은 `assets.py` 하나다. domain이 bucket을 모른다."""
     from pathlib import Path
 
     root = Path(__file__).resolve().parent.parent
     for path in ["app/marketplace/models.py", "app/marketplace/store.py",
-                 "app/marketplace/firestore_store.py", "app/marketplace/service.py"]:
-        code = _code_only((root / path).read_text())
-        for banned in ["storage", "bucket", "signed_url", "generate_signed_url"]:
-            assert banned not in code.lower(), f"{path}: GCS를 들였다 ({banned})"
+                 "app/marketplace/firestore_store.py"]:
+        code = _code_only((root / path).read_text()).lower()
+        for banned in ["bucket", "google.cloud import storage", "signed_url"]:
+            assert banned not in code, f"{path}: GCS를 안다 ({banned})"
 
 
 # MARK: - 공개 조회 (B-7D)
@@ -801,19 +801,12 @@ def test_mutations_still_require_auth(client):
     assert client.post("/marketplace/listings/abc/unpublish").status_code == 401
 
 
-def test_no_asset_routes(client):
-    """§18 — asset 전달은 B-7F다. 가짜 preview URL도 만들지 않는다.
-
-    (purchase는 B-7E에서 구현됐다 — 인증 test가 따로 있다.)
-    """
-    for path in [
-        "/marketplace/listings/abc/preview",
-        "/marketplace/listings/abc/template",
-        "/marketplace/listings/abc/image",
-        "/marketplace/listings/abc/like",
-    ]:
-        assert client.get(path).status_code in {404, 405}
-        assert client.post(path).status_code in {404, 405}
+def test_public_listing_dto_has_no_asset_url(client, store):
+    """공개 DTO에 가짜 preview URL을 넣지 않는다 — 미리보기는 별도 endpoint다."""
+    published(store, "live")
+    body = client.get("/marketplace/listings/live").json()
+    for banned in ["previewUrl", "preview_url", "templateUrl", "url", "gs://", "bucket"]:
+        assert banned not in body
 
 
 def test_no_n_plus_one_snapshot_reads():
@@ -953,7 +946,7 @@ def test_insufficient_shards_changes_nothing(store, shards, service, shard_store
 
     assert shard_store.wallet(BUYER).balance == 29
     assert shard_store.wallet(SELLER).balance == 10
-    assert store.ownership == {}
+    assert store.ownership_records == {}
     assert store.listings[listing.id].download_count == 5
     assert entries(shard_store, buy_reason) == []
     assert entries(shard_store, sell_reason) == []
@@ -967,7 +960,7 @@ def test_self_purchase_is_refused(store, shards, service, shard_store):
         service.purchase(user(SELLER), listing.id)
 
     assert shard_store.wallet(SELLER).balance == 100
-    assert store.ownership == {}
+    assert store.ownership_records == {}
     assert store.listings[listing.id].download_count == 4
 
 
@@ -981,7 +974,7 @@ def test_unavailable_listings_cannot_be_bought(store, shards, service, shard_sto
         service.purchase(user(BUYER), "hidden")
 
     assert shard_store.wallet(BUYER).balance == 100
-    assert store.ownership == {}
+    assert store.ownership_records == {}
 
 
 # MARK: - 멱등 (§11, §12)
@@ -1006,7 +999,7 @@ def test_repeated_purchase_acquires_once(store, shards, service, shard_store, ti
     assert shard_store.wallet(SELLER).balance == 30
     assert len(entries(shard_store, buy_reason)) == 1
     assert len(entries(shard_store, sell_reason)) == 1
-    assert len(store.ownership) == 1
+    assert len(store.ownership_records) == 1
     assert store.listings[listing.id].download_count == 2
 
 
@@ -1032,7 +1025,7 @@ def test_different_listings_are_different_purchases(store, shards, service, shar
     service.purchase(user(BUYER), second.id)
 
     assert shard_store.wallet(BUYER).balance == 40
-    assert len(store.ownership) == 2
+    assert len(store.ownership_records) == 2
 
 
 # MARK: - 동시성 (§14, §15, §16)
@@ -1058,7 +1051,7 @@ def test_same_buyer_concurrency_acquires_once(store, shards, service, shard_stor
     assert sum(acquired) == 1, f"소유권이 {sum(acquired)}번 생겼다"
     assert shard_store.wallet(BUYER).balance == 70
     assert shard_store.wallet(SELLER).balance == 30
-    assert len(store.ownership) == 1
+    assert len(store.ownership_records) == 1
     assert store.listings[listing.id].download_count == 8, "counter가 여러 번 올랐다"
 
 
@@ -1080,7 +1073,7 @@ def test_different_buyers_concurrency_counts_each(store, shards, service, shard_
     for t in threads:
         t.join()
 
-    assert len(store.ownership) == 8
+    assert len(store.ownership_records) == 8
     for buyer in buyers:
         assert shard_store.wallet(buyer).balance == 90
     assert shard_store.wallet(SELLER).balance == 80, "판매 대금이 유실됐다"
@@ -1110,7 +1103,7 @@ def test_balance_limits_concurrent_purchases(store, shards, service, shard_store
 
     assert sum(outcome) == 1
     assert shard_store.wallet(BUYER).balance == 0, "잔액이 음수가 됐다"
-    assert len(store.ownership) == 1
+    assert len(store.ownership_records) == 1
     assert shard_store.wallet(SELLER).balance == 30
 
 
@@ -1143,7 +1136,7 @@ def test_purchase_after_unpublish_changes_nothing(store, shards, service, shard_
         service.purchase(user(BUYER), listing.id)
 
     assert shard_store.wallet(BUYER).balance == 100
-    assert store.ownership == {}
+    assert store.ownership_records == {}
 
 
 # MARK: - 원자성 (§25)
@@ -1160,7 +1153,7 @@ def test_ownership_failure_rolls_back_the_money(store, shards, service, shard_st
         def __setitem__(self, key, value):
             raise RuntimeError("ownership write failed")
 
-    store.ownership = FailingOwnership(store.ownership)
+    store.ownership_records = FailingOwnership(store.ownership_records)
 
     with pytest.raises(RuntimeError):
         service.purchase(user(BUYER), listing.id)
@@ -1188,7 +1181,7 @@ def test_counter_failure_rolls_back_everything(store, shards, service, shard_sto
 
     assert shard_store.wallet(BUYER).balance == 100
     assert shard_store.wallet(SELLER).balance == 0
-    assert store.ownership == {}
+    assert store.ownership_records == {}
 
 
 def test_ownership_is_never_overwritten(store, shards, service):
@@ -1353,16 +1346,16 @@ def test_no_counter_or_price_spoofing_in_source():
     assert "downloadCount +" not in api and "download_count +" not in api
 
 
-def test_still_no_gcs_or_asset_delivery():
-    """§29 — asset 전달은 B-7F다."""
+def test_no_signed_urls_anywhere():
+    """§7 — signed URL을 delivery 수단으로 쓰지 않는다. URL 자체가 credential이 된다."""
     from pathlib import Path
 
     root = Path(__file__).resolve().parent.parent
-    for path in ["app/marketplace/models.py", "app/marketplace/store.py",
-                 "app/marketplace/firestore_store.py", "app/marketplace/service.py"]:
-        code = _code_only((root / path).read_text()).lower()
-        for banned in ["bucket", "signed_url", "generate_signed_url", "gcs"]:
-            assert banned not in code, f"{path}: {banned}"
+    for path in ["app/marketplace/assets.py", "app/marketplace/service.py",
+                 "app/api/marketplace.py"]:
+        code = _code_only((root / path).read_text())
+        for banned in ["generate_signed_url", "signed_url", "sign_blob"]:
+            assert banned not in code, f"{path}: signed URL을 만든다 ({banned})"
 
 
 # MARK: - 좋아요 (B-7E.1)
@@ -1944,3 +1937,595 @@ def test_firestore_self_like_is_refused(firestore_like_store):
         store.like("live", SELLER)
 
     assert db.data[LISTINGS]["live"]["likeCount"] == 0
+
+
+# MARK: - snapshot asset (B-7F)
+#
+# 보는 것 셋:
+# 1. 같은 snapshotId를 **어느 경로로도 덮어쓸 수 없는가**
+# 2. 판매자가 내려도 산 사람이 계속 받는가
+# 3. 소유권 없는 사람이 원본을 **어떤 endpoint로도** 못 받는가
+
+import json as _json   # noqa: E402
+
+from app.marketplace.assets import (   # noqa: E402
+    MAX_IMAGE_BYTES,
+    MAX_MANIFEST_BYTES,
+    PNG_MAGIC,
+    AssetAlreadyExists,
+    AssetError,
+    AssetNotFound,
+    AssetTooLarge,
+    InMemoryMarketplaceAssetStorage,
+    asset_key,
+    checked_package,
+    manifest_key,
+    preview_key,
+)
+from app.marketplace.models import Snapshot   # noqa: E402
+
+ASSET_A = "A0000001-0000-4000-A000-000000000001"
+PNG = PNG_MAGIC + b"pretend-pixels"
+
+
+def manifest_bytes(asset_ids: list[str] | None = None, **extra) -> bytes:
+    """client Codable JSON을 흉내 낸 최소 문서. 서버는 이것을 해석하지 않는다."""
+    document = {
+        "schemaVersion": 2,
+        "id": "mirror-1",
+        "name": "내 거울",
+        "style": {"frame": {"red": 1.0, "green": 0.9, "blue": 0.9, "alpha": 1.0}},
+        "stickers": [],
+        "assetIds": asset_ids or [],
+    }
+    document.update(extra)
+    return _json.dumps(document, ensure_ascii=False).encode()
+
+
+@pytest.fixture
+def storage() -> InMemoryMarketplaceAssetStorage:
+    return InMemoryMarketplaceAssetStorage()
+
+
+@pytest.fixture
+def asset_service(store, shards, storage) -> MarketplaceService:
+    return MarketplaceService(store, shards, assets=storage)
+
+
+def upload(
+    service: MarketplaceService,
+    *,
+    kind: ContentType = ContentType.MIRROR,
+    asset_ids: list[str] | None = None,
+    owner: str = SELLER,
+) -> Snapshot:
+    ids = asset_ids or []
+    package = checked_package(
+        manifest=manifest_bytes(ids),
+        preview=PNG,
+        assets={x: PNG for x in ids},
+    )
+    return service.create_snapshot(user(owner), content_type=kind.value, package=package)
+
+
+def listing_with_snapshot(store, snapshot: Snapshot, *, price: int = 30,
+                          status: ListingStatus = ListingStatus.PUBLISHED) -> Listing:
+    listing = published(store, "with-asset", kind=snapshot.content_type, price=price, status=status)
+    replaced = type(listing)(**{**listing.__dict__, "snapshot_id": snapshot.id})
+    store.listings[listing.id] = replaced
+    return replaced
+
+
+# MARK: - 업로드 (§8, §12, §13)
+
+
+@pytest.mark.parametrize("kind", list(ContentType))
+def test_snapshot_upload_stores_every_object(asset_service, storage, kind):
+    snapshot = upload(asset_service, kind=kind, asset_ids=[ASSET_A])
+
+    assert snapshot.content_type is kind
+    assert snapshot.seller_user_id == SELLER
+    assert snapshot.asset_count == 1
+    assert snapshot.total_bytes > 0
+    assert snapshot.is_complete
+
+    assert manifest_key(snapshot.id) in storage.objects
+    assert preview_key(snapshot.id) in storage.objects
+    assert asset_key(snapshot.id, ASSET_A) in storage.objects
+    assert storage.objects[preview_key(snapshot.id)].content_type == "image/png"
+    assert storage.objects[manifest_key(snapshot.id)].content_type == "application/json"
+
+
+def test_snapshot_id_is_server_generated(asset_service):
+    first = upload(asset_service)
+    second = upload(asset_service)
+    assert first.id != second.id
+    assert len(first.id) == 36
+
+
+def test_checksum_is_server_computed(asset_service):
+    import hashlib
+
+    package = checked_package(manifest=manifest_bytes(), preview=PNG, assets={})
+    snapshot = asset_service.create_snapshot(
+        user(), content_type="mirror", package=package
+    )
+    assert snapshot.manifest_checksum == hashlib.sha256(manifest_bytes()).hexdigest()
+
+
+def test_snapshot_binds_to_the_uploader(asset_service, store):
+    snapshot = upload(asset_service, owner=SELLER)
+    assert store.snapshots[snapshot.id].seller_user_id == SELLER
+
+
+def test_unknown_content_type_is_refused(asset_service, storage):
+    package = checked_package(manifest=manifest_bytes(), preview=PNG, assets={})
+    with pytest.raises(InvalidListing):
+        asset_service.create_snapshot(user(), content_type="album", package=package)
+    assert storage.objects == {}, "거절됐는데 object가 올라갔다"
+
+
+# MARK: - 불변성 (§3, §6)
+
+
+def test_storage_refuses_to_overwrite(storage):
+    storage.put("k", b"first", "image/png")
+    with pytest.raises(AssetAlreadyExists):
+        storage.put("k", b"second", "image/png")
+    assert storage.get("k").data == b"first"
+
+
+def test_snapshot_objects_never_share_a_key(asset_service, storage):
+    first = upload(asset_service, asset_ids=[ASSET_A])
+    second = upload(asset_service, asset_ids=[ASSET_A])
+
+    assert manifest_key(first.id) != manifest_key(second.id)
+    assert asset_key(first.id, ASSET_A) != asset_key(second.id, ASSET_A)
+    assert len(storage.objects) == 6
+
+
+def test_gcs_storage_uses_create_only_precondition():
+    """`if_generation_match=0` — 저장소 수준에서 덮어쓰기를 막는다."""
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parent.parent / "app/marketplace/assets.py"
+    ).read_text()
+    body = source[source.index("class GCSMarketplaceAssetStorage"):]
+    assert "if_generation_match=0" in body
+    assert "PreconditionFailed" in body
+
+
+def test_no_snapshot_delete_api(client):
+    """§29 — 구매자 권리와 묶여 있으므로 삭제 API를 만들지 않는다."""
+    for path in ["/marketplace/snapshots/abc", "/marketplace/snapshots"]:
+        assert client.delete(path).status_code in {404, 405}
+
+
+# MARK: - 반쪽 업로드 (§14)
+
+
+def test_partial_upload_leaves_no_snapshot_document(store, shards, storage):
+    """가장 중요 — object가 반쪽만 올라가면 **문서를 만들지 않는다.**
+
+    문서가 없으므로 어떤 listing도 그 snapshot을 참조할 수 없다.
+    """
+    class FailsOnPreview(InMemoryMarketplaceAssetStorage):
+        def put(self, key, data, content_type):
+            if key.endswith("preview.png"):
+                raise AssetError("upload failed")
+            super().put(key, data, content_type)
+
+    failing = FailsOnPreview()
+    service = MarketplaceService(store, shards, assets=failing)
+    package = checked_package(manifest=manifest_bytes(), preview=PNG, assets={})
+
+    with pytest.raises(AssetError):
+        service.create_snapshot(user(), content_type="mirror", package=package)
+
+    assert store.snapshots == {}, "반쪽 snapshot이 완료로 기록됐다"
+    # 이미 올라간 것은 best-effort로 치운다.
+    assert failing.objects == {}, "orphan이 남았다"
+
+
+def test_incomplete_legacy_snapshot_delivers_nothing(store, shards, storage, service):
+    """§26 — B-7C 시절 fixture(asset 없는 문서)로는 미리보기를 만들지 않는다."""
+    legacy = Snapshot(id="legacy", seller_user_id=SELLER, content_type=ContentType.MIRROR)
+    store.snapshots["legacy"] = legacy
+    listing = published(store, "old", price=0)
+    store.listings["old"] = type(listing)(**{**listing.__dict__, "snapshot_id": "legacy"})
+
+    asset_service = MarketplaceService(store, shards, assets=storage)
+    with pytest.raises(SnapshotNotFound):
+        asset_service.preview("old")
+
+
+# MARK: - 검증 (§10, §11, §25)
+
+
+def test_oversized_manifest_is_refused():
+    with pytest.raises(AssetTooLarge):
+        checked_package(manifest=b"x" * (MAX_MANIFEST_BYTES + 1), preview=PNG, assets={})
+
+
+def test_oversized_image_is_refused():
+    big = PNG_MAGIC + b"x" * MAX_IMAGE_BYTES
+    with pytest.raises(AssetTooLarge):
+        checked_package(manifest=manifest_bytes(), preview=big, assets={})
+    with pytest.raises(AssetTooLarge):
+        checked_package(
+            manifest=manifest_bytes([ASSET_A]), preview=PNG, assets={ASSET_A: big}
+        )
+
+
+def test_oversized_snapshot_is_refused():
+    from app.marketplace.assets import MAX_SNAPSHOT_BYTES
+
+    ids = [f"A000000{i}-0000-4000-A000-000000000001" for i in range(1, 9)]
+    chunk = PNG_MAGIC + b"x" * (MAX_SNAPSHOT_BYTES // 8)
+    with pytest.raises(AssetTooLarge):
+        checked_package(
+            manifest=manifest_bytes(ids), preview=PNG, assets={x: chunk for x in ids}
+        )
+
+
+@pytest.mark.parametrize("data", [b"notpng", b"", b"GIF89a"])
+def test_non_png_images_are_refused(data):
+    """확장자를 믿지 않는다 — 실제 바이트를 본다."""
+    with pytest.raises((AssetError, AssetTooLarge)):
+        checked_package(manifest=manifest_bytes(), preview=data, assets={})
+
+
+@pytest.mark.parametrize("manifest", [b"not json", b"[]", b"\xff\xfe invalid", b""])
+def test_malformed_manifest_is_refused(manifest):
+    with pytest.raises((AssetError, AssetTooLarge)):
+        checked_package(manifest=manifest, preview=PNG, assets={})
+
+
+@pytest.mark.parametrize(
+    "poison",
+    [
+        "../../etc/passwd",
+        "..\\\\windows",
+        "file:///etc/passwd",
+        "http://evil.example/x.png",
+        "https://evil.example/x.png",
+        "javascript:alert(1)",
+        "data:image/png;base64,AAAA",
+        "<script>alert(1)</script>",
+    ],
+)
+def test_manifest_cannot_reference_outside_content(poison):
+    """§25 — 템플릿은 앱 안의 안전한 local 콘텐츠만 표현한다."""
+    with pytest.raises(AssetError):
+        checked_package(manifest=manifest_bytes(note=poison), preview=PNG, assets={})
+
+
+@pytest.mark.parametrize("asset_id", ["../evil", "a/b", "not-a-uuid", "", "..%2f"])
+def test_asset_ids_must_be_uuids(asset_id):
+    """경로 조작이 성립할 문자가 애초에 통과하지 못한다."""
+    with pytest.raises(AssetError):
+        checked_package(
+            manifest=manifest_bytes([asset_id]), preview=PNG, assets={asset_id: PNG}
+        )
+    with pytest.raises(AssetError):
+        asset_key("snap", asset_id)
+
+
+def test_declared_and_uploaded_assets_must_match():
+    """빠진 이미지가 있으면 다른 기기에서 복원할 때 조용히 깨진다."""
+    with pytest.raises(AssetError):
+        checked_package(manifest=manifest_bytes([ASSET_A]), preview=PNG, assets={})
+    with pytest.raises(AssetError):
+        checked_package(manifest=manifest_bytes([]), preview=PNG, assets={ASSET_A: PNG})
+
+
+# MARK: - 공개 미리보기 (§16)
+
+
+def test_published_preview_is_public(asset_service, store):
+    snapshot = upload(asset_service)
+    listing_with_snapshot(store, snapshot)
+
+    stored = asset_service.preview("with-asset")
+
+    assert stored.data == PNG
+    assert stored.content_type == "image/png"
+
+
+@pytest.mark.parametrize("status", [ListingStatus.DRAFT, ListingStatus.UNLISTED])
+def test_hidden_listing_has_no_public_preview(asset_service, store, status):
+    snapshot = upload(asset_service)
+    listing = listing_with_snapshot(store, snapshot, status=status)
+    if status is ListingStatus.DRAFT:
+        store.listings[listing.id] = type(listing)(
+            **{**listing.__dict__, "published_at": None}
+        )
+
+    with pytest.raises(ListingNotFound):
+        asset_service.preview(listing.id)
+
+
+def test_missing_listing_has_no_preview(asset_service):
+    with pytest.raises(ListingNotFound):
+        asset_service.preview("nope")
+
+
+# MARK: - 템플릿 전달 (§17 ~ §20)
+
+
+def test_seller_can_fetch_the_template(asset_service, store):
+    snapshot = upload(asset_service)
+    listing_with_snapshot(store, snapshot)
+
+    stored = asset_service.template(user(SELLER), "with-asset")
+
+    assert _json.loads(stored.data)["name"] == "내 거울"
+
+
+def test_owner_can_fetch_the_template(asset_service, store, shards):
+    seed(shards, 100, who=BUYER)
+    snapshot = upload(asset_service)
+    listing_with_snapshot(store, snapshot)
+    asset_service.purchase(user(BUYER), "with-asset")
+
+    stored = asset_service.template(user(BUYER), "with-asset")
+
+    assert _json.loads(stored.data)["schemaVersion"] == 2
+
+
+def test_free_owner_can_fetch_the_template(asset_service, store):
+    """§19 — 무료도 소유권이 생기므로 규칙이 같다."""
+    snapshot = upload(asset_service)
+    listing_with_snapshot(store, snapshot, price=0)
+    asset_service.purchase(user(BUYER), "with-asset")
+
+    assert asset_service.template(user(BUYER), "with-asset").data
+
+
+def test_stranger_cannot_fetch_the_template(asset_service, store):
+    """§17 — 구경만 한 사람은 원본을 받을 수 없다."""
+    snapshot = upload(asset_service)
+    listing_with_snapshot(store, snapshot)
+
+    # 공개 미리보기는 되지만 원본은 안 된다.
+    assert asset_service.preview("with-asset").data
+    with pytest.raises(ListingNotFound):
+        asset_service.template(user(OTHER), "with-asset")
+    with pytest.raises(ListingNotFound):
+        asset_service.template_asset(user(OTHER), "with-asset", ASSET_A)
+
+
+def test_owner_keeps_access_after_unpublish(asset_service, store, shards):
+    """§18 — 판매자가 내려도 산 사람은 계속 받는다."""
+    seed(shards, 100, who=BUYER)
+    snapshot = upload(asset_service, asset_ids=[ASSET_A])
+    listing_with_snapshot(store, snapshot)
+    asset_service.purchase(user(BUYER), "with-asset")
+
+    asset_service.unpublish(user(SELLER), "with-asset")
+
+    # 공개 미리보기는 사라진다.
+    with pytest.raises(ListingNotFound):
+        asset_service.preview("with-asset")
+    # 하지만 구매자는 그대로 받는다.
+    assert asset_service.template(user(BUYER), "with-asset").data
+    assert asset_service.template_asset(user(BUYER), "with-asset", ASSET_A).data == PNG
+
+
+def test_template_asset_requires_a_known_asset(asset_service, store, shards):
+    seed(shards, 100, who=BUYER)
+    snapshot = upload(asset_service, asset_ids=[ASSET_A])
+    listing_with_snapshot(store, snapshot)
+    asset_service.purchase(user(BUYER), "with-asset")
+
+    with pytest.raises(AssetNotFound):
+        asset_service.template_asset(
+            user(BUYER), "with-asset", "B0000002-0000-4000-A000-000000000002"
+        )
+    with pytest.raises(AssetError):
+        asset_service.template_asset(user(BUYER), "with-asset", "../evil")
+
+
+# MARK: - counter 무영향 (§22, §23)
+
+
+def test_asset_delivery_never_moves_counters(asset_service, store, shards):
+    seed(shards, 100, who=BUYER)
+    snapshot = upload(asset_service, asset_ids=[ASSET_A])
+    listing_with_snapshot(store, snapshot)
+    asset_service.purchase(user(BUYER), "with-asset")
+    asset_service.like(user(LIKER), "with-asset")
+    before = store.listings["with-asset"]
+
+    for _ in range(10):
+        asset_service.preview("with-asset")
+        asset_service.template(user(BUYER), "with-asset")
+        asset_service.template_asset(user(BUYER), "with-asset", ASSET_A)
+
+    after = store.listings["with-asset"]
+    assert after.download_count == before.download_count == 1
+    assert after.like_count == before.like_count == 1
+
+
+# MARK: - listing 연결 (§15)
+
+
+def test_listing_cannot_use_someone_elses_snapshot(asset_service, store):
+    snapshot = upload(asset_service, owner=SELLER)
+
+    with pytest.raises(SnapshotNotFound):
+        asset_service.create_draft(
+            user(OTHER), content_type="mirror", title="훔친 것",
+            description="", price_shards=0, snapshot_id=snapshot.id,
+        )
+
+
+def test_draft_requires_an_uploaded_snapshot(asset_service):
+    with pytest.raises(SnapshotNotFound):
+        asset_service.create_draft(
+            user(), content_type="mirror", title="제목",
+            description="", price_shards=0, snapshot_id="made-up",
+        )
+
+
+# MARK: - HTTP (§21, §24)
+
+
+@pytest.fixture
+def asset_client(store, shard_store, storage):
+    from fastapi.testclient import TestClient
+
+    from app.core.config import Settings
+    from app.main import create_app
+
+    app = create_app(
+        Settings(app_env="local"),
+        shard_store=shard_store,
+        marketplace_store=store,
+        marketplace_assets=storage,
+    )
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_asset_endpoints_require_the_right_auth(asset_client):
+    assert asset_client.post("/marketplace/snapshots").status_code == 401
+    assert asset_client.get("/marketplace/listings/abc/template").status_code == 401
+    assert asset_client.get(
+        "/marketplace/listings/abc/template/assets/" + ASSET_A
+    ).status_code == 401
+    # 미리보기는 공개다 — 없는 상품이라 404.
+    assert asset_client.get("/marketplace/listings/abc/preview").status_code == 404
+
+
+def test_public_preview_streams_bytes(asset_client, asset_service, store):
+    snapshot = upload(asset_service)
+    listing_with_snapshot(store, snapshot)
+
+    response = asset_client.get("/marketplace/listings/with-asset/preview")
+
+    assert response.status_code == 200
+    assert response.content == PNG
+    assert response.headers["content-type"] == "image/png"
+    assert response.headers["content-length"] == str(len(PNG))
+    assert "immutable" in response.headers["cache-control"]
+
+
+def test_responses_never_leak_storage_details(asset_client, asset_service, store):
+    """§21 — bucket · gs:// · object key · signed URL을 client에 주지 않는다."""
+    snapshot = upload(asset_service)
+    listing_with_snapshot(store, snapshot)
+
+    preview = asset_client.get("/marketplace/listings/with-asset/preview")
+    detail = asset_client.get("/marketplace/listings/with-asset").text
+
+    for banned in ["gs://", "bucket", "marketplace/snapshots", "googleapis.com", "X-Goog"]:
+        assert banned not in detail
+        assert banned not in str(preview.headers)
+
+
+def test_snapshot_response_hides_object_keys():
+    from app.api.marketplace import SnapshotResponse
+
+    fields = set(SnapshotResponse.model_fields)
+    assert fields == {
+        "snapshot_id", "content_type", "asset_count", "total_bytes", "manifest_checksum"
+    }
+    for banned in ["manifest_object", "preview_object", "bucket", "object_key"]:
+        assert banned not in fields
+
+
+def test_no_raw_snapshot_endpoint(asset_client):
+    """§24 — snapshotId를 직접 넣어 받는 경로를 만들지 않는다."""
+    for path in [
+        "/marketplace/snapshots/abc/raw",
+        "/marketplace/snapshots/abc",
+        "/marketplace/snapshots/abc/manifest",
+    ]:
+        assert asset_client.get(path).status_code in {404, 405}
+
+
+def test_anonymous_multipart_upload_is_refused(asset_client):
+    """실제 multipart 경로로도 익명 업로드가 통하지 않는다."""
+    response = asset_client.post(
+        "/marketplace/snapshots",
+        data={"contentType": "mirror"},
+        files={
+            "manifest": ("manifest.json", manifest_bytes(), "application/json"),
+            "preview": ("preview.png", PNG, "image/png"),
+        },
+    )
+    assert response.status_code == 401
+
+
+# MARK: - bucket 격리 (§4, §5)
+
+
+def test_marketplace_bucket_is_separate_from_the_ai_bucket():
+    """§4 — AI 결과 bucket을 재사용하지 않는다.
+
+    그쪽은 7일 lifecycle이다. 판매한 템플릿이 7일 뒤 사라지면 구매자가 산 것을
+    잃는다 — 환불로도 되돌릴 수 없다.
+    """
+    from app.core.config import Settings, load_settings
+
+    import dataclasses
+
+    fields = {f.name: f for f in dataclasses.fields(Settings)}
+    assert "marketplace_asset_bucket" in fields
+    assert fields["marketplace_asset_bucket"].default == "", "기본값이 있으면 실수로 공유된다"
+
+    shared = load_settings(
+        {
+            "APP_ENV": "local",
+            "AI_RESULT_BUCKET": "ggumirror-ai-results",
+            "MARKETPLACE_ASSET_BUCKET": "ggumirror-marketplace-assets",
+        }
+    )
+    assert shared.marketplace_asset_bucket != shared.ai_result_bucket
+
+    # env가 없으면 조용히 AI bucket으로 흐르지 않는다.
+    empty = load_settings({"APP_ENV": "local", "AI_RESULT_BUCKET": "ggumirror-ai-results"})
+    assert empty.marketplace_asset_bucket == ""
+
+
+def test_asset_prefix_is_not_shared_with_ai_results():
+    """§4 — prefix도 나눈다. 같은 bucket에 섞일 여지를 두지 않는다."""
+    from app.marketplace.assets import PREFIX
+
+    assert PREFIX == "marketplace/snapshots"
+    assert "ai" not in PREFIX.split("/")
+    for key in [manifest_key("s"), preview_key("s"), asset_key("s", ASSET_A)]:
+        assert key.startswith("marketplace/snapshots/s/")
+
+
+def test_missing_bucket_fails_closed(store, shards, shard_store):
+    """§5 — bucket이 없으면 조용히 성공하지 않는다. 거짓 preview를 만들지 않는다."""
+    from fastapi.testclient import TestClient
+
+    from app.core.config import Settings
+    from app.main import create_app
+    from app.marketplace.assets import AssetStorageUnavailable
+
+    blind = MarketplaceService(store, shards, assets=None)
+    package = checked_package(manifest=manifest_bytes(), preview=PNG, assets={})
+
+    with pytest.raises(AssetStorageUnavailable):
+        blind.create_snapshot(user(), content_type="mirror", package=package)
+
+    snapshot = Snapshot(id="s", seller_user_id=SELLER, content_type=ContentType.MIRROR,
+                        manifest_checksum="x", asset_count=0, total_bytes=1)
+    store.snapshots["s"] = snapshot
+    listing = published(store, "live")
+    store.listings["live"] = type(listing)(**{**listing.__dict__, "snapshot_id": "s"})
+    with pytest.raises(AssetStorageUnavailable):
+        blind.preview("live")
+
+    # HTTP에서는 503 — 200에 빈 이미지를 주지 않는다.
+    app = create_app(
+        Settings(app_env="local", marketplace_asset_bucket=""),
+        shard_store=shard_store,
+        marketplace_store=store,
+    )
+    with TestClient(app, raise_server_exceptions=False) as http:
+        assert http.get("/marketplace/listings/live/preview").status_code == 503
