@@ -138,6 +138,19 @@ class MarketplaceService:
         """공개 상세. draft · unlisted · 없는 것은 모두 `ListingNotFound`다."""
         return self._store.get_published(listing_id)
 
+    def seller_listings(self, user: User) -> list[Listing]:
+        """**판매자 자신의** listing 전부 — `draft` · `published` · `unlisted`.
+
+        판매자가 자기 상품을 다시 찾는 **authority**다. 앱이 기억해 둔 id에
+        의존하면 앱을 지웠거나 기기를 바꾼 뒤 자기 상품을 내릴 수 없다.
+
+        정렬은 `updatedAt` 내림차순이다 — 방금 만진 것이 위로 온다. 같으면 id로
+        안정화한다(값이 같을 때 순서가 흔들리면 목록이 이유 없이 재배열돼 보인다).
+        `updatedAt`은 이미 있는 field다 — 정렬 때문에 schema를 늘리지 않는다.
+        """
+        listings = self._store.list_for_seller(user.id)
+        return sorted(listings, key=lambda x: (x.updated_at, x.id), reverse=True)
+
     # MARK: - 획득 (B-7E)
 
     def purchase(self, user: User, listing_id: str) -> PurchaseResult:

@@ -551,6 +551,30 @@ def my_purchases(
     ]
 
 
+@purchases_router.get("/listings")
+def my_listings(
+    user: Annotated[User, Depends(current_user)],
+    service: Annotated[MarketplaceService, Depends(marketplace_service)],
+) -> list[ListingResponse]:
+    """**내가 올린 것 전부** — `draft` · `published` · `unlisted`.
+
+    공개 목록(`GET /marketplace/listings`)과 다른 것이다. 그쪽은 `published`만
+    보여 주므로, 판매자가 아직 안 올린 것과 내린 것을 다시 찾을 방법이 없었다.
+    앱이 기억해 둔 id에 의존하면 앱을 지웠거나 기기를 바꾼 뒤 관리가 끊긴다.
+
+    `/users/me/...`뿐이다 — 임의 userId로 **남의 draft를 조회하는 경로를 만들지
+    않는다.** 판매자 판단은 session의 user이고 요청 본문이나 query로 받지 않는다.
+
+    응답은 판매자 전용 `ListingResponse`(`status` 포함)다. **공개 DTO는 그대로
+    둔다** — 거기에는 계속 `sellerUserId` · `snapshotId`가 없다.
+    """
+    try:
+        listings = service.seller_listings(user)
+    except StoreUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+    return [_listing(x) for x in listings]
+
+
 @purchases_router.get("/likes")
 def my_likes(
     user: Annotated[User, Depends(current_user)],

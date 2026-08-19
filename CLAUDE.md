@@ -20,7 +20,7 @@ Backend repository for 꾸미러.
 - purchase / ownership
 - seller shard settlement
 
-## Current Implementation (Phase B-7F.1 완료 · 미배포)
+## Current Implementation (Phase B-7G.1 완료 · 배포)
 
 FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth +
 server-authoritative 조각 원장 + 하루 한 번 출석 + AdMob rewarded SSV + AI 스티커 생성 +
@@ -60,11 +60,12 @@ app/core/config.py   환경변수 + logging
 app/api/iap.py       POST /users/me/iap/shards (body는 signedTransaction 하나)
 app/api/app_store.py POST /app-store/notifications/v2 (Apple 서명이 곧 인증)
 app/api/marketplace.py  GET(공개) /marketplace/listings · {id} · {id}/preview
+                     GET  /users/me/marketplace/listings (판매자 자기 목록)
                      POST /marketplace/listings · {id}/publish · {id}/unpublish · {id}/purchase
                      POST /marketplace/snapshots (multipart)
                      GET  /marketplace/listings/{id}/template · template/assets/{assetId}
                      PUT/DELETE /marketplace/listings/{id}/like
-                     GET /users/me/marketplace/purchases · likes
+                     GET /users/me/marketplace/purchases · likes · listings
 app/marketplace/models.py  Listing · Snapshot · 상태 · 등록비 정책
 app/marketplace/store.py   MarketplaceStore protocol + in-memory
 app/marketplace/firestore_store.py  등록비 + 게시가 **한 transaction**
@@ -947,6 +948,44 @@ bucket은 **`MARKETPLACE_ASSET_BUCKET`로 따로 받는다.**
 `AssetNotFound`와 구분한다 — 404로 뭉개면 운영자가 설정 누락을 "데이터 없음"으로 오진한다.
 
 **client production code는 아직 붙이지 않았다**(B-7G).
+
+#### 판매자 자기 목록 (B-7G.1)
+
+```
+GET /users/me/marketplace/listings     (인증)
+```
+
+`draft` · `published` · `unlisted` **전부** 돌려준다. 공개 목록과 다른 것이다 —
+그쪽은 `published`만 보여 주므로 판매자가 아직 안 올린 것과 내린 것을 다시 찾을
+방법이 없었다. **client가 기억해 둔 listing id는 authority가 아니다** — 앱을 지우거나
+기기를 바꾸면 관리가 끊긴다. 이 endpoint가 authority다.
+
+`/users/me/...`뿐이다. 임의 userId로 남의 draft를 조회하는 경로를 만들지 않았고,
+판매자 판단은 session의 user다(본문·query로 받지 않는다).
+
+Firestore 질의는 `sellerUserId == currentUserId` **하나뿐**이다. `where` + `order_by`를
+함께 걸면 composite index를 요구하게 되므로 정렬은 service가 한다
+(`updatedAt` 내림차순, 같으면 id — 이미 있는 field이고 schema를 늘리지 않았다).
+
+**응답은 판매자 전용 `ListingResponse`(`status` 포함)를 재사용한다.** 공개
+`PublicListingResponse`는 그대로 8칸이고 거기에는 계속 `sellerUserId` ·
+`snapshotId`가 없다. 판매자 DTO에도 내부 식별자는 넣지 않았다.
+
+공개 목록과 달리 **malformed 문서를 걸러내지 않는다.** 공개는 거짓 정보를 보여
+주지 않으려고 빼지만, 판매자에게는 자기 상품이 이상한 상태라는 것 자체가 보여야
+한다 — 안 보이면 내릴 수도 없다.
+
+#### Marketplace bucket IAM (B-7G.1)
+
+runtime SA의 bucket 권한을 `objectAdmin` → **`objectUser`**로 좁혔다.
+
+`objectCreator` + `objectViewer`로는 **안 된다.** production path가 `delete()`를 쓴다
+(`service.py`의 반쪽 업로드 정리). 이 bucket은 lifecycle rule이 0개이고 삭제 API도
+없어서, delete 권한을 빼면 실패한 업로드가 남긴 orphan을 **영구히 지울 방법이 사라진다.**
+
+`objectUser`는 `objectAdmin`보다 엄격히 좁다 — `setIamPolicy` · `getIamPolicy` ·
+`setRetention` · `overrideUnlockedRetention`이 빠지고 create/get/delete는 남는다.
+project 수준 storage role은 없다(`roles/datastore.user`만).
 
 ### Admin Shard CLI (A-2) — 운영자 조정은 CLI 하나뿐
 

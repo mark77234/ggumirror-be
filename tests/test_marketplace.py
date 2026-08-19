@@ -817,9 +817,16 @@ def test_no_n_plus_one_snapshot_reads():
         Path(__file__).resolve().parent.parent / "app/marketplace/firestore_store.py"
     ).read_text()
     start = source.index("def list_published")
-    end = source.index("def get_published")
+    # 경계는 **바로 다음 method**다. 사이에 다른 method가 끼면 대상이 아닌 코드까지 본다.
+    end = source.index("def list_for_seller")
     body = _code_only(source[start:end])
     assert "SNAPSHOTS" not in body, "목록에서 snapshot을 읽는다"
+
+    # 판매자 목록도 같은 규칙이다.
+    seller = _code_only(
+        source[source.index("def list_for_seller"):source.index("def get_published")]
+    )
+    assert "SNAPSHOTS" not in seller, "판매자 목록에서 snapshot을 읽는다"
 
 
 # MARK: - 획득 · 소유권 (B-7E)
@@ -1787,6 +1794,52 @@ class FakeCollection:
 
     def document(self, doc_id: str) -> FakeReference:
         return FakeReference(self._store, doc_id)
+
+    def where(self, *, filter):   # noqa: A002 — 실제 SDK의 keyword 이름이다
+        """`FieldFilter` 하나만 지원한다. 실제 SDK와 같은 속성을 읽는다
+        (`field_path` · `op_string` · `value` — 설치본에서 확인했다).
+
+        **정말로 걸러야 한다.** 필터가 통과만 하고 아무것도 안 걸러내면
+        판매자 목록 test가 남의 draft 유출을 잡지 못한다.
+        """
+        assert filter.op_string == "==", f"이 fake는 ==만 안다: {filter.op_string}"
+        return FakeQuery(self._store, filter.field_path, filter.value)
+
+    def stream(self):
+        return FakeQuery(self._store, None, None).stream()
+
+
+class FakeQuery:
+    """`where(...).stream()`만 있는 최소 query."""
+
+    def __init__(self, store: dict, field: str | None, value) -> None:
+        self._store = store
+        self._field = field
+        self._value = value
+
+    def where(self, *, filter):   # noqa: A002
+        raise AssertionError("이 fake는 조건 하나만 지원한다 — composite index가 필요해진다")
+
+    def order_by(self, *args, **kwargs):
+        raise AssertionError("query 정렬은 composite index를 요구한다")
+
+    def stream(self):
+        for doc_id, data in list(self._store.items()):
+            if self._field is not None and data.get(self._field) != self._value:
+                continue
+            yield FakeSnapshot(doc_id, data)
+
+
+class FakeSnapshot:
+    """`stream()`이 내놓는 문서 하나."""
+
+    def __init__(self, doc_id: str, data: dict) -> None:
+        self.id = doc_id
+        self._data = data
+        self.exists = True
+
+    def to_dict(self) -> dict:
+        return dict(self._data)
 
 
 class FakeDatabase:
@@ -3130,3 +3183,235 @@ def test_snapshot_upload_passes_the_content_type_to_the_validator():
     source = (Path(__file__).resolve().parent.parent / "app/api/marketplace.py").read_text()
     body = source[source.index('@router.post("/snapshots"'):]
     assert "content_type=contentType" in body
+
+
+# MARK: - 판매자 자기 목록 (B-7G.1)
+#
+# 공개 목록과 **다른 것**이다. 그쪽은 published만 보여 주므로 판매자가 아직 안 올린
+# 것과 내린 것을 다시 찾을 방법이 없었다. 앱이 기억해 둔 id에 의존하면 앱을 지웠거나
+# 기기를 바꾼 뒤 관리가 끊긴다.
+#
+# 가장 중요한 것: **남의 draft가 한 건도 새지 않는다.**
+
+
+def test_seller_sees_every_state(service, store):
+    """draft · published · unlisted 모두 돌려준다."""
+    published(store, "draft-one", status=ListingStatus.DRAFT, published_at=None)
+    published(store, "live-one", status=ListingStatus.PUBLISHED)
+    published(store, "pulled-one", status=ListingStatus.UNLISTED)
+
+    mine = service.seller_listings(user(SELLER))
+
+    assert {x.id for x in mine} == {"draft-one", "live-one", "pulled-one"}
+    assert {x.status for x in mine} == {
+        ListingStatus.DRAFT, ListingStatus.PUBLISHED, ListingStatus.UNLISTED
+    }
+
+
+def test_seller_never_sees_another_seller(service, store):
+    """가장 중요 — 남의 상품이 섞이면 draft 내용과 가격 전략이 유출된다."""
+    published(store, "mine", owner=SELLER, status=ListingStatus.DRAFT, published_at=None)
+    published(store, "theirs", owner=OTHER, status=ListingStatus.DRAFT, published_at=None)
+    published(store, "theirs-live", owner=OTHER)
+
+    mine = service.seller_listings(user(SELLER))
+    theirs = service.seller_listings(user(OTHER))
+
+    assert [x.id for x in mine] == ["mine"]
+    assert {x.id for x in theirs} == {"theirs", "theirs-live"}
+    assert all(x.seller_user_id == SELLER for x in mine)
+
+
+def test_seller_with_nothing_gets_an_empty_list(service, store):
+    """가짜 상품을 만들지 않는다."""
+    published(store, "theirs", owner=OTHER)
+    assert service.seller_listings(user(SELLER)) == []
+
+
+def test_seller_listings_are_sorted_by_recent_change(service, store):
+    """방금 만진 것이 위로. 값이 같으면 id로 안정화한다."""
+    first = published(store, "aaa", status=ListingStatus.DRAFT, published_at=None)
+    second = published(store, "bbb", status=ListingStatus.DRAFT, published_at=None)
+    store.listings["aaa"] = type(first)(
+        **{**first.__dict__, "updated_at": datetime(2026, 8, 1, tzinfo=timezone.utc)}
+    )
+    store.listings["bbb"] = type(second)(
+        **{**second.__dict__, "updated_at": datetime(2026, 8, 9, tzinfo=timezone.utc)}
+    )
+
+    assert [x.id for x in service.seller_listings(user(SELLER))] == ["bbb", "aaa"]
+
+
+def test_seller_listing_sort_is_deterministic(service, store):
+    """같은 시각이면 순서가 흔들리지 않는다."""
+    same = datetime(2026, 8, 5, tzinfo=timezone.utc)
+    for listing_id in ["zzz", "aaa", "mmm"]:
+        listing = published(store, listing_id, status=ListingStatus.DRAFT, published_at=None)
+        store.listings[listing_id] = type(listing)(**{**listing.__dict__, "updated_at": same})
+
+    order = [x.id for x in service.seller_listings(user(SELLER))]
+    assert order == ["zzz", "mmm", "aaa"], order
+
+
+def test_seller_listings_query_needs_no_composite_index():
+    """`where` + `order_by`를 함께 걸지 않는다 — composite index를 요구하게 된다."""
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parent.parent / "app/marketplace/firestore_store.py"
+    ).read_text()
+    raw = source[source.index("def list_for_seller"):source.index("def get_published")]
+    assert 'FieldFilter("sellerUserId", "==", seller_user_id)' in raw
+    # **docstring을 걷어낸 코드만** 본다 — 설명에 적은 단어를 잡으면 안 된다.
+    body = _code_only("def " + raw.split("def ", 1)[1])
+    assert "order_by" not in body, "query에 정렬을 넣었다"
+    # 질의 조건이 하나뿐이다.
+    assert body.count("FieldFilter") == 1
+
+
+# MARK: - HTTP
+
+
+def test_my_listings_needs_auth(client):
+    """§7 — 로그인 없이는 남의 draft를 볼 수 없다."""
+    assert client.get("/users/me/marketplace/listings").status_code == 401
+
+
+def test_no_arbitrary_user_listing_path(client):
+    """임의 userId로 남의 draft를 조회하는 경로를 만들지 않았다."""
+    for path in [
+        f"/users/{SELLER}/marketplace/listings",
+        "/marketplace/sellers/x/listings",
+        f"/marketplace/listings?sellerUserId={SELLER}",
+    ]:
+        response = client.get(path)
+        # 마지막 것은 200이지만 **공개 목록**이고 seller 필터가 없다.
+        if response.status_code == 200:
+            assert response.json() == [], "query로 판매자 목록을 얻을 수 있다"
+        else:
+            assert response.status_code in {401, 404, 405}
+
+
+def test_my_listings_response_is_the_seller_dto(client, store):
+    """판매자 응답에는 `status`가 있다. 공개 DTO에는 없다."""
+    from app.api.marketplace import ListingResponse, PublicListingResponse
+
+    assert "status" in ListingResponse.model_fields
+    assert "status" not in PublicListingResponse.model_fields
+    # 판매자 DTO에도 내부 식별자는 없다.
+    for banned in ["seller_user_id", "sellerUserId", "snapshot_id", "snapshotId"]:
+        assert banned not in ListingResponse.model_fields
+    del store
+
+
+def test_public_listing_contract_is_unchanged(client, store):
+    """§5 — 공개 DTO 보안 계약을 건드리지 않았다."""
+    from app.api.marketplace import PublicListingResponse
+
+    assert set(PublicListingResponse.model_fields) == {
+        "id", "content_type", "title", "description",
+        "price_shards", "download_count", "like_count", "published_at",
+    }
+
+    published(store, "live")
+    body = client.get("/marketplace/listings").json()
+    assert [x["id"] for x in body] == ["live"]
+    text = client.get("/marketplace/listings").text
+    for banned in ["sellerUserId", "snapshotId", "status", "bucket", "gs://"]:
+        assert banned not in text
+
+
+def test_public_browse_still_hides_drafts(client, store):
+    """판매자 목록이 생겼어도 공개 목록은 그대로다."""
+    published(store, "draft-one", status=ListingStatus.DRAFT, published_at=None)
+    published(store, "pulled-one", status=ListingStatus.UNLISTED)
+    published(store, "live-one")
+
+    assert [x["id"] for x in client.get("/marketplace/listings").json()] == ["live-one"]
+
+
+def test_seller_listings_do_not_move_counters(service, store, shards):
+    """조회가 경제나 카운터를 건드리지 않는다."""
+    seed(shards, 100, who=BUYER)
+    listing = published(store, "live", price=10)
+    service.purchase(user(BUYER), "live")
+    service.like(user(LIKER), "live")
+    before = store.listings["live"]
+
+    for _ in range(5):
+        service.seller_listings(user(SELLER))
+
+    after = store.listings["live"]
+    assert after.download_count == before.download_count == 1
+    assert after.like_count == before.like_count == 1
+    assert shards.wallet(SELLER).balance == 10
+    del listing
+
+
+# MARK: - 실제 Firestore store로 판매자 목록 (B-7G.1)
+
+
+@pytest.fixture
+def seller_listings_store():
+    """`FirestoreMarketplaceStore`를 **실제로** 돌린다. production Firestore는 부르지 않는다."""
+    from app.marketplace.firestore_store import FirestoreMarketplaceStore
+    from app.marketplace.store import LISTINGS
+
+    def document(seller: str, status: str, day: int) -> dict:
+        return {
+            "sellerUserId": seller,
+            "contentType": "mirror",
+            "title": "제목",
+            "description": "",
+            "priceShards": 0,
+            "snapshotId": "snap",
+            "status": status,
+            "publishFeePaid": status != "draft",
+            "downloadCount": 0,
+            "likeCount": 0,
+            "createdAt": datetime(2026, 8, day, tzinfo=timezone.utc),
+            "updatedAt": datetime(2026, 8, day, tzinfo=timezone.utc),
+            "publishedAt": (
+                datetime(2026, 8, day, tzinfo=timezone.utc) if status != "draft" else None
+            ),
+            "schemaVersion": 1,
+        }
+
+    db = FakeDatabase()
+    db.data[LISTINGS] = {
+        "mine-draft": document(SELLER, "draft", 1),
+        "mine-live": document(SELLER, "published", 2),
+        "mine-pulled": document(SELLER, "unlisted", 3),
+        "theirs-draft": document(OTHER, "draft", 4),
+        "theirs-live": document(OTHER, "published", 5),
+    }
+    return FirestoreMarketplaceStore(db)
+
+
+def test_real_store_returns_only_my_listings(seller_listings_store):
+    """실제 store 코드가 **정말로** 판매자로 걸러낸다."""
+    mine = seller_listings_store.list_for_seller(SELLER)
+
+    assert {x.id for x in mine} == {"mine-draft", "mine-live", "mine-pulled"}
+    assert all(x.seller_user_id == SELLER for x in mine)
+
+
+def test_real_store_leaks_no_other_seller(seller_listings_store):
+    ids = {x.id for x in seller_listings_store.list_for_seller(SELLER)}
+    assert "theirs-draft" not in ids
+    assert "theirs-live" not in ids
+
+
+def test_real_store_returns_all_three_states(seller_listings_store):
+    states = {x.status.value for x in seller_listings_store.list_for_seller(SELLER)}
+    assert states == {"draft", "published", "unlisted"}
+
+
+def test_real_store_empty_for_a_seller_with_nothing(seller_listings_store):
+    assert seller_listings_store.list_for_seller("00000000-0000-4000-8000-000000000000") == []
+
+
+def test_real_public_list_still_only_published(seller_listings_store):
+    """공개 목록은 그대로다 — 판매자 목록이 생겼어도 draft가 새지 않는다."""
+    public = seller_listings_store.list_published()
+    assert {x.id for x in public} == {"mine-live", "theirs-live"}

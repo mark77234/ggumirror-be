@@ -95,6 +95,27 @@ class FirestoreMarketplaceStore:
             logger.error("marketplace_listing_malformed count=%d", len(skipped))
         return [x for x in listings if _is_public(x)]
 
+    def list_for_seller(self, seller_user_id: str) -> list[Listing]:
+        """`sellerUserId == seller_user_id` **하나로만** 질의한다.
+
+        정렬을 query에 넣지 않는다 — `where` + `order_by`는 composite index를
+        요구하고, 판매자 한 명의 상품 수는 application에서 정렬해도 되는 규모다
+        (`list_published`와 같은 판단이다).
+
+        여기서는 malformed 문서를 **빼지 않는다.** 공개 목록은 거짓 정보를 보여
+        주지 않으려고 걸러내지만, 판매자에게는 자기 상품이 이상한 상태라는 것
+        자체가 보여야 한다 — 안 보이면 내릴 수도 없다.
+        """
+        try:
+            found = (
+                self._db.collection(LISTINGS)
+                .where(filter=firestore.FieldFilter("sellerUserId", "==", seller_user_id))
+                .stream()
+            )
+            return [_listing_from(x.id, x.to_dict() or {}) for x in found]
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("listing_seller_list", error) from error
+
     def get_published(self, listing_id: str) -> Listing:
         try:
             snapshot = self._db.collection(LISTINGS).document(listing_id).get()

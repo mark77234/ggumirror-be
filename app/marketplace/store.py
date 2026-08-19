@@ -92,6 +92,15 @@ class MarketplaceStore(Protocol):
         """공개 상세. `published`가 아니면 `ListingNotFound` —
         **판매자 자신이라도** 공개 endpoint로는 draft를 볼 수 없다."""
 
+    def list_for_seller(self, seller_user_id: str) -> list[Listing]:
+        """**판매자 자신의** listing 전부. `draft` · `published` · `unlisted` 모두다.
+
+        공개 목록(`list_published`)과 다른 것이다 — 그쪽은 `published`만 보여 준다.
+        판매자가 자기 상품을 관리하려면 아직 안 올린 것과 내린 것까지 보여야 한다.
+
+        **다른 판매자의 것은 한 건도 섞이지 않는다.**
+        """
+
     def acquire(self, listing_id: str, buyer_user_id: str, shards) -> PurchaseResult:
         """**상품 하나를 획득한다. 전부 한 commit이다.**
 
@@ -191,6 +200,9 @@ class InMemoryMarketplaceStore:
         if found is None or not _is_public(found):
             raise ListingNotFound(listing_id)
         return found
+
+    def list_for_seller(self, seller_user_id: str) -> list[Listing]:
+        return [x for x in self.listings.values() if x.seller_user_id == seller_user_id]
 
     # MARK: - 쓰기
 
