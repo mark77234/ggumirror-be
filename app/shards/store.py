@@ -183,12 +183,26 @@ class InMemoryTransaction:
         self.commits = 0
 
     def add(self, write) -> None:
+        """`write()`는 **되돌리는 함수**를 돌려준다.
+
+        Firestore는 commit 하나에 모든 쓰기를 담으므로 중간에 절반만 반영될 수 없다.
+        fake도 그래야 test가 거짓말을 하지 않는다 — 하나라도 실패하면 **이미 적용한
+        것을 되돌린 뒤** 예외를 올린다.
+        """
         self._writes.append(write)
 
     def commit(self) -> None:
-        for write in self._writes:
-            write()
-        self._writes.clear()
+        undos: list = []
+        try:
+            for write in self._writes:
+                undos.append(write())
+        except BaseException:
+            for undo in reversed(undos):
+                if undo is not None:
+                    undo()
+            raise
+        finally:
+            self._writes.clear()
         self.commits += 1
 
 
@@ -480,10 +494,21 @@ class InMemoryShardStore:
             updated_at=now,
         )
 
-        def write() -> None:
+        def write():
+            previous = self.wallets.get(user_id)
             self.wallets[user_id] = wallet
             self.entries.append(entry)
             self._applied[idempotency_key_hash] = entry
+
+            def undo() -> None:
+                if previous is None:
+                    self.wallets.pop(user_id, None)
+                else:
+                    self.wallets[user_id] = previous
+                self.entries.remove(entry)
+                self._applied.pop(idempotency_key_hash, None)
+
+            return undo
 
         context.transaction.add(write)
         return wallet, entry, True

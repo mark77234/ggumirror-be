@@ -25,10 +25,11 @@ from app.ai.store import GenerationStore
 from app.iap.models import parse_allowed_environments
 from app.iap.notifications import AppStoreNotificationService
 from app.iap.refunds import IAPRefundService
+from app.marketplace.service import MarketplaceService
 from app.iap.service import IAPService
 from app.iap.apple_verifier import build_apple_verifier
 from app.iap.verifier import TransactionVerifier
-from app.api import ads, ai, app_store, auth, health, iap, users
+from app.api import ads, ai, app_store, auth, health, iap, marketplace, users
 from app.auth.apple import AppleTokenVerifier
 from app.auth.store import AuthStore
 from app.shards.service import ShardLedgerService
@@ -48,6 +49,7 @@ def create_app(
     image_provider: ImageProvider | None = None,
     generation_store: GenerationStore | None = None,
     generation_storage: GenerationStorage | None = None,
+    marketplace_store=None,
 ) -> FastAPI:
     """store를 주면 그것을 쓴다 — test는 in-memory fake와 test key를 넣는다."""
     settings = settings or load_settings()
@@ -172,6 +174,17 @@ def create_app(
             refunds=IAPRefundService(shards()),
         )
 
+    @lru_cache(maxsize=1)
+    def marketplace_listings() -> MarketplaceService:
+        from app.marketplace.firestore_store import FirestoreMarketplaceStore
+
+        # 조각 원장과 **같은 Firestore client**를 쓴다 — 등록비와 listing이
+        # 한 transaction에서 commit되려면 같은 database여야 한다.
+        return MarketplaceService(
+            store=marketplace_store or FirestoreMarketplaceStore(_firestore()),
+            shards=shards(),
+        )
+
     app.state.apple_verifier = verifier
     app.state.auth_store = store
     app.state.shard_service = shards
@@ -179,6 +192,7 @@ def create_app(
     app.state.ai_sticker_service = ai_stickers
     app.state.iap_service = shard_iap
     app.state.app_store_notifications = notifications
+    app.state.marketplace_service = marketplace_listings
 
     app.include_router(health.router)
     app.include_router(auth.router)
@@ -187,6 +201,7 @@ def create_app(
     app.include_router(ai.router)
     app.include_router(iap.router)
     app.include_router(app_store.router)
+    app.include_router(marketplace.router)
 
     logger.info("app created env=%s log_level=%s", settings.app_env, settings.log_level)
     return app

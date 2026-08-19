@@ -18,6 +18,7 @@ from app.ai.service import AIStickerService
 from app.auth.apple import AppleTokenVerifier
 from app.iap.notifications import AppStoreNotificationService
 from app.iap.service import IAPService
+from app.marketplace.service import MarketplaceService
 from app.auth.models import User, sha256_hex
 from app.auth.store import AuthStore, StoreUnavailable
 from app.shards.service import ShardLedgerService
@@ -95,6 +96,15 @@ def app_store_notifications(request: Request) -> AppStoreNotificationService:
         return request.app.state.app_store_notifications()
     except Exception as error:  # Firestore client 생성 실패 등
         logger.error("app_store_notifications_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
+def marketplace_service(request: Request) -> MarketplaceService:
+    """상점 service. store와 같은 이유로 처음 쓰일 때 만든다."""
+    try:
+        return request.app.state.marketplace_service()
+    except Exception as error:  # Firestore client 생성 실패 (credential / network)
+        logger.error("marketplace_service_unavailable error=%s", type(error).__name__)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
 
 

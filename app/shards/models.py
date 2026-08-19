@@ -41,7 +41,13 @@ class ShardReason(StrEnum):
     AI_STICKER = "ai_sticker"
     MIRROR_PURCHASE = "mirror_purchase"
     MIRROR_SALE = "mirror_sale"
+    # 상점 등록 비용. **콘텐츠 종류마다 값이 다르므로 reason도 나눈다** —
+    # 하나로 합치면 원장만 보고 거울인지 스티커인지 알 수 없다.
+    #
+    # `mirror_publish_fee`라는 이름은 **바꾸지 않는다.** 값을 rename하면 과거 원장을
+    # 읽는 코드가 조용히 깨진다. (production 원장에 아직 0건이지만 규칙은 규칙이다.)
     MIRROR_PUBLISH_FEE = "mirror_publish_fee"
+    STICKER_PUBLISH_FEE = "sticker_publish_fee"
     # AI 생성 실패 복구(A-1B). **Apple 환불에 재사용하지 않는다** — 다른 사건이다.
     REFUND = "refund"
     # Apple 환불로 실제 회수한 조각(B-6F-B). 회수 못 한 몫은 원장에 남지 않는다.

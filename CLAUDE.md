@@ -20,7 +20,7 @@ Backend repository for 꾸미러.
 - purchase / ownership
 - seller shard settlement
 
-## Current Implementation (Phase B-7B 완료 · 미배포)
+## Current Implementation (Phase B-7C 완료 · 미배포)
 
 FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth +
 server-authoritative 조각 원장 + 하루 한 번 출석 + AdMob rewarded SSV + AI 스티커 생성 +
@@ -59,6 +59,11 @@ app/shards/attendance.py  KST 날짜 규칙 + 출석 지급
 app/core/config.py   환경변수 + logging
 app/api/iap.py       POST /users/me/iap/shards (body는 signedTransaction 하나)
 app/api/app_store.py POST /app-store/notifications/v2 (Apple 서명이 곧 인증)
+app/api/marketplace.py  POST /marketplace/listings · {id}/publish · {id}/unpublish
+app/marketplace/models.py  Listing · Snapshot · 상태 · 등록비 정책
+app/marketplace/store.py   MarketplaceStore protocol + in-memory
+app/marketplace/firestore_store.py  등록비 + 게시가 **한 transaction**
+app/marketplace/service.py  client가 정할 수 있는 것과 서버가 정하는 것의 경계
 app/iap/notifications.py  알림 검증 · 분류 (조각은 만지지 않고 REFUND만 넘긴다)
 app/iap/refunds.py   환불 회수 · 되돌리기 정책 (record가 금액 authority)
 app/iap/models.py    catalog(10/50/100) · 전역 claim id · appAccountToken 대조
@@ -629,6 +634,33 @@ test용 `InMemoryTransaction`은 쓰기를 모았다가 commit에서 반영한�
 Firestore의 all-or-nothing을 흉내 내야 "구매자만 차감된 상태가 없다"를 실제로 시험할 수 있다.
 
 `tests/test_shard_transactions.py`가 위 전부를 고정한다.
+
+### Marketplace 등록 (B-7C)
+
+거울/스티커를 상점에 올린다. **등록비 차감과 게시가 한 Firestore commit**이다.
+
+| | 등록비 | 원장 reason |
+|---|---|---|
+| 거울 | **10 조각** | `mirror_publish_fee` |
+| 스티커 | **5 조각** | `sticker_publish_fee` |
+
+- **서버가 비용의 authority다.** client에도 같은 숫자가 있지만 화면용이고,
+  요청 body에 비용 · 판매자 · 상태 · counter를 실을 자리가 **없다**
+- **무료 상품(`priceShards=0`)도 등록비는 같다** — "만드는 값"이지 "파는 값"이 아니다
+- reason을 콘텐츠 종류별로 나눴다 — 원장만 보고 무엇이었는지 알 수 있어야 한다.
+  **`mirror_publish_fee` 값은 바꾸지 않았다**(rename하면 과거 원장 파싱이 깨진다)
+- draft 생성은 **무료**다. 만들다 만 것에 돈을 받지 않는다
+- **서버에 없는 snapshot은 draft로도 만들지 않는다** — client가 준 문자열만 믿지 않는다
+- 상태는 `draft` · `published` · `unlisted` **셋뿐**이다. 심사/보류를 MVP에 만들지 않는다
+- **unpublish는 경제 mutation 0**이다. 낸 등록비는 돌아오지 않고 `publishFeePaid`도 그대로다
+- **republish는 무료**이고 `publishedAt`(최초 업로드 날짜)을 **덮어쓰지 않는다**
+- `downloadCount` · `likeCount`는 field만 있다. 실제 증가는 B-7E(소유권 획득) · like phase
+- 남의 listing은 **404**다 — 존재 사실도 정보다(AI 스티커와 같은 규칙)
+
+게시가 이미 돼 있으면 `published=false`로 조용히 끝난다 — 재시도 · 연타가 오류가 아니다
+(B-4 `claimed` · B-6 `credited`와 같은 semantics). HTTP 오류로 만들지 않는다.
+
+`tests/test_marketplace.py`가 위 전부를 고정한다.
 
 ### Admin Shard CLI (A-2) — 운영자 조정은 CLI 하나뿐
 
