@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Protocol
 
 from app.auth.store import StoreUnavailable  # noqa: F401  (같은 실패 타입을 쓴다)
@@ -26,6 +27,7 @@ from app.shards.models import (
     RefundPlan,
     RefundRecordMissing,
     QuotaExceeded,
+    WalletAlreadyChanged,
     ShardLedgerEntry,
     ShardReason,
     ShardRefundResult,
@@ -135,6 +137,57 @@ class ShardStore(Protocol):
         `lifetime_earned`를 올리지 않는다 — 원래 구매가 이미 올렸으므로 두 번 세게 된다.
         `lifetime_refunded`도 줄이지 않는다(gross). 대신 `lifetime_refund_reversed`가 오른다.
         """
+
+
+    def transaction(self):
+        """호출자가 소유하는 transaction을 연다. **commit은 호출자가 한다.**"""
+
+    def apply_in_transaction(
+        self,
+        transaction,
+        user_id: str,
+        delta: int,
+        reason: ShardReason,
+        idempotency_key_hash: str,
+    ) -> tuple[ShardWallet, ShardLedgerEntry, bool]:
+        """**이미 열려 있는 transaction에** 원장 한 줄과 지갑 갱신을 얹는다.
+
+        `apply`와 다른 점은 하나뿐이다 — **transaction을 열지도 commit하지도 않는다.**
+        그래서 호출자가 marketplace listing · ownership을 **같은 transaction**에
+        함께 넣을 수 있다. 그것이 이 함수가 존재하는 유일한 이유다.
+
+        - 중복이면 아무것도 쓰지 않고 `applied=False`
+        - 잔액 부족이면 `InsufficientShards` — 호출자의 transaction 전체가 취소된다
+        - 같은 transaction에서 같은 지갑을 두 번 바꾸면 `WalletAlreadyChanged`
+
+        quota · 전역 claim은 다루지 않는다. 필요하면 `apply`를 쓴다.
+        """
+
+
+class InMemoryTransaction:
+    """test용 transaction. **쓰기를 모았다가 commit에서 한 번에 반영한다.**
+
+    중간에 예외가 나면 모아 둔 쓰기를 버린다 — Firestore의 all-or-nothing을 흉내 내야
+    "구매자만 차감된 상태"가 없다는 것을 실제로 시험할 수 있다.
+
+    읽기는 **commit된 상태**만 본다(Firestore transaction의 시작 시점 snapshot과 같다).
+    그래서 같은 지갑을 두 번 바꾸면 두 번째가 첫 번째를 보지 못한다 —
+    `WalletAlreadyChanged`가 그 상황을 막는다.
+    """
+
+    def __init__(self) -> None:
+        self._writes: list = []
+        self.changed_wallets: set[str] = set()
+        self.commits = 0
+
+    def add(self, write) -> None:
+        self._writes.append(write)
+
+    def commit(self) -> None:
+        for write in self._writes:
+            write()
+        self._writes.clear()
+        self.commits += 1
 
 
 class InMemoryShardStore:
@@ -371,3 +424,63 @@ class InMemoryShardStore:
             return ShardRefundReversalResult(
                 wallet=wallet, restored=restorable, applied=True, ledger_entry_id=entry.id
             )
+
+    # MARK: - 호출자가 소유하는 transaction
+
+    @contextmanager
+    def transaction(self):
+        """`with store.transaction() as tx:` — 정상 종료면 commit, 예외면 버린다."""
+        tx = InMemoryTransaction()
+        with self._lock:
+            yield tx
+            tx.commit()
+
+    def apply_in_transaction(
+        self,
+        transaction: InMemoryTransaction,
+        user_id: str,
+        delta: int,
+        reason: ShardReason,
+        idempotency_key_hash: str,
+    ) -> tuple[ShardWallet, ShardLedgerEntry, bool]:
+        # 읽기는 **commit된 상태**만 본다 — Firestore transaction과 같은 규칙이다.
+        if existing := self._applied.get(idempotency_key_hash):
+            return self.wallet(user_id), existing, False
+
+        if user_id in transaction.changed_wallets:
+            raise WalletAlreadyChanged(user_id)
+        transaction.changed_wallets.add(user_id)
+
+        current = self.wallet(user_id)
+        if current.balance + delta < 0:
+            raise InsufficientShards()
+
+        now = utcnow()
+        entry = ShardLedgerEntry(
+            id=idempotency_key_hash,
+            user_id=user_id,
+            delta=delta,
+            balance_after=current.balance + delta,
+            reason=reason,
+            idempotency_key_hash=idempotency_key_hash,
+            created_at=now,
+        )
+        wallet = ShardWallet(
+            user_id=user_id,
+            balance=entry.balance_after,
+            lifetime_earned=current.lifetime_earned + max(delta, 0),
+            lifetime_spent=current.lifetime_spent + max(-delta, 0),
+            # 환불 누적 둘은 전용 경로(B-6F-B/C)의 몫이다. 여기서 건드리지 않는다.
+            lifetime_refunded=current.lifetime_refunded,
+            lifetime_refund_reversed=current.lifetime_refund_reversed,
+            created_at=current.created_at,
+            updated_at=now,
+        )
+
+        def write() -> None:
+            self.wallets[user_id] = wallet
+            self.entries.append(entry)
+            self._applied[idempotency_key_hash] = entry
+
+        transaction.add(write)
+        return wallet, entry, True

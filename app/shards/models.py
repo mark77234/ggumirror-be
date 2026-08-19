@@ -292,6 +292,17 @@ class RefundNotYetProcessed(ShardError):
     """
 
 
+class WalletAlreadyChanged(ShardError):
+    """**같은 transaction 안에서 한 지갑을 두 번 바꾸려 했다.**
+
+    Firestore transaction의 읽기는 시작 시점 snapshot이라, 두 번째 호출은 첫 번째가
+    계산한 잔액을 보지 못한다. 그대로 두면 뒤엣것이 앞엣것을 덮어써 조각이 조용히 사라진다.
+
+    marketplace 자기거래(`buyer == seller`)가 정확히 이 모양이라 여기서 막는다 —
+    상위 service의 검사에만 기대지 않는다.
+    """
+
+
 class QuotaExceeded(ShardError):
     """그 기간의 상한을 이미 채웠다. **아무것도 기록되지 않는다.**
 

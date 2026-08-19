@@ -28,6 +28,7 @@ from app.shards.models import (
     RefundPlan,
     RefundRecordMissing,
     QuotaExceeded,
+    WalletAlreadyChanged,
     ShardLedgerEntry,
     ShardReason,
     ShardRefundResult,
@@ -165,17 +166,7 @@ class FirestoreShardStore:
                 idempotency_key_hash=idempotency_key_hash,
                 created_at=now,
             )
-            wallet = ShardWallet(
-                user_id=user_id,
-                balance=balance,
-                lifetime_earned=current.lifetime_earned + max(delta, 0),
-                lifetime_spent=current.lifetime_spent + max(-delta, 0),
-                # 일반 거래는 환불 누적을 **건드리지 않고 그대로 물려준다.**
-                lifetime_refunded=current.lifetime_refunded,
-                lifetime_refund_reversed=current.lifetime_refund_reversed,
-                created_at=current.created_at if snapshot.exists else now,
-                updated_at=now,
-            )
+            wallet = _moved(current, delta, now, existed=snapshot.exists)
 
             # 원장 먼저 — 있으면 안 되는 자리에 쓰는 것이므로 create로 막는다.
             # 여기까지 왔다는 것은 이 transaction이 그 줄의 **작성자**라는 뜻이다.
@@ -471,12 +462,116 @@ class FirestoreShardStore:
             updated_at=utcnow(),
         )
 
+
+    # MARK: - 호출자가 소유하는 transaction
+
+    def transaction(self):
+        """호출자가 transaction을 소유할 수 있게 열어 준다. **commit은 호출자가 한다.**"""
+        return self._db.transaction()
+
+    def apply_in_transaction(
+        self,
+        transaction,
+        user_id: str,
+        delta: int,
+        reason: ShardReason,
+        idempotency_key_hash: str,
+    ) -> tuple[ShardWallet, ShardLedgerEntry, bool]:
+        """**이미 열려 있는 transaction에** 원장 한 줄과 지갑 갱신을 얹는다.
+
+        `apply`와 다른 점은 하나뿐이다 — **transaction을 열지도 commit하지도 않는다.**
+        그래서 호출자가 marketplace listing · ownership 같은 다른 문서를 **같은
+        transaction**에 함께 넣을 수 있다. 그것이 이 함수가 존재하는 유일한 이유다.
+
+        되는 것:
+        - 중복(같은 열쇠가 이미 있음)이면 **아무것도 쓰지 않고** `applied=False`
+        - 잔액이 모자라면 `InsufficientShards` — 호출자의 transaction 전체가 취소된다
+        - 같은 transaction에서 **같은 지갑을 두 번** 바꾸려 하면 `WalletAlreadyChanged`
+
+        안 되는 것: quota · 전역 claim. 필요하면 `apply`를 쓴다.
+        """
+        ledger_ref = self._db.collection(LEDGER).document(idempotency_key_hash)
+        wallet_ref = self._db.collection(WALLETS).document(user_id)
+
+        # 읽기는 쓰기보다 먼저. Firestore transaction의 규칙이다.
+        existing = ledger_ref.get(transaction=transaction)
+        wallet_snapshot = wallet_ref.get(transaction=transaction)
+
+        current = (
+            _wallet(user_id, wallet_snapshot.to_dict() or {})
+            if wallet_snapshot.exists
+            else ShardWallet.empty(user_id)
+        )
+
+        if existing.exists:
+            # 같은 사건이 다시 왔다. **쓰지 않는다** — 지갑 표시도 하지 않는다.
+            return current, _entry(existing.id, existing.to_dict() or {}), False
+
+        # 여기서부터 쓴다. 지갑을 두 번 바꾸는 것은 이 시점에 막는다.
+        _claim_wallet(transaction, user_id)
+
+        if current.balance + delta < 0:
+            # 호출자의 transaction이 통째로 취소된다 — 부분 반영이 없다.
+            raise InsufficientShards()
+
+        now = utcnow()
+        entry = ShardLedgerEntry(
+            id=ledger_ref.id,
+            user_id=user_id,
+            delta=delta,
+            balance_after=current.balance + delta,
+            reason=reason,
+            idempotency_key_hash=idempotency_key_hash,
+            created_at=now,
+        )
+        wallet = _moved(current, delta, now, existed=wallet_snapshot.exists)
+
+        # 원장은 `create` — 우리가 읽은 뒤 다른 요청이 먼저 적었으면 commit이 깨진다.
+        transaction.create(ledger_ref, _entry_document(entry))
+        transaction.set(wallet_ref, _wallet_document(wallet))
+        return wallet, entry, True
+
     # MARK: - 내부
 
     def _unavailable(self, operation: str, error: Exception) -> StoreUnavailable:
         # 실패 사실만 남긴다. Firestore 오류 문자열에 문서 경로가 들어갈 수 있다.
         logger.warning("firestore_failed operation=%s error=%s", operation, type(error).__name__)
         return StoreUnavailable(operation)
+
+
+
+def _moved(current: ShardWallet, delta: int, now, *, existed: bool) -> ShardWallet:
+    """일반 거래의 지갑 projection. **한 곳에서만 정의한다.**
+
+    `delta > 0`이면 `lifetime_earned`, `delta < 0`이면 `lifetime_spent`가 오른다.
+    환불 누적 둘은 **건드리지 않고 그대로 물려준다** — 그건 전용 경로(B-6F-B/C)의 몫이다.
+    """
+    return ShardWallet(
+        user_id=current.user_id,
+        balance=current.balance + delta,
+        lifetime_earned=current.lifetime_earned + max(delta, 0),
+        lifetime_spent=current.lifetime_spent + max(-delta, 0),
+        lifetime_refunded=current.lifetime_refunded,
+        lifetime_refund_reversed=current.lifetime_refund_reversed,
+        created_at=current.created_at if existed else now,
+        updated_at=now,
+    )
+
+
+def _claim_wallet(transaction, user_id: str) -> None:
+    """이 transaction에서 이 지갑을 이미 바꿨는지 표시한다.
+
+    Firestore transaction의 읽기는 **시작 시점 snapshot**이라, 같은 지갑을 두 번 바꾸면
+    두 번째가 첫 번째의 결과를 보지 못하고 덮어쓴다. 조각이 조용히 사라지는 경로다.
+    transaction 객체에 붙여 두므로 transaction과 함께 사라진다.
+    """
+    changed = getattr(transaction, "_ggumirror_changed_wallets", None)
+    if changed is None:
+        changed = set()
+        transaction._ggumirror_changed_wallets = changed
+    if user_id in changed:
+        raise WalletAlreadyChanged(user_id)
+    changed.add(user_id)
 
 
 # MARK: - 문서 변환

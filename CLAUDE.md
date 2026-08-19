@@ -20,7 +20,7 @@ Backend repository for 꾸미러.
 - purchase / ownership
 - seller shard settlement
 
-## Current Implementation (Phase B-6F-C 완료 · 미배포)
+## Current Implementation (Phase B-7B 완료 · 미배포)
 
 FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth +
 server-authoritative 조각 원장 + 하루 한 번 출석 + AdMob rewarded SSV + AI 스티커 생성 +
@@ -53,7 +53,8 @@ app/api/deps.py      Bearer → current user
 app/shards/models.py ShardWallet, ShardLedgerEntry, ShardReason, idempotency_hash
 app/shards/store.py  ShardStore protocol + in-memory
 app/shards/firestore_store.py  Firestore transaction 구현
-app/shards/service.py  ShardLedgerService (credit · debit · refund_iap · reverse_iap_refund)
+app/shards/service.py  ShardLedgerService (credit · debit · refund_iap · reverse_iap_refund
+                       · apply_in_transaction — 호출자가 transaction을 소유)
 app/shards/attendance.py  KST 날짜 규칙 + 출석 지급
 app/core/config.py   환경변수 + logging
 app/api/iap.py       POST /users/me/iap/shards (body는 signedTransaction 하나)
@@ -583,6 +584,39 @@ production 알림은 전송되지 않아, 검증되지 않은 코드가 실제 �
 
 `Transaction.currentEntitlements`는 **consumable 복구에 쓰지 않는다** — 소모품은 거기에 남지 않는다.
 
+### 호출자가 소유하는 transaction (B-7B) — Marketplace의 토대
+
+`credit` / `debit` / `refund_iap` / `reverse_iap_refund`는 **각자 transaction을 열고 닫는다.**
+그래서 marketplace 구매처럼 **지갑 두 개 + 원장 두 줄 + 소유권**을 한 번에 커밋해야 하는
+경우에 쓸 수 없다 — 두 번 부르면 "구매자만 차감된" 중간 상태가 실제로 생긴다.
+
+`ShardLedgerService.apply_in_transaction(transaction, user_id, delta, reason, external_event_id)`은
+**이미 열려 있는 transaction에 조각 이동 하나를 얹기만 한다.** 열지도 commit하지도 않는다.
+
+- **범용 이체가 아니다.** 보내는 사람·받는 사람을 한 번에 받는 자리가 없고
+  `POST /shards/transfer` 같은 endpoint도 만들지 않는다 —
+  marketplace 밖의 임의 조각 이동은 제품에 없다. 테스트가 소스에서 금지한다
+- 방향은 `delta` 부호 + 호출부가 고른 `reason`이 함께 정한다
+  (`mirror_purchase` −, `mirror_sale` +, `mirror_publish_fee` −)
+- **같은 transaction에서 같은 지갑을 두 번 바꾸면 `WalletAlreadyChanged`다.**
+  Firestore transaction의 읽기는 시작 시점 snapshot이라 두 번째가 첫 번째를 못 보고
+  덮어쓴다 — 조각이 조용히 사라지는 경로다. 자기 자신에게 파는 경우가 정확히 이 모양이라
+  상위 service의 검사에만 기대지 않고 저장소에서 막는다
+- 잔액 부족은 `InsufficientShards` — **호출자의 transaction 전체가 취소된다.** 음수 불가
+- 멱등 열쇠는 다른 이유와 **같은 `idempotency_hash`**다. 구매자/판매자/수수료가
+  각각 다른 문서 ID를 갖는다(user_id와 reason이 섞이므로)
+- quota · 전역 claim은 다루지 않는다. 필요하면 `apply`를 쓴다
+
+**기존 `apply`를 이 primitive 위에 다시 얹지 않았다.** `apply`의 읽기 순서
+(claim → 멱등 → quota → 지갑)에는 "중복이면 quota를 깎지 않는다" 같은 규칙이 박혀 있고,
+살아 있는 지급 경로 전부가 그 위에 있다. 대신 **지갑 projection 계산만 `_moved()` 한 곳으로
+뽑아** 둘이 같은 규칙을 쓰게 했다 — 중복은 없애고 검증된 choreography는 건드리지 않았다.
+
+test용 `InMemoryTransaction`은 쓰기를 모았다가 commit에서 반영한다.
+Firestore의 all-or-nothing을 흉내 내야 "구매자만 차감된 상태가 없다"를 실제로 시험할 수 있다.
+
+`tests/test_shard_transactions.py`가 위 전부를 고정한다.
+
 ### Admin Shard CLI (A-2) — 운영자 조정은 CLI 하나뿐
 
 운영/테스트용 지급·회수는 **`scripts/admin_shards.py`** 로만 한다.
@@ -1050,7 +1084,7 @@ B-3 원장 위에 얹는다. 전부 server가 지급 / 차감한다.
 | A-1A ✅ | AI 스티커 — **−6개**, 실패하면 환불 | `ai_sticker` · `refund` |
 | B-6 ✅ | 조각 IAP — 10 / 50 / 100, 환불 회수 · 되돌리기 | `iap_purchase` · `iap_refund` · `iap_refund_reversed` |
 | B-7 | 꾸미러 Pass — ₩4,900 월 / ₩39,000 년 | 정책 확정 후 |
-| B-8 | 마켓 — 등록 20 조각, 조각 구매 거울은 영구 소유 | `mirror_publish_fee` · `mirror_purchase` · `mirror_sale` |
+| B-7 | 마켓 — 등록 20 조각, 조각 구매 거울은 영구 소유 | `mirror_publish_fee` · `mirror_purchase` · `mirror_sale` |
 
 ## Next Phase
 

@@ -174,6 +174,55 @@ class ShardLedgerService:
         )
         return result
 
+    # MARK: - 호출자가 소유하는 transaction (B-7B)
+
+    def transaction(self):
+        """marketplace처럼 **다른 문서와 함께 commit해야 하는** 호출자가 transaction을 연다."""
+        return self._store.transaction()
+
+    def apply_in_transaction(
+        self,
+        transaction,
+        user_id: str,
+        delta: int,
+        reason: ShardReason,
+        external_event_id: str,
+    ) -> ShardMutationResult:
+        """이미 열려 있는 transaction에 조각 이동 하나를 얹는다. **commit하지 않는다.**
+
+        marketplace가 유일한 사용자다 — 구매는 **구매자 지갑 · 판매자 지갑 · 원장 두 줄 ·
+        ownership**이 한 transaction에서 커밋돼야 하고, `credit`/`debit`은 각자 transaction을
+        열어 버려서 "구매자만 차감된" 중간 상태를 만든다.
+
+        **범용 이체 함수가 아니다.** 보내는 사람 · 받는 사람을 한 번에 받는 자리가 없고,
+        방향은 `delta`의 부호가 아니라 **호출부가 고른 `reason`**과 함께 읽힌다.
+        같은 지갑을 한 transaction에서 두 번 바꾸려 하면 저장소가 거절한다
+        (자기 자신에게 파는 경우가 정확히 그 모양이다).
+
+        열쇠는 다른 이유와 **같은 함수**로 만든다 — user scope도 여기서 강제한다.
+        """
+        key = idempotency_hash(user_id, reason, external_event_id)
+        wallet, entry, applied = self._store.apply_in_transaction(
+            transaction, user_id, self._moved(delta), reason, key
+        )
+        event = "shard_ledger_credit" if entry.delta > 0 else "shard_ledger_debit"
+        logger.info(
+            "%s reason=%s delta=%d balance=%d applied=%s scoped=True",
+            event, reason.value, entry.delta, wallet.balance, applied,
+        )
+        return ShardMutationResult(wallet=wallet, applied=applied)
+
+    @staticmethod
+    def _moved(delta: int) -> int:
+        """0은 이동이 아니다. 크기 검사는 `_checked`와 같은 규칙을 쓴다."""
+        if not isinstance(delta, int) or isinstance(delta, bool):
+            raise InvalidShardAmount("delta must be an integer")
+        if delta == 0:
+            raise InvalidShardAmount("delta must not be zero")
+        if abs(delta) > MAX_DELTA:
+            raise InvalidShardAmount("delta is too large")
+        return delta
+
     # MARK: - 내부
 
     def _apply(
