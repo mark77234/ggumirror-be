@@ -20,7 +20,7 @@ Backend repository for 꾸미러.
 - purchase / ownership
 - seller shard settlement
 
-## Current Implementation (Phase B-7F 완료 · 미배포)
+## Current Implementation (Phase B-7F.1 완료 · 미배포)
 
 FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth +
 server-authoritative 조각 원장 + 하루 한 번 출석 + AdMob rewarded SSV + AI 스티커 생성 +
@@ -861,15 +861,71 @@ marketplace/snapshots/{snapshotId}/assets/{assetId}.png
 
 | 대상 | 규칙 |
 |---|---|
-| manifest | UTF-8 JSON object · ≤ 256 KB |
+| manifest | UTF-8 JSON object · ≤ 256 KB · 중첩 ≤ 32단 |
 | 이미지 | `\x89PNG\r\n\x1a\n` magic · 각 ≤ 2 MB |
 | snapshot 전체 | ≤ 10 MB · asset ≤ 32개 |
 | `assetId` | UUID 형식만. `../` · `/`가 애초에 통과하지 못한다 |
-| manifest 내용 | `../` · `file://` · `http(s)://` · `data:` · `<script` 금지 |
-| 선언 ↔ 업로드 | `assetIds`와 실제 업로드가 **정확히 일치**해야 한다 |
+| 구조 field | `../` · `file://` · `http(s)://` · `data:` · `<script` 금지 |
+| 참조 ↔ 업로드 | **manifest가 실제로 참조하는 것**과 업로드가 정확히 일치 |
 
 `manifest_checksum`은 **서버가 계산한다** — client가 보낸 값을 믿지 않는다.
-`assetId`가 UUID로 제한되므로 경로 조작은 문자 수준에서 불가능하다.
+raw 저장 바이트 기준이고, parse/re-serialize한 값의 hash가 아니다.
+
+#### contentType ↔ manifest 결합 (B-7F.1)
+
+label만 바꿔 스티커를 거울로 등록할 수 없다. **완전한 Swift decoder를 Python에
+다시 만들지 않는다** — 두 종류를 구분하기에 충분한 최소 구조만 본다:
+
+| contentType | 요구 | 금지 |
+|---|---|---|
+| `mirror` | `id`(str) · `name`(str) · `style`(object) | 최상위 `design` |
+| `sticker` | `id`(str) · `name`(str) · `design.style`(object) | — |
+
+`design` 유무가 두 포맷을 가르는 지점이다(`StickerProject`에는 있고 `MyMirror`에는 없다).
+
+**key 동일성을 요구하지 않는다** — client가 나중에 optional field를 더해도 옛
+backend가 깨지지 않아야 한다. 모르는 key는 안전한 값이면 통과한다. 다만 `stickers` ·
+`importedArtworks`가 **있는데 배열이 아니면** 우리가 아는 포맷이 아니라 거절한다.
+
+API와 **service 양쪽**에서 확인한다. 한 경로에만 두면 다른 경로가 생기는 순간
+구매자가 못 읽는 바이트가 팔리고, snapshot은 불변이라 되돌릴 수 없다.
+
+#### 참조 asset은 manifest에서 뽑는다 (B-7F.1)
+
+**client가 따로 보낸 목록을 authority로 쓰지 않는다.** B-7F에는 서버가 발명한
+`assetIds` 필드가 있었는데 client는 그런 것을 적지 않는다 — 실제 client JSON을
+넣어보니 *사진을 참조하는 거울이 asset 0개로 통과했다.* 구매자는 이미지가 비어
+있는 템플릿을 받고, snapshot은 불변이라 고칠 수 없다. 그래서 구조에서 뽑는다:
+
+| 종류 | 참조 위치 |
+|---|---|
+| 거울 | `stickers[].source.assetID` (`kind == "photo"`일 때만) · `importedArtworks[].assetID` |
+| 스티커 | `finalAssetID`(optional) · `design.stickers[].source.assetID` · `design.importedArtworks[].assetID` |
+
+**asset이 아닌 것**: `stickers[].id` · `importedArtworks[].id` · `strokes[].id` ·
+`texts[].id`는 오브젝트 자기 식별자다(둘 다 UUID라서 구분하지 않으면 없는 PNG를
+요구한다). `generationIDs`도 아니다 — AI 생성 기록 id이고 파일이 아니다.
+`style.doodles[].symbol`은 SF Symbol 이름이다. client GC가 정확히 위 목록만
+살려두는 것을 확인했다(`MyMirror.assetIDs(_:)` · `collectAssetGarbage(keeping:)`).
+
+집합은 **정확히 같아야 한다.** 빠지면 조용히 깨지고, 남으면 manifest 어디서도
+쓰지 않는 이미지를 몰래 넣은 것이다. 같은 assetID를 여러 오브젝트가 참조하는 것은
+정상이고 업로드는 1개다 — **multipart로 같은 assetID를 두 번 보내면 거절한다**
+(dict로 모으면 마지막 값이 조용히 이겨서, 업로더가 보낸 것과 다른 이미지가 팔린다).
+
+#### 금지 문자열 검사는 산문을 비껴간다 (B-7F.1)
+
+`TextObject.text`(100자 장식 문구)와 `name`은 사용자가 자유롭게 쓴다. 거울에
+"https://insta.gr/me"라고 적는 것은 흔한 꾸미기인데, 전체 텍스트를 훑는 검사는
+그 package를 통째로 거절했다. 그 문자열은 asset을 가리키지 않고 client는 `Text`로
+그릴 뿐이다. 그래서 `PROSE_KEYS = {"name", "text"}`만 면제한다.
+
+진짜 방어는 **참조 위치를 구조에서 뽑아 UUID만 허용하는 것**이다 — 경로·URL은
+UUID 형식을 통과할 수 없으므로 asset 자리에서 경로 조작이 문자 수준에서 불가능하다.
+면제는 참조 위치로 새지 않는다(같은 object 안에 `name`이 있어도 `assetID`는 검사한다).
+
+깊게 중첩된 JSON은 `json.loads`가 `RecursionError`로 죽어 500이 됐다 — 이제
+32단 상한으로 400이다.
 
 전달 규칙:
 

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 
 from app.auth.models import User
@@ -28,8 +29,10 @@ from app.marketplace.models import (
     normalized_title,
 )
 from app.marketplace.assets import (
+    AssetError,
     AssetNotFound,
     AssetStorageUnavailable,
+    referenced_asset_ids,
     MarketplaceAssetStorage,
     SnapshotPackage,
     asset_key,
@@ -209,6 +212,20 @@ class MarketplaceService:
             raise InvalidListing("contentType") from error
         if self._assets is None:
             raise AssetStorageUnavailable("marketplace asset bucket is not configured")
+
+        # **API가 이미 검증했지만 여기서 다시 확인한다.** 저장된 manifest가 선언한
+        # contentType과 맞지 않으면 구매자 앱이 못 읽는 바이트를 판 것이 되고,
+        # snapshot은 불변이라 나중에 고칠 수 없다. 검증을 한 호출 경로에만
+        # 의존하지 않는다 — 우회하면 손해가 구매자에게 간다.
+        try:
+            referenced = referenced_asset_ids(kind.value, json.loads(package.manifest))
+        except (AssetError, ValueError) as error:
+            # **`InvalidListing`으로 바꾼다.** 그대로 두면 API가 `AssetError`를
+            # 저장소 장애(503)로 분류해서, 잘못된 package를 보낸 판매자에게
+            # "서버 문제"라고 거짓말한다.
+            raise InvalidListing("manifest does not match contentType") from error
+        if referenced != set(package.assets):
+            raise InvalidListing("package assets do not match the manifest")
 
         snapshot_id = Snapshot.new_id()
         keys = [

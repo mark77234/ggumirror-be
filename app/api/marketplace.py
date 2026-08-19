@@ -176,17 +176,24 @@ async def create_snapshot(
     if len(uploaded) > MAX_ASSETS:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "too many assets")
 
+    # 확장자를 떼고 남은 것이 UUID여야 한다 — 검증은 `checked_package`가 한다.
+    #
+    # **dict comprehension으로 모으지 않는다.** 같은 assetID가 두 번 오면 마지막 값이
+    # 조용히 이기고, 업로더는 자기가 보낸 것과 다른 이미지가 팔리는 것을 모른다.
+    # 여기서 거절한다.
+    parts: dict[str, bytes] = {}
+    for item in uploaded:
+        asset_id = (item.filename or "").removesuffix(".png")
+        if asset_id in parts:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "duplicate asset")
+        parts[asset_id] = await _read_capped(item, MAX_IMAGE_BYTES, "asset")
+
     try:
         package = checked_package(
+            content_type=contentType,
             manifest=await _read_capped(manifest, MAX_MANIFEST_BYTES, "manifest"),
             preview=await _read_capped(preview, MAX_IMAGE_BYTES, "preview"),
-            assets={
-                # 확장자를 떼고 남은 것이 UUID여야 한다 — 검증은 `checked_package`가 한다.
-                (item.filename or "").removesuffix(".png"): await _read_capped(
-                    item, MAX_IMAGE_BYTES, "asset"
-                )
-                for item in uploaded
-            },
+            assets=parts,
         )
     except AssetTooLarge as error:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "package is too large") from error

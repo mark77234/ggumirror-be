@@ -52,6 +52,27 @@ FORBIDDEN_IN_MANIFEST = (
     "<script", "/etc/", "\\\\",
 )
 
+#: 사용자가 자유롭게 쓰는 글. **여기는 위 검사에서 뺀다.**
+#:
+#: `TextObject.text`는 100자 장식 문구이고 `name`은 사용자가 붙인 이름이다.
+#: 거울에 "https://insta.gr/me"라고 써 넣는 것은 정상적인 사용인데, 전체 텍스트를
+#: 훑는 검사는 그 package를 통째로 거절했다(B-7F.1에서 재현). 그 문자열은 asset을
+#: 가리키지 않는다 — client는 `Text`로 그릴 뿐이고 우리는 JSON으로만 돌려준다.
+#:
+#: 진짜 방어는 **참조 위치를 구조에서 뽑아 UUID만 허용하는 것**이다(아래).
+#: 경로·URL은 UUID 형식을 통과할 수 없으므로 asset 자리에서는 애초에 불가능하다.
+PROSE_KEYS = frozenset({"name", "text"})
+
+#: JSON 중첩 상한. 이보다 깊으면 우리 포맷이 아니고, `json.loads`가
+#: `RecursionError`로 죽는다(재현했다) — 500이 아니라 400으로 끊는다.
+MAX_MANIFEST_DEPTH = 32
+
+#: contentType별 manifest 모양. **완전한 Swift decoder를 다시 만들지 않는다** —
+#: 두 종류를 구분하기에 충분한 최소 구조만 본다. client가 나중에 optional field를
+#: 더해도 깨지지 않도록 **key 동일성(exact equality)을 요구하지 않는다.**
+MIRROR = "mirror"
+STICKER = "sticker"
+
 
 class AssetError(Exception):
     """package가 규칙에 맞지 않는다."""
@@ -210,11 +231,14 @@ def asset_key(snapshot_id: str, asset_id: str) -> str:
 
 
 def checked_package(
-    *, manifest: bytes, preview: bytes, assets: dict[str, bytes]
+    *, content_type: str, manifest: bytes, preview: bytes, assets: dict[str, bytes]
 ) -> SnapshotPackage:
     """**저장 전에** package를 검사한다. 통과하지 못하면 아무것도 올라가지 않는다.
 
     확장자·`Content-Type`을 믿지 않는다 — 실제 바이트를 본다.
+
+    `content_type`이 manifest의 실제 모양과 맞아야 한다. label만 바꿔
+    스티커를 거울로 등록할 수 없다.
     """
     if len(manifest) == 0 or len(manifest) > MAX_MANIFEST_BYTES:
         raise AssetTooLarge("manifest")
@@ -223,7 +247,7 @@ def checked_package(
     if len(assets) > MAX_ASSETS:
         raise AssetTooLarge("assetCount")
 
-    document = _checked_manifest(manifest)
+    referenced = referenced_asset_ids(content_type, _checked_manifest(manifest))
 
     if not preview.startswith(PNG_MAGIC):
         raise AssetError("preview is not a PNG")
@@ -235,11 +259,14 @@ def checked_package(
         if not data.startswith(PNG_MAGIC):
             raise AssetError("asset is not a PNG")
 
-    # manifest가 말한 것과 실제 올라온 것이 **정확히 같아야 한다** —
-    # 빠진 이미지가 있으면 다른 기기에서 복원할 때 조용히 깨진다.
-    declared = {str(x) for x in document.get("assetIds", [])}
-    if declared != set(assets):
-        raise AssetError("assetIds do not match the uploaded assets")
+    # **manifest가 authority다.** client가 따로 보낸 목록을 믿지 않는다.
+    #
+    # 정확히 같아야 한다. 빠지면 구매자 기기에서 이미지가 비어 보이고(조용히 깨진다),
+    # 남으면 manifest 어디서도 쓰지 않는 이미지를 package에 몰래 넣은 것이다.
+    if referenced != set(assets):
+        missing = sorted(referenced - set(assets))
+        extra = sorted(set(assets) - referenced)
+        raise AssetError(f"asset set mismatch missing={len(missing)} extra={len(extra)}")
 
     package = SnapshotPackage(manifest=manifest, preview=preview, assets=dict(assets))
     if package.total_bytes > MAX_SNAPSHOT_BYTES:
@@ -247,29 +274,158 @@ def checked_package(
     return package
 
 
-def _checked_manifest(manifest: bytes) -> dict:
-    """valid UTF-8 JSON이어야 하고 **경로 · 원격 자원 · 스크립트를 담을 수 없다.**
+def referenced_asset_ids(content_type: str, document: dict) -> set[str]:
+    """manifest가 **실제로 참조하는** local asset id.
 
-    Marketplace 템플릿은 앱 안의 안전한 local 콘텐츠만 표현한다. client 모델에는
-    애초에 경로가 없고 이미지는 assetID로만 참조되므로, 그런 문자열이 나오면
-    우리가 아는 포맷이 아니다.
+    client 코드에서 확인한 위치만 본다:
+
+    거울(`MyMirror`)
+      - `stickers[].source.assetID` — `kind == "photo"`일 때만(`PhotoStickerAssets`)
+      - `importedArtworks[].assetID` (`ImportedArtworkAssets`)
+
+    스티커(`StickerProject`)
+      - `finalAssetID` — 완성 PNG(`UserStickerAssets`). optional이라 없으면 없는 것이다
+      - `design.stickers[].source.assetID` · `design.importedArtworks[].assetID`
+
+    **`stickers[].id` · `importedArtworks[].id` · `strokes[].id` · `texts[].id`는
+    asset이 아니다** — 오브젝트 자기 식별자다. `generationIDs`도 아니다(AI 생성 기록
+    id이고 파일이 아니다). client GC가 정확히 위 목록만 살려두는 것을 확인했다.
+    """
+    if content_type == MIRROR:
+        _mirror_shape(document)
+        return _design_asset_ids(document)
+    if content_type == STICKER:
+        design = _sticker_shape(document)
+        ids = _design_asset_ids(design)
+        # optional이다. 없는 finalAssetID를 만들어내지 않는다.
+        final = document.get("finalAssetID")
+        if final is not None:
+            ids.add(_checked_asset_id(final))
+        return ids
+    raise AssetError("contentType")
+
+
+def _mirror_shape(document: dict) -> None:
+    """거울을 구분하기에 충분한 최소 구조. **모르는 key는 허용한다.**"""
+    _string(document, "id")
+    _string(document, "name")
+    _object(document, "style")
+    # `StickerProject`에는 `design`이 있고 `MyMirror`에는 없다.
+    # 이 한 줄이 "스티커를 거울이라고 label만 바꾸는 것"을 막는다.
+    if "design" in document:
+        raise AssetError("mirror manifest must not contain design")
+
+
+def _sticker_shape(document: dict) -> dict:
+    """스티커를 구분하기에 충분한 최소 구조. 안쪽 `design`을 돌려준다."""
+    _string(document, "id")
+    _string(document, "name")
+    design = _object(document, "design")
+    # `MirrorDesign`은 `style`을 반드시 적는다 — 거울 JSON을 스티커로 우기면 여기서 걸린다.
+    _object(design, "style")
+    return design
+
+
+def _design_asset_ids(design: dict) -> set[str]:
+    """`MyMirror` / `MirrorDesign` 공통. 두 곳이 같은 부품을 쓴다."""
+    ids: set[str] = set()
+    for sticker in _array(design, "stickers"):
+        if not isinstance(sticker, dict):
+            raise AssetError("stickers")
+        source = sticker.get("source")
+        if not isinstance(source, dict):
+            raise AssetError("sticker source")
+        # `kind`가 없으면 client는 builtIn으로 읽는다 — asset이 아니다.
+        if source.get("kind") != "photo":
+            continue
+        # photo인데 assetID가 없으면 client decode가 실패한다(required).
+        if "assetID" not in source:
+            raise AssetError("photo sticker without assetID")
+        ids.add(_checked_asset_id(source["assetID"]))
+    for artwork in _array(design, "importedArtworks"):
+        if not isinstance(artwork, dict):
+            raise AssetError("importedArtworks")
+        if "assetID" not in artwork:
+            raise AssetError("importedArtwork without assetID")
+        ids.add(_checked_asset_id(artwork["assetID"]))
+    return ids
+
+
+def _checked_asset_id(value: object) -> str:
+    """asset 참조는 **UUID 문자열만**이다.
+
+    경로 구분자 · `../` · 절대 경로 · `file://` · 원격 URL은 이 형식을 통과할 수
+    없다. 그래서 참조 위치에서의 경로 조작이 문자 수준에서 불가능하다.
+    """
+    if not isinstance(value, str) or not ASSET_ID.match(value):
+        raise AssetError("asset reference is not a UUID")
+    return value
+
+
+def _string(document: dict, key: str) -> str:
+    value = document.get(key)
+    if not isinstance(value, str):
+        raise AssetError(f"{key} is not a string")
+    return value
+
+
+def _object(document: dict, key: str) -> dict:
+    value = document.get(key)
+    if not isinstance(value, dict):
+        raise AssetError(f"{key} is not an object")
+    return value
+
+
+def _array(document: dict, key: str) -> list:
+    """없으면 빈 배열이다 — client가 `decodeIfPresent`로 그렇게 읽는다.
+    단 **있는데 배열이 아니면** 우리가 아는 포맷이 아니다."""
+    value = document.get(key, [])
+    if not isinstance(value, list):
+        raise AssetError(f"{key} is not a list")
+    return value
+
+
+def _checked_manifest(manifest: bytes) -> dict:
+    """valid UTF-8 JSON object여야 하고 **경로 · 원격 자원 · 스크립트를 담을 수 없다.**
+
+    검사는 **사용자 산문(`PROSE_KEYS`)을 뺀 나머지 문자열**에 적용한다. 거울에 적은
+    장식 문구는 asset을 가리키지 않으므로, 거기 URL을 썼다고 판매를 막지 않는다.
     """
     try:
         text = manifest.decode("utf-8")
     except UnicodeDecodeError as error:
         raise AssetError("manifest is not UTF-8") from error
 
-    lowered = text.lower()
-    for banned in FORBIDDEN_IN_MANIFEST:
-        if banned in lowered:
-            raise AssetError("manifest contains a forbidden reference")
-
     try:
         document = json.loads(text)
     except json.JSONDecodeError as error:
         raise AssetError("manifest is not JSON") from error
+    except RecursionError as error:
+        # 깊은 중첩으로 parser를 죽이려는 것. 500이 아니라 400이다.
+        raise AssetError("manifest is too deeply nested") from error
+
     if not isinstance(document, dict):
         raise AssetError("manifest is not an object")
-    if not isinstance(document.get("assetIds", []), list):
-        raise AssetError("assetIds is not a list")
+    _reject_forbidden(document)
     return document
+
+
+def _reject_forbidden(value: object, key: str | None = None, depth: int = 0) -> None:
+    """산문이 아닌 문자열에서 경로 · 원격 자원 · 스크립트를 거절한다."""
+    if depth > MAX_MANIFEST_DEPTH:
+        raise AssetError("manifest is too deeply nested")
+    if isinstance(value, str):
+        if key in PROSE_KEYS:
+            return
+        lowered = value.lower()
+        for banned in FORBIDDEN_IN_MANIFEST:
+            if banned in lowered:
+                raise AssetError("manifest contains a forbidden reference")
+    elif isinstance(value, dict):
+        for name, item in value.items():
+            # key 이름도 본다 — 거기에 숨길 수 없다.
+            _reject_forbidden(name, None, depth + 1)
+            _reject_forbidden(item, name, depth + 1)
+    elif isinstance(value, list):
+        for item in value:
+            _reject_forbidden(item, key, depth + 1)

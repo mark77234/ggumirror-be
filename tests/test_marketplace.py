@@ -1965,21 +1965,102 @@ from app.marketplace.assets import (   # noqa: E402
 from app.marketplace.models import Snapshot   # noqa: E402
 
 ASSET_A = "A0000001-0000-4000-A000-000000000001"
+ASSET_B = "B0000002-0000-4000-A000-000000000002"
 PNG = PNG_MAGIC + b"pretend-pixels"
+
+# 아래 fixture는 **실제 client `encode(to:)`가 내는 모양**이다(B-7F.1에서 재audit).
+# 서버가 상상한 schema가 아니다 — `assetIds` 같은 필드는 client에 없다.
+
+STYLE = {
+    "frame": {"red": 1.0, "green": 0.9, "blue": 0.9, "alpha": 1.0},
+    "insets": {"top": 0.1, "right": 0.05, "bottom": 0.1, "left": 0.05},
+    "doodles": [],
+    "frameVisible": True,
+}
+
+
+def photo_sticker(asset_id: str, *, object_id: str = "11111111-1111-4111-8111-111111111111") -> dict:
+    """`StickerObject` + `StickerSource.photo`. `id`는 **오브젝트 식별자**이고
+    asset이 아니다 — 참조는 `source.assetID`뿐이다."""
+    return {
+        "id": object_id,
+        "source": {"kind": "photo", "assetID": asset_id, "aspectRatio": 1.0},
+        "frame": {"x": 0.5, "y": 0.5, "width": 0.2, "height": 0.2},
+        "rotation": 0.0, "opacity": 1.0, "zIndex": 0,
+        "isLocked": False, "isFlippedHorizontally": False,
+    }
+
+
+def builtin_sticker(name: str = "heart") -> dict:
+    """내장 스티커. **asset을 참조하지 않는다.**"""
+    return {
+        "id": "33333333-3333-4333-8333-333333333333",
+        "source": {"kind": "builtIn", "sticker": name},
+        "frame": {"x": 0.3, "y": 0.3, "width": 0.1, "height": 0.1},
+        "rotation": 0.0, "opacity": 1.0, "zIndex": 1,
+        "isLocked": False, "isFlippedHorizontally": False,
+    }
+
+
+def artwork(asset_id: str, *, object_id: str = "44444444-4444-4444-8444-444444444444") -> dict:
+    """`ImportedArtworkObject`. `assetID`가 참조다."""
+    return {"id": object_id, "assetID": asset_id, "opacity": 1.0, "zIndex": 2}
+
+
+def text_object(text: str) -> dict:
+    """`TextObject`. `text`는 사용자가 쓰는 100자 장식 문구다."""
+    return {
+        "id": "22222222-2222-4222-8222-222222222222",
+        "text": text, "center": {"x": 0.5, "y": 0.8}, "fontSize": 0.088,
+        "style": "basic", "alignment": "center",
+        "color": {"red": 0, "green": 0, "blue": 0, "alpha": 1},
+        "rotation": 0.0, "opacity": 1.0, "zIndex": 0, "isLocked": False,
+    }
+
+
+def mirror_document(*, stickers=None, artworks=None, texts=None, **extra) -> dict:
+    """`MyMirror.encode`가 적는 8개 key 그대로."""
+    document = {
+        "id": "mirror-1", "name": "내 거울", "origin": "made", "style": STYLE,
+        "strokes": [],
+        "stickers": stickers or [],
+        "texts": texts or [],
+        "importedArtworks": artworks or [],
+    }
+    document.update(extra)
+    return document
+
+
+def sticker_document(*, final: str | None = None, stickers=None,
+                     artworks=None, **extra) -> dict:
+    """`StickerProject.encode`가 적는 모양. `design`은 `MirrorDesign`이다.
+
+    `generationIDs`는 비어 있으면 client가 **적지 않는다** — 여기서도 뺀다.
+    """
+    document = {
+        "id": "sticker-1", "name": "내 스티커",
+        "createdAt": 0.0, "updatedAt": 0.0,
+        "design": {
+            "id": "sticker-1", "name": "내 스티커", "style": STYLE,
+            "strokes": [], "stickers": stickers or [], "texts": [],
+            "importedArtworks": artworks or [], "canvas": "sticker",
+        },
+        "origin": "made",
+    }
+    if final is not None:
+        document["finalAssetID"] = final
+    document.update(extra)
+    return document
+
+
+def as_bytes(document: dict) -> bytes:
+    return _json.dumps(document, ensure_ascii=False).encode()
 
 
 def manifest_bytes(asset_ids: list[str] | None = None, **extra) -> bytes:
-    """client Codable JSON을 흉내 낸 최소 문서. 서버는 이것을 해석하지 않는다."""
-    document = {
-        "schemaVersion": 2,
-        "id": "mirror-1",
-        "name": "내 거울",
-        "style": {"frame": {"red": 1.0, "green": 0.9, "blue": 0.9, "alpha": 1.0}},
-        "stickers": [],
-        "assetIds": asset_ids or [],
-    }
-    document.update(extra)
-    return _json.dumps(document, ensure_ascii=False).encode()
+    """참조 asset이 있는 거울 manifest. 참조는 **구조 안에** 들어간다."""
+    ids = asset_ids or []
+    return as_bytes(mirror_document(stickers=[photo_sticker(x) for x in ids], **extra))
 
 
 @pytest.fixture
@@ -2000,12 +2081,28 @@ def upload(
     owner: str = SELLER,
 ) -> Snapshot:
     ids = asset_ids or []
+    if kind is ContentType.MIRROR:
+        document = mirror_document(stickers=[photo_sticker(x, object_id=_object_id(i))
+                                            for i, x in enumerate(ids)])
+    else:
+        # 스티커는 완성 PNG 하나 + 나머지는 캔버스 안 사진 cutout이다.
+        document = sticker_document(
+            final=ids[0] if ids else None,
+            stickers=[photo_sticker(x, object_id=_object_id(i))
+                      for i, x in enumerate(ids[1:])],
+        )
     package = checked_package(
-        manifest=manifest_bytes(ids),
+        content_type=kind.value,
+        manifest=as_bytes(document),
         preview=PNG,
         assets={x: PNG for x in ids},
     )
     return service.create_snapshot(user(owner), content_type=kind.value, package=package)
+
+
+def _object_id(index: int) -> str:
+    """오브젝트 식별자는 서로 달라야 한다 — asset id와는 다른 것이다."""
+    return f"1111111{index}-1111-4111-8111-111111111111"
 
 
 def listing_with_snapshot(store, snapshot: Snapshot, *, price: int = 30,
@@ -2046,7 +2143,7 @@ def test_snapshot_id_is_server_generated(asset_service):
 def test_checksum_is_server_computed(asset_service):
     import hashlib
 
-    package = checked_package(manifest=manifest_bytes(), preview=PNG, assets={})
+    package = checked_package(content_type="mirror", manifest=manifest_bytes(), preview=PNG, assets={})
     snapshot = asset_service.create_snapshot(
         user(), content_type="mirror", package=package
     )
@@ -2059,7 +2156,7 @@ def test_snapshot_binds_to_the_uploader(asset_service, store):
 
 
 def test_unknown_content_type_is_refused(asset_service, storage):
-    package = checked_package(manifest=manifest_bytes(), preview=PNG, assets={})
+    package = checked_package(content_type="mirror", manifest=manifest_bytes(), preview=PNG, assets={})
     with pytest.raises(InvalidListing):
         asset_service.create_snapshot(user(), content_type="album", package=package)
     assert storage.objects == {}, "거절됐는데 object가 올라갔다"
@@ -2118,7 +2215,7 @@ def test_partial_upload_leaves_no_snapshot_document(store, shards, storage):
 
     failing = FailsOnPreview()
     service = MarketplaceService(store, shards, assets=failing)
-    package = checked_package(manifest=manifest_bytes(), preview=PNG, assets={})
+    package = checked_package(content_type="mirror", manifest=manifest_bytes(), preview=PNG, assets={})
 
     with pytest.raises(AssetError):
         service.create_snapshot(user(), content_type="mirror", package=package)
@@ -2145,16 +2242,17 @@ def test_incomplete_legacy_snapshot_delivers_nothing(store, shards, storage, ser
 
 def test_oversized_manifest_is_refused():
     with pytest.raises(AssetTooLarge):
-        checked_package(manifest=b"x" * (MAX_MANIFEST_BYTES + 1), preview=PNG, assets={})
+        checked_package(content_type="mirror", manifest=b"x" * (MAX_MANIFEST_BYTES + 1), preview=PNG, assets={})
 
 
 def test_oversized_image_is_refused():
     big = PNG_MAGIC + b"x" * MAX_IMAGE_BYTES
     with pytest.raises(AssetTooLarge):
-        checked_package(manifest=manifest_bytes(), preview=big, assets={})
+        checked_package(content_type="mirror", manifest=manifest_bytes(), preview=big, assets={})
     with pytest.raises(AssetTooLarge):
         checked_package(
-            manifest=manifest_bytes([ASSET_A]), preview=PNG, assets={ASSET_A: big}
+            content_type="mirror", manifest=manifest_bytes([ASSET_A]),
+            preview=PNG, assets={ASSET_A: big},
         )
 
 
@@ -2165,7 +2263,8 @@ def test_oversized_snapshot_is_refused():
     chunk = PNG_MAGIC + b"x" * (MAX_SNAPSHOT_BYTES // 8)
     with pytest.raises(AssetTooLarge):
         checked_package(
-            manifest=manifest_bytes(ids), preview=PNG, assets={x: chunk for x in ids}
+            content_type="mirror", manifest=manifest_bytes(ids),
+            preview=PNG, assets={x: chunk for x in ids},
         )
 
 
@@ -2173,13 +2272,13 @@ def test_oversized_snapshot_is_refused():
 def test_non_png_images_are_refused(data):
     """확장자를 믿지 않는다 — 실제 바이트를 본다."""
     with pytest.raises((AssetError, AssetTooLarge)):
-        checked_package(manifest=manifest_bytes(), preview=data, assets={})
+        checked_package(content_type="mirror", manifest=manifest_bytes(), preview=data, assets={})
 
 
 @pytest.mark.parametrize("manifest", [b"not json", b"[]", b"\xff\xfe invalid", b""])
 def test_malformed_manifest_is_refused(manifest):
     with pytest.raises((AssetError, AssetTooLarge)):
-        checked_package(manifest=manifest, preview=PNG, assets={})
+        checked_package(content_type="mirror", manifest=manifest, preview=PNG, assets={})
 
 
 @pytest.mark.parametrize(
@@ -2198,7 +2297,7 @@ def test_malformed_manifest_is_refused(manifest):
 def test_manifest_cannot_reference_outside_content(poison):
     """§25 — 템플릿은 앱 안의 안전한 local 콘텐츠만 표현한다."""
     with pytest.raises(AssetError):
-        checked_package(manifest=manifest_bytes(note=poison), preview=PNG, assets={})
+        checked_package(content_type="mirror", manifest=manifest_bytes(note=poison), preview=PNG, assets={})
 
 
 @pytest.mark.parametrize("asset_id", ["../evil", "a/b", "not-a-uuid", "", "..%2f"])
@@ -2206,18 +2305,21 @@ def test_asset_ids_must_be_uuids(asset_id):
     """경로 조작이 성립할 문자가 애초에 통과하지 못한다."""
     with pytest.raises(AssetError):
         checked_package(
-            manifest=manifest_bytes([asset_id]), preview=PNG, assets={asset_id: PNG}
+            content_type="mirror", manifest=manifest_bytes([asset_id]),
+            preview=PNG, assets={asset_id: PNG},
         )
     with pytest.raises(AssetError):
         asset_key("snap", asset_id)
 
 
-def test_declared_and_uploaded_assets_must_match():
+def test_referenced_and_uploaded_assets_must_match():
     """빠진 이미지가 있으면 다른 기기에서 복원할 때 조용히 깨진다."""
     with pytest.raises(AssetError):
-        checked_package(manifest=manifest_bytes([ASSET_A]), preview=PNG, assets={})
+        checked_package(content_type="mirror", manifest=manifest_bytes([ASSET_A]),
+                        preview=PNG, assets={})
     with pytest.raises(AssetError):
-        checked_package(manifest=manifest_bytes([]), preview=PNG, assets={ASSET_A: PNG})
+        checked_package(content_type="mirror", manifest=manifest_bytes([]),
+                        preview=PNG, assets={ASSET_A: PNG})
 
 
 # MARK: - 공개 미리보기 (§16)
@@ -2271,7 +2373,7 @@ def test_owner_can_fetch_the_template(asset_service, store, shards):
 
     stored = asset_service.template(user(BUYER), "with-asset")
 
-    assert _json.loads(stored.data)["schemaVersion"] == 2
+    assert _json.loads(stored.data)["id"] == "mirror-1"
 
 
 def test_free_owner_can_fetch_the_template(asset_service, store):
@@ -2508,7 +2610,7 @@ def test_missing_bucket_fails_closed(store, shards, shard_store):
     from app.marketplace.assets import AssetStorageUnavailable
 
     blind = MarketplaceService(store, shards, assets=None)
-    package = checked_package(manifest=manifest_bytes(), preview=PNG, assets={})
+    package = checked_package(content_type="mirror", manifest=manifest_bytes(), preview=PNG, assets={})
 
     with pytest.raises(AssetStorageUnavailable):
         blind.create_snapshot(user(), content_type="mirror", package=package)
@@ -2529,3 +2631,502 @@ def test_missing_bucket_fails_closed(store, shards, shard_store):
     )
     with TestClient(app, raise_server_exceptions=False) as http:
         assert http.get("/marketplace/listings/live/preview").status_code == 503
+
+
+# MARK: - package contract (B-7F.1)
+#
+# 세 가지를 못 하게 만드는 것이 전부다:
+# 1. 스티커를 거울이라고 **label만 바꿔** 등록
+# 2. manifest가 참조하는데 **업로드되지 않은** asset
+# 3. manifest가 쓰지 않는 asset을 **몰래 끼워 넣기**
+
+from app.marketplace.assets import (   # noqa: E402
+    MAX_MANIFEST_DEPTH,
+    PROSE_KEYS,
+    referenced_asset_ids,
+)
+
+
+def package(content_type: str, document: dict, assets: dict[str, bytes]):
+    return checked_package(
+        content_type=content_type, manifest=as_bytes(document), preview=PNG, assets=assets
+    )
+
+
+# MARK: - 타입 결합 (§3)
+
+
+def test_mirror_manifest_is_accepted():
+    result = package("mirror", mirror_document(), {})
+    assert result.assets == {}
+
+
+def test_sticker_manifest_is_accepted():
+    result = package("sticker", sticker_document(final=ASSET_A), {ASSET_A: PNG})
+    assert set(result.assets) == {ASSET_A}
+
+
+def test_sticker_manifest_cannot_be_labelled_mirror():
+    """가장 중요 — `StickerProject` JSON을 `contentType=mirror`로 등록할 수 없다.
+
+    `design`이 있으면 거울이 아니다. label만 바꿔 통과시키면 구매자 앱이
+    `MyMirror`로 decode하다 실패하고, snapshot은 불변이라 고칠 수 없다.
+    """
+    with pytest.raises(AssetError):
+        package("mirror", sticker_document(final=ASSET_A), {ASSET_A: PNG})
+    # asset이 없어도 마찬가지다 — 크기·PNG가 아니라 **모양**이 문제다.
+    with pytest.raises(AssetError):
+        package("mirror", sticker_document(), {})
+
+
+def test_mirror_manifest_cannot_be_labelled_sticker():
+    with pytest.raises(AssetError):
+        package("sticker", mirror_document(), {})
+    with pytest.raises(AssetError):
+        package("sticker", mirror_document(stickers=[photo_sticker(ASSET_A)]), {ASSET_A: PNG})
+
+
+def test_unknown_content_type_is_refused_by_the_validator():
+    for label in ["album", "MIRROR", "", "mirror ", "sticker\n"]:
+        with pytest.raises(AssetError):
+            package(label, mirror_document(), {})
+
+
+@pytest.mark.parametrize(
+    "broken",
+    [
+        {"id": 1},                       # id가 문자열이 아니다
+        {"name": None},                  # name이 없는 것과 같다
+        {"style": "pink"},               # style이 object가 아니다
+        {"style": None},
+    ],
+)
+def test_mirror_without_the_required_shape_is_refused(broken):
+    with pytest.raises(AssetError):
+        package("mirror", {**mirror_document(), **broken}, {})
+
+
+def test_mirror_missing_style_entirely_is_refused():
+    document = mirror_document()
+    del document["style"]
+    with pytest.raises(AssetError):
+        package("mirror", document, {})
+
+
+@pytest.mark.parametrize("broken", [{"design": "x"}, {"design": None}, {"id": []}])
+def test_sticker_without_the_required_shape_is_refused(broken):
+    with pytest.raises(AssetError):
+        package("sticker", {**sticker_document(), **broken}, {})
+
+
+def test_sticker_design_must_carry_a_style():
+    document = sticker_document()
+    del document["design"]["style"]
+    with pytest.raises(AssetError):
+        package("sticker", document, {})
+
+
+def test_service_rechecks_the_type_binding(store, shards, storage):
+    """API를 우회해도 결합이 유지된다.
+
+    검증을 한 호출 경로에만 두면, 다른 경로가 생기는 순간 구매자가 못 읽는
+    바이트가 팔린다. snapshot은 불변이라 되돌릴 수 없다.
+    """
+    service = MarketplaceService(store, shards, assets=storage)
+    # mirror로 검증받은 package를 sticker라고 주장한다.
+    valid = package("mirror", mirror_document(), {})
+
+    with pytest.raises(InvalidListing):
+        service.create_snapshot(user(), content_type="sticker", package=valid)
+
+    assert store.snapshots == {}
+    assert storage.objects == {}, "거절됐는데 object가 올라갔다"
+
+
+# MARK: - 전방 호환 (§4)
+
+
+def test_unknown_additional_fields_are_accepted():
+    """client가 나중에 optional field를 더해도 옛 backend가 깨지지 않는다.
+
+    **key 동일성을 요구하지 않는다** — 핵심 key의 존재/타입만 본다.
+    """
+    result = package(
+        "mirror",
+        mirror_document(schemaVersion=3, mood="calm", futureFlags={"glow": True}),
+        {},
+    )
+    assert result.manifest_checksum
+
+
+def test_future_sticker_fields_are_accepted():
+    assert package("sticker", sticker_document(final=ASSET_A, remix=True), {ASSET_A: PNG})
+
+
+def test_omitted_optional_arrays_are_accepted():
+    """client는 빈 `generationIDs`를 적지 않고, v1 거울에는 `importedArtworks`가 없다."""
+    document = mirror_document()
+    del document["importedArtworks"]
+    del document["texts"]
+    assert package("mirror", document, {})
+
+
+def test_present_but_wrong_typed_arrays_are_refused():
+    """없는 것은 괜찮지만 **있는데 배열이 아니면** 우리가 아는 포맷이 아니다."""
+    for key in ["stickers", "importedArtworks"]:
+        with pytest.raises(AssetError):
+            package("mirror", mirror_document(**{key: {"a": 1}}), {})
+
+
+# MARK: - 참조 추출 (§5)
+
+
+def test_mirror_photo_sticker_reference_is_extracted():
+    assert referenced_asset_ids("mirror", mirror_document(
+        stickers=[photo_sticker(ASSET_A)])) == {ASSET_A}
+
+
+def test_mirror_imported_artwork_reference_is_extracted():
+    assert referenced_asset_ids("mirror", mirror_document(
+        artworks=[artwork(ASSET_B)])) == {ASSET_B}
+
+
+def test_mirror_extracts_both_kinds():
+    assert referenced_asset_ids("mirror", mirror_document(
+        stickers=[photo_sticker(ASSET_A)], artworks=[artwork(ASSET_B)],
+    )) == {ASSET_A, ASSET_B}
+
+
+def test_builtin_stickers_reference_nothing():
+    """내장 스티커·낙서·글씨·획은 파일을 참조하지 않는다."""
+    assert referenced_asset_ids("mirror", mirror_document(
+        stickers=[builtin_sticker()], texts=[text_object("안녕")],
+    )) == set()
+
+
+def test_object_ids_are_not_asset_references():
+    """`stickers[].id` · `importedArtworks[].id`는 **오브젝트 식별자**다.
+
+    둘 다 UUID라서 구분하지 않으면 존재하지 않는 PNG를 요구하게 된다.
+    """
+    document = mirror_document(
+        stickers=[builtin_sticker()],
+        artworks=[artwork(ASSET_B, object_id="99999999-9999-4999-8999-999999999999")],
+    )
+    references = referenced_asset_ids("mirror", document)
+    assert references == {ASSET_B}
+    assert "33333333-3333-4333-8333-333333333333" not in references
+    assert "99999999-9999-4999-8999-999999999999" not in references
+
+
+def test_sticker_final_asset_is_a_reference():
+    """`finalAssetID` → `UserStickerAssets/<id>.png`. client GC가 이것만 살려둔다."""
+    assert referenced_asset_ids("sticker", sticker_document(final=ASSET_A)) == {ASSET_A}
+
+
+def test_absent_final_asset_is_not_invented():
+    """optional이다. **없는 것을 가짜로 만들지 않는다.**"""
+    assert referenced_asset_ids("sticker", sticker_document()) == set()
+    assert referenced_asset_ids("sticker", sticker_document(finalAssetID=None)) == set()
+    assert package("sticker", sticker_document(), {})
+
+
+def test_sticker_design_references_are_extracted():
+    """스티커 캔버스 안의 사진 cutout·외부 디자인도 참조다."""
+    document = sticker_document(
+        final=ASSET_A, stickers=[photo_sticker(ASSET_B)],
+        artworks=[artwork("C0000003-0000-4000-A000-000000000003")],
+    )
+    assert referenced_asset_ids("sticker", document) == {
+        ASSET_A, ASSET_B, "C0000003-0000-4000-A000-000000000003"
+    }
+
+
+def test_generation_ids_are_not_asset_references():
+    """AI 생성 기록 id다 — 파일이 아니다. PNG를 요구하면 정상 스티커가 거절된다."""
+    document = sticker_document(final=ASSET_A, generationIDs=["gen-1", "gen-2"])
+    assert referenced_asset_ids("sticker", document) == {ASSET_A}
+    assert package("sticker", document, {ASSET_A: PNG})
+
+
+def test_photo_sticker_without_an_asset_id_is_refused():
+    """client decode에서 `assetID`는 required다 — 없으면 열 수 없는 파일이다."""
+    broken = photo_sticker(ASSET_A)
+    del broken["source"]["assetID"]
+    with pytest.raises(AssetError):
+        package("mirror", mirror_document(stickers=[broken]), {})
+
+
+def test_imported_artwork_without_an_asset_id_is_refused():
+    broken = artwork(ASSET_B)
+    del broken["assetID"]
+    with pytest.raises(AssetError):
+        package("mirror", mirror_document(artworks=[broken]), {})
+
+
+# MARK: - 정확히 같은 집합 (§6)
+
+
+def test_exact_asset_set_is_accepted():
+    result = package(
+        "mirror",
+        mirror_document(stickers=[photo_sticker(ASSET_A)], artworks=[artwork(ASSET_B)]),
+        {ASSET_A: PNG, ASSET_B: PNG},
+    )
+    assert set(result.assets) == {ASSET_A, ASSET_B}
+
+
+def test_referenced_but_not_uploaded_is_refused():
+    """manifest A,B / upload A → 거절. 구매자 기기에서 조용히 비어 보인다."""
+    with pytest.raises(AssetError):
+        package(
+            "mirror",
+            mirror_document(stickers=[photo_sticker(ASSET_A)], artworks=[artwork(ASSET_B)]),
+            {ASSET_A: PNG},
+        )
+
+
+def test_uploaded_but_never_referenced_is_refused():
+    """manifest A / upload A,B → 거절. 쓰지 않는 이미지를 몰래 넣을 수 없다."""
+    with pytest.raises(AssetError):
+        package("mirror", mirror_document(stickers=[photo_sticker(ASSET_A)]),
+                {ASSET_A: PNG, ASSET_B: PNG})
+
+
+def test_uploading_an_asset_a_reference_free_manifest_is_refused():
+    """manifest 참조 없음 / upload A → 거절."""
+    with pytest.raises(AssetError):
+        package("mirror", mirror_document(), {ASSET_A: PNG})
+    with pytest.raises(AssetError):
+        package("sticker", sticker_document(), {ASSET_A: PNG})
+
+
+def test_asset_free_package_is_accepted():
+    """둘 다 비어 있으면 허용이다 — 그린 것만 있는 거울/스티커가 정상이다."""
+    assert package("mirror", mirror_document(stickers=[builtin_sticker()]), {}).assets == {}
+    assert package("sticker", sticker_document(), {}).assets == {}
+
+
+def test_a_client_supplied_asset_list_is_not_authority():
+    """`assetIds` 같은 목록을 보내도 **manifest 구조가 authority다.**
+
+    (B-7F에서 서버가 발명했던 필드다. client는 그런 것을 적지 않는다.)
+    """
+    # 목록으로는 참조를 만들 수 없다.
+    with pytest.raises(AssetError):
+        package("mirror", mirror_document(assetIds=[ASSET_A]), {ASSET_A: PNG})
+    # 목록으로 실제 참조를 지울 수도 없다.
+    with pytest.raises(AssetError):
+        package("mirror", mirror_document(stickers=[photo_sticker(ASSET_A)], assetIds=[]), {})
+
+
+def test_repeated_reference_to_the_same_asset_is_accepted():
+    """§8 — 같은 사진을 두 군데 얹는 것은 정상이다. upload는 **1개**다."""
+    document = mirror_document(
+        stickers=[
+            photo_sticker(ASSET_A, object_id="55555555-5555-4555-8555-555555555555"),
+            photo_sticker(ASSET_A, object_id="66666666-6666-4666-8666-666666666666"),
+        ],
+        artworks=[artwork(ASSET_A)],
+    )
+    assert referenced_asset_ids("mirror", document) == {ASSET_A}
+    assert set(package("mirror", document, {ASSET_A: PNG}).assets) == {ASSET_A}
+
+
+# MARK: - UUID · 경로 (§7, §10)
+
+
+@pytest.mark.parametrize(
+    "poison",
+    [
+        "../secret",
+        "..\\secret",
+        "/Users/ibyeongchan/Desktop/x.png",
+        "~/Library/x.png",
+        "file:///etc/passwd",
+        "https://evil.example/x.png",
+        "http://evil.example/x.png",
+        "assets/A0000001-0000-4000-A000-000000000001",
+        "A0000001-0000-4000-A000-000000000001/../../etc",
+        "A0000001-0000-4000-A000-000000000001.png",
+        "not-a-uuid",
+        "",
+        123,
+        {"assetID": ASSET_A},
+    ],
+)
+def test_asset_references_must_be_uuid_strings(poison):
+    """참조 자리에 경로·URL·비문자열이 오면 거절이다.
+
+    UUID 형식이 아니면 통과하지 못하므로 경로 조작이 **문자 수준에서** 불가능하다.
+    """
+    broken = photo_sticker(ASSET_A)
+    broken["source"]["assetID"] = poison
+    with pytest.raises(AssetError):
+        package("mirror", mirror_document(stickers=[broken]), {})
+
+    with pytest.raises(AssetError):
+        package("sticker", sticker_document(finalAssetID=poison), {})
+
+
+def test_null_photo_reference_is_refused_but_null_final_asset_is_not():
+    """`finalAssetID`는 optional이라 `null`이 정상이다.
+
+    사진 스티커의 `assetID`는 required다 — `null`이면 client가 못 읽는다.
+    두 자리를 같은 규칙으로 뭉개지 않는다.
+    """
+    broken = photo_sticker(ASSET_A)
+    broken["source"]["assetID"] = None
+    with pytest.raises(AssetError):
+        package("mirror", mirror_document(stickers=[broken]), {})
+
+    assert package("sticker", sticker_document(finalAssetID=None), {}).assets == {}
+
+
+def test_remote_url_as_a_sticker_source_is_refused():
+    """client 포맷에 원격 자원 자리가 없다 — 새로 만들어 통과시킬 수 없다."""
+    document = mirror_document(stickers=[{
+        "id": "77777777-7777-4777-8777-777777777777",
+        "source": {"kind": "photo", "url": "https://evil.example/x.png",
+                   "assetID": ASSET_A, "aspectRatio": 1.0},
+        "frame": {"x": .5, "y": .5, "width": .2, "height": .2},
+        "rotation": 0, "opacity": 1, "zIndex": 0,
+        "isLocked": False, "isFlippedHorizontally": False,
+    }])
+    with pytest.raises(AssetError):
+        package("mirror", document, {ASSET_A: PNG})
+
+
+def test_forbidden_strings_in_structural_fields_are_refused():
+    for field in [{"origin": "file:///etc/passwd"}, {"style": {**STYLE, "hint": "../../x"}}]:
+        with pytest.raises(AssetError):
+            package("mirror", mirror_document(**field), {})
+
+
+def test_forbidden_strings_in_keys_are_refused():
+    with pytest.raises(AssetError):
+        package("mirror", mirror_document(**{"../evil": "x"}), {})
+
+
+# MARK: - 검사 정밀도 (§11)
+
+
+def test_user_text_may_contain_a_url():
+    """정상 사용을 막지 않는다.
+
+    거울에 "https://insta.gr/me"라고 적는 것은 흔한 꾸미기다. 그 문자열은 asset을
+    가리키지 않고 client는 `Text`로 그릴 뿐이다. B-7F는 이 package를 통째로
+    거절했다 — 판매자는 이유를 알 수 없었다.
+    """
+    document = mirror_document(texts=[text_object("https://insta.gr/me")])
+    assert package("mirror", document, {})
+
+
+def test_user_names_may_contain_a_url():
+    assert package("mirror", mirror_document(name="http://내거울"), {})
+    assert package("sticker", sticker_document(name="../내스티커"), {})
+
+
+def test_prose_exemption_is_narrow():
+    """면제는 `PROSE_KEYS` 둘뿐이다. 늘어나면 검사가 무력해진다."""
+    assert PROSE_KEYS == {"name", "text"}
+
+
+def test_prose_exemption_does_not_cover_asset_positions():
+    """산문 면제가 참조 자리로 새지 않는다."""
+    broken = photo_sticker(ASSET_A)
+    broken["source"]["assetID"] = "../evil"
+    broken["source"]["name"] = "https://ok-in-prose"
+    with pytest.raises(AssetError):
+        package("mirror", mirror_document(stickers=[broken]), {})
+
+
+def test_deeply_nested_manifest_is_refused_not_crashed():
+    """깊은 중첩으로 parser를 죽이려는 것. **500이 아니라 400이다.**"""
+    nested: object = "x"
+    for _ in range(MAX_MANIFEST_DEPTH + 5):
+        nested = [nested]
+    with pytest.raises(AssetError):
+        package("mirror", mirror_document(deep=nested), {})
+
+    raw = b'{"id":"a","name":"b","style":{}' + b',"a":[' * 20000
+    with pytest.raises(AssetError):
+        checked_package(content_type="mirror", manifest=raw, preview=PNG, assets={})
+
+
+# MARK: - checksum (§12)
+
+
+def test_checksum_is_over_the_raw_stored_bytes():
+    """re-serialize한 값이 아니라 **실제로 저장할 바이트**의 hash다.
+
+    구매자가 받는 바이트와 checksum이 같은 것에서 나와야 무결성 확인이 의미를 갖는다.
+    """
+    import hashlib
+
+    # 같은 문서를 공백만 다르게 적으면 checksum이 달라야 한다 — raw 기준이라는 증거다.
+    document = mirror_document()
+    compact = _json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode()
+    spaced = _json.dumps(document, ensure_ascii=False, indent=2).encode()
+
+    first = checked_package(content_type="mirror", manifest=compact, preview=PNG, assets={})
+    second = checked_package(content_type="mirror", manifest=spaced, preview=PNG, assets={})
+
+    assert first.manifest_checksum == hashlib.sha256(compact).hexdigest()
+    assert second.manifest_checksum == hashlib.sha256(spaced).hexdigest()
+    assert first.manifest_checksum != second.manifest_checksum
+
+
+def test_stored_manifest_bytes_are_unchanged(asset_service, storage, store):
+    """저장한 것이 올린 것과 **바이트 단위로 같다.** 우리가 다시 적지 않는다."""
+    raw = _json.dumps(mirror_document(), ensure_ascii=False, indent=2).encode()
+    validated = checked_package(content_type="mirror", manifest=raw, preview=PNG, assets={})
+    snapshot = asset_service.create_snapshot(user(), content_type="mirror", package=validated)
+
+    assert storage.objects[manifest_key(snapshot.id)].data == raw
+    assert store.snapshots[snapshot.id].manifest_checksum == validated.manifest_checksum
+
+
+# MARK: - HTTP 중복 (§8)
+
+
+def test_duplicate_multipart_asset_is_refused(asset_client):
+    """같은 assetID를 두 번 보내면 거절이다.
+
+    dict로 모으면 **마지막 값이 조용히 이긴다** — 업로더가 보낸 것과 다른 이미지가
+    팔리고, snapshot은 불변이라 고칠 수 없다.
+    """
+    files = [
+        ("manifest", ("manifest.json",
+                      as_bytes(mirror_document(stickers=[photo_sticker(ASSET_A)])),
+                      "application/json")),
+        ("preview", ("preview.png", PNG, "image/png")),
+        ("assets", (f"{ASSET_A}.png", PNG_MAGIC + b"first", "image/png")),
+        ("assets", (f"{ASSET_A}.png", PNG_MAGIC + b"second", "image/png")),
+    ]
+    response = asset_client.post(
+        "/marketplace/snapshots", data={"contentType": "mirror"}, files=files
+    )
+    # 인증이 먼저다 — 익명은 401. 중복 검사는 아래 단위 test가 고정한다.
+    assert response.status_code == 401
+
+
+def test_upload_endpoint_refuses_duplicates_before_reading_them():
+    """중복 검사가 **모으는 자리**에 있어야 한다. dict comprehension이면 놓친다."""
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parent.parent / "app/api/marketplace.py").read_text()
+    body = source[source.index('@router.post("/snapshots"'):]
+    body = body[: body.index("return SnapshotResponse")]
+    assert "duplicate asset" in body, "중복 거절이 없다"
+    assert "for item in uploaded" in body, "dict comprehension으로 되돌아갔다"
+    assert "removesuffix(\".png\"): await" not in body, "comprehension이 되살아났다"
+
+
+def test_snapshot_upload_passes_the_content_type_to_the_validator():
+    """API가 contentType을 검증기에 넘기지 않으면 결합이 없는 것과 같다."""
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parent.parent / "app/api/marketplace.py").read_text()
+    body = source[source.index('@router.post("/snapshots"'):]
+    assert "content_type=contentType" in body
