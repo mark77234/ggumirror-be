@@ -3415,3 +3415,140 @@ def test_real_public_list_still_only_published(seller_listings_store):
     """공개 목록은 그대로다 — 판매자 목록이 생겼어도 draft가 새지 않는다."""
     public = seller_listings_store.list_published()
     assert {x.id for x in public} == {"mine-live", "theirs-live"}
+
+
+# MARK: - 판매자 전용 미리보기 (B-7H hotfix)
+#
+# 판매자 관리 화면에 숫자만 보이고 생김새가 없어 어느 상품인지 알 수 없었다.
+# draft · unlisted도 **판매자 본인에게는** 보여야 한다.
+#
+# 가장 중요한 것: **공개 정책은 그대로다.** draft/unlisted가 공개 endpoint로
+# 새면 사기 전에 원본을 보여 주는 것이 된다.
+
+
+def test_seller_sees_preview_in_every_state(asset_service, store):
+    """draft · published · unlisted 모두 판매자에게는 보인다."""
+    for state, listing_id in [
+        (ListingStatus.DRAFT, "mine-draft"),
+        (ListingStatus.PUBLISHED, "mine-live"),
+        (ListingStatus.UNLISTED, "mine-pulled"),
+    ]:
+        snapshot = upload(asset_service, owner=SELLER)
+        listing = published(
+            store, listing_id, status=state,
+            published_at=None if state is ListingStatus.DRAFT else ...,
+        )
+        store.listings[listing_id] = type(listing)(
+            **{**listing.__dict__, "snapshot_id": snapshot.id}
+        )
+
+        stored = asset_service.seller_preview(user(SELLER), listing_id)
+
+        assert stored.data == PNG, state
+        assert stored.content_type == "image/png"
+
+
+def test_seller_preview_refuses_another_seller(asset_service, store):
+    """가장 중요 — 남의 draft를 미리보기로 엿볼 수 없다."""
+    snapshot = upload(asset_service, owner=SELLER)
+    listing = published(store, "theirs", owner=OTHER, status=ListingStatus.DRAFT,
+                        published_at=None)
+    store.listings["theirs"] = type(listing)(
+        **{**listing.__dict__, "snapshot_id": snapshot.id}
+    )
+
+    with pytest.raises(ListingNotFound):
+        asset_service.seller_preview(user(SELLER), "theirs")
+
+
+def test_seller_preview_of_missing_listing(asset_service):
+    with pytest.raises(ListingNotFound):
+        asset_service.seller_preview(user(SELLER), "nope")
+
+
+def test_seller_preview_does_not_move_counters(asset_service, store):
+    snapshot = upload(asset_service)
+    listing = listing_with_snapshot(store, snapshot)
+    before = store.listings[listing.id]
+
+    for _ in range(5):
+        asset_service.seller_preview(user(SELLER), listing.id)
+
+    after = store.listings[listing.id]
+    assert after.download_count == before.download_count
+    assert after.like_count == before.like_count
+
+
+def test_public_preview_policy_is_unchanged(asset_service, store):
+    """**회귀 금지** — 공개 미리보기는 여전히 published만이다."""
+    for state in [ListingStatus.DRAFT, ListingStatus.UNLISTED]:
+        snapshot = upload(asset_service)
+        listing = published(
+            store, f"hidden-{state.value}", status=state,
+            published_at=None if state is ListingStatus.DRAFT else ...,
+        )
+        store.listings[listing.id] = type(listing)(
+            **{**listing.__dict__, "snapshot_id": snapshot.id}
+        )
+
+        # 판매자 자신은 본다.
+        assert asset_service.seller_preview(user(SELLER), listing.id).data == PNG
+        # 공개로는 안 보인다.
+        with pytest.raises(ListingNotFound):
+            asset_service.preview(listing.id)
+
+
+def test_public_published_preview_still_works(asset_service, store):
+    snapshot = upload(asset_service)
+    listing_with_snapshot(store, snapshot)
+    assert asset_service.preview("with-asset").data == PNG
+
+
+def test_seller_preview_needs_auth(asset_client):
+    """§8 — 로그인 없이는 남의 draft 미리보기를 얻을 수 없다."""
+    assert asset_client.get(
+        "/users/me/marketplace/listings/abc/preview"
+    ).status_code == 401
+
+
+def test_seller_preview_leaks_no_storage_detail(asset_client, asset_service, store):
+    """bucket · gs:// · object key · signed URL이 응답에 없다."""
+    snapshot = upload(asset_service)
+    listing_with_snapshot(store, snapshot)
+
+    # 인증이 없으므로 401이지만, 헤더에 저장소 정보가 실릴 자리가 없음을 함께 본다.
+    response = asset_client.get("/users/me/marketplace/listings/with-asset/preview")
+    for banned in ["gs://", "bucket", "marketplace/snapshots", "X-Goog", "googleapis.com"]:
+        assert banned not in str(response.headers)
+        assert banned not in response.text
+
+
+def test_seller_preview_reuses_the_public_reader():
+    """새 storage 경로를 만들지 않았다 — 같은 key builder와 reader를 쓴다."""
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parent.parent / "app/marketplace/service.py"
+    ).read_text()
+    body = source[source.index("def seller_preview"):source.index("def template")]
+    assert "preview_key(snapshot.id)" in body
+    assert "self._read(" in body
+    # 자기만의 bucket 접근을 만들지 않았다.
+    for banned in ["storage.Client", "bucket(", "generate_signed_url", "gs://"]:
+        assert banned not in body, banned
+
+
+def test_no_signed_url_in_seller_preview_endpoint():
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parent.parent / "app/api/marketplace.py"
+    ).read_text()
+    raw = source[source.index("def my_listing_preview"):]
+    raw = raw[: raw.index("@purchases_router.get(\"/likes\")")]
+    # **docstring을 걷어낸 코드만** 본다 — 설명에 적은 단어를 잡으면 안 된다.
+    body = _code_only("def " + raw.split("def ", 1)[1])
+    for banned in ["signed_url", "generate_signed_url", "gs://", "bucket"]:
+        assert banned not in body, banned
+    # 판매자 전용이라 공용 캐시에 두지 않는다.
+    assert 'private' in raw and "immutable" in raw

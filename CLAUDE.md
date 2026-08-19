@@ -66,6 +66,7 @@ app/api/marketplace.py  GET(공개) /marketplace/listings · {id} · {id}/previe
                      GET  /marketplace/listings/{id}/template · template/assets/{assetId}
                      PUT/DELETE /marketplace/listings/{id}/like
                      GET /users/me/marketplace/purchases · likes · listings
+                     GET /users/me/marketplace/listings/{id}/preview (판매자 전용)
 app/marketplace/models.py  Listing · Snapshot · 상태 · 등록비 정책
 app/marketplace/store.py   MarketplaceStore protocol + in-memory
 app/marketplace/firestore_store.py  등록비 + 게시가 **한 transaction**
@@ -974,6 +975,24 @@ Firestore 질의는 `sellerUserId == currentUserId` **하나뿐**이다. `where`
 공개 목록과 달리 **malformed 문서를 걸러내지 않는다.** 공개는 거짓 정보를 보여
 주지 않으려고 빼지만, 판매자에게는 자기 상품이 이상한 상태라는 것 자체가 보여야
 한다 — 안 보이면 내릴 수도 없다.
+
+#### 판매자 전용 미리보기 (B-7H hotfix)
+
+```
+GET /users/me/marketplace/listings/{listingId}/preview     (인증, 판매자 본인)
+```
+
+`draft` · `published` · `unlisted` **모두** 돌려준다. 판매자 관리 화면에 숫자만
+보이고 생김새가 없어 어느 상품인지 알 수 없었다 — 아직 올리지 않은 것과 내린 것도
+그림이 필요하다.
+
+**공개 미리보기 정책은 그대로다.** `GET /marketplace/listings/{id}/preview`는
+여전히 `published`만이다. 완화하면 사기 전에 원본 성격을 보여 주는 것이 된다.
+
+판매자 본인만이고 남의 것이면 404다(존재 여부를 알려주지 않는다).
+저장소 접근은 공개 미리보기와 **같은 key builder · 같은 reader**를 쓴다 —
+새 storage 경로를 만들지 않았다. signed URL 없음, 응답에 bucket 경로 없음.
+판매자 전용이라 `Cache-Control: private`다(공개 쪽은 `public`).
 
 #### Marketplace bucket IAM (B-7G.1)
 

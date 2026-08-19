@@ -284,6 +284,24 @@ class MarketplaceService:
         snapshot = self._complete_snapshot(listing.snapshot_id)
         return self._read(preview_key(snapshot.id))
 
+    def seller_preview(self, user: User, listing_id: str):
+        """**판매자 자신의** 미리보기. `draft` · `published` · `unlisted` 모두.
+
+        공개 미리보기(`preview`)와 다른 것이다 — 그쪽은 `published`만 보여 주고
+        그 정책은 그대로 둔다. 판매자가 자기 상품을 관리하는 화면에서는 아직 올리지
+        않은 것과 내린 것도 생김새가 보여야 한다(숫자만 보이면 어느 상품인지 모른다).
+
+        **판매자 본인만이다.** 남의 draft를 미리보기로 엿볼 수 없다. 없는 것과 권한
+        없는 것을 구분해 알려주지 않는다 — 존재 여부 자체가 정보다.
+
+        저장소 접근은 `preview`와 **같은 reader**를 쓴다. 새 storage 경로를 만들지 않는다.
+        """
+        listing = self._store.any_listing(listing_id)
+        if listing.seller_user_id != user.id:
+            raise ListingNotFound(listing_id)
+        snapshot = self._complete_snapshot(listing.snapshot_id)
+        return self._read(preview_key(snapshot.id))
+
     def template(self, user: User, listing_id: str):
         """원본 템플릿. **판매자 또는 소유자만.**
 

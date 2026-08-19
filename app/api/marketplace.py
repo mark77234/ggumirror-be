@@ -575,6 +575,33 @@ def my_listings(
     return [_listing(x) for x in listings]
 
 
+@purchases_router.get("/listings/{listing_id}/preview")
+def my_listing_preview(
+    listing_id: str,
+    user: Annotated[User, Depends(current_user)],
+    service: Annotated[MarketplaceService, Depends(marketplace_service)],
+) -> Response:
+    """**내가 올린 상품의 미리보기.** `draft` · `published` · `unlisted` 모두.
+
+    공개 미리보기(`GET /marketplace/listings/{id}/preview`)는 `published`만
+    보여 주고 **그 정책은 그대로다.** 판매자 관리 화면에서만 아직 올리지 않은 것과
+    내린 것의 생김새가 필요하다 — 숫자만 보이면 어느 상품인지 알 수 없다.
+
+    판매자 본인만이고, 남의 것이면 404다(존재 여부를 알려주지 않는다).
+    signed URL을 만들지 않고 bucket 경로도 응답에 담지 않는다 — 우리가 읽어 흘려보낸다.
+    """
+    try:
+        stored = service.seller_preview(user, listing_id)
+    except AssetStorageUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+    except (ListingNotFound, SnapshotMissing, AssetNotFound) as error:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "preview not found") from error
+    except StoreUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+    # snapshot은 불변이지만 **판매자 전용**이라 공용 캐시에 두지 않는다.
+    return _streamed(stored, cache="private, max-age=3600, immutable")
+
+
 @purchases_router.get("/likes")
 def my_likes(
     user: Annotated[User, Depends(current_user)],
