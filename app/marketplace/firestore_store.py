@@ -25,7 +25,7 @@ from app.marketplace.models import (
     Snapshot,
     SnapshotNotFound,
 )
-from app.marketplace.store import LISTINGS, SNAPSHOTS
+from app.marketplace.store import LISTINGS, SNAPSHOTS, _is_public
 from app.shards.models import utcnow
 from app.shards.service import ShardLedgerService
 
@@ -58,6 +58,46 @@ class FirestoreMarketplaceStore:
         except gcp_exceptions.GoogleAPIError as error:
             raise self._unavailable("snapshot_read", error) from error
         return _owned_snapshot(found, snapshot_id, seller_user_id)
+
+    def list_published(self) -> list[Listing]:
+        """`status == published` **하나로만** 질의한다.
+
+        종류 필터와 정렬을 application에서 하는 이유: 정렬 셋(`publishedAt` ·
+        `downloadCount` · `likeCount`)마다 composite index를 만들면 index 세 개를
+        지금 production에 요구하게 된다. 초기 상품 수가 작고 pagination도 없으므로
+        **index 없이 시작한다.** 규모가 커지면 그때 index와 pagination을 함께 넣는다.
+
+        목록 한 건마다 snapshot을 추가 조회하지 않는다(N+1 금지) —
+        공개에 필요한 값은 listing 문서에 이미 다 있다.
+        """
+        try:
+            found = (
+                self._db.collection(LISTINGS)
+                .where(filter=firestore.FieldFilter("status", "==", ListingStatus.PUBLISHED.value))
+                .stream()
+            )
+            listings = [_listing_from(x.id, x.to_dict() or {}) for x in found]
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("listing_list", error) from error
+
+        skipped = [x for x in listings if not _is_public(x)]
+        if skipped:
+            # 있을 수 없는 상태다 — 거짓 날짜를 지어내지 않고 조용히 빼고 크게 남긴다.
+            logger.error("marketplace_listing_malformed count=%d", len(skipped))
+        return [x for x in listings if _is_public(x)]
+
+    def get_published(self, listing_id: str) -> Listing:
+        try:
+            snapshot = self._db.collection(LISTINGS).document(listing_id).get()
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("listing_public_read", error) from error
+        if not snapshot.exists:
+            raise ListingNotFound(listing_id)
+        listing = _listing_from(listing_id, snapshot.to_dict() or {})
+        if not _is_public(listing):
+            # 판매자 자신이라도 공개 endpoint로는 볼 수 없다.
+            raise ListingNotFound(listing_id)
+        return listing
 
     # MARK: - 최초 게시 (한 transaction)
 
@@ -217,9 +257,13 @@ def _owned_listing(snapshot, listing_id: str, seller_user_id: str) -> Listing:
     data = snapshot.to_dict() or {}
     if data.get("sellerUserId") != seller_user_id:
         raise ListingNotFound(listing_id)
+    return _listing_from(listing_id, data)
+
+
+def _listing_from(listing_id: str, data: dict) -> Listing:
     return Listing(
         id=listing_id,
-        seller_user_id=seller_user_id,
+        seller_user_id=str(data.get("sellerUserId") or ""),
         content_type=ContentType(data.get("contentType") or ContentType.MIRROR.value),
         title=str(data.get("title") or ""),
         description=str(data.get("description") or ""),

@@ -20,7 +20,7 @@ Backend repository for 꾸미러.
 - purchase / ownership
 - seller shard settlement
 
-## Current Implementation (Phase B-7C 완료 · 미배포)
+## Current Implementation (Phase B-7D 완료 · 미배포)
 
 FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth +
 server-authoritative 조각 원장 + 하루 한 번 출석 + AdMob rewarded SSV + AI 스티커 생성 +
@@ -59,7 +59,8 @@ app/shards/attendance.py  KST 날짜 규칙 + 출석 지급
 app/core/config.py   환경변수 + logging
 app/api/iap.py       POST /users/me/iap/shards (body는 signedTransaction 하나)
 app/api/app_store.py POST /app-store/notifications/v2 (Apple 서명이 곧 인증)
-app/api/marketplace.py  POST /marketplace/listings · {id}/publish · {id}/unpublish
+app/api/marketplace.py  GET(공개) /marketplace/listings · {id}
+                     POST /marketplace/listings · {id}/publish · {id}/unpublish
 app/marketplace/models.py  Listing · Snapshot · 상태 · 등록비 정책
 app/marketplace/store.py   MarketplaceStore protocol + in-memory
 app/marketplace/firestore_store.py  등록비 + 게시가 **한 transaction**
@@ -659,6 +660,59 @@ Firestore의 all-or-nothing을 흉내 내야 "구매자만 차감된 상태가 �
 
 게시가 이미 돼 있으면 `published=false`로 조용히 끝난다 — 재시도 · 연타가 오류가 아니다
 (B-4 `claimed` · B-6 `credited`와 같은 semantics). HTTP 오류로 만들지 않는다.
+
+#### 공개 조회 (B-7D)
+
+```
+GET /marketplace/listings?contentType=mirror|sticker&sort=latest|popular|likes
+GET /marketplace/listings/{id}
+```
+
+**로그인 없이 볼 수 있다** — 상점 구경에 로그인 벽을 세우지 않는다(Core Product Policy).
+등록 · 게시 · 내리기는 그대로 인증 필수다.
+
+- **`published`만 보인다.** draft · unlisted · 없는 것은 전부 404이고,
+  **판매자 자신도** 이 경로로는 자기 draft를 볼 수 없다 —
+  공개 조회와 판매자 관리를 한 endpoint에 섞지 않는다
+- `publishedAt`이 없는 `published` 문서는 있을 수 없는 상태다.
+  **거짓 날짜를 지어내지 않고** 공개에서 빼고 `marketplace_listing_malformed`로 남긴다
+- **조회가 counter를 올리지 않는다.** `downloadCount`는 B-7E(소유권 획득 성공),
+  `likeCount`는 별도 like phase다
+
+##### 공개 응답에 담지 않는 것
+
+```
+sellerUserId (내부 user UUID) · snapshotId · publishFeePaid
+schemaVersion · createdAt · updatedAt · status
+```
+
+Firestore 문서를 그대로 내보내지 않는다 — `PublicListingResponse`가 따로 있고,
+담는 것은 `id · contentType · title · description · priceShards ·
+downloadCount · likeCount · publishedAt` **여덟 개뿐**이다.
+필드를 늘리려면 **왜 공개해야 하는지**부터 답한다.
+
+판매자 표시 이름도 없다. seller profile이 없으므로 "익명" 같은 가짜 이름을 만들지 않는다.
+
+##### 정렬 — client UI-P3와 같은 계약
+
+| UI | authority | tie-breaker |
+|---|---|---|
+| 최신 순 | `publishedAt` DESC | listingId |
+| **인기 순** | **`downloadCount` DESC** | publishedAt DESC → listingId |
+| 좋아요 순 | `likeCount` DESC | downloadCount DESC → publishedAt DESC → listingId |
+
+**"인기"는 다운로드 수 하나다.** 가중 점수를 만들지 않는다(테스트가 소스에서 금지).
+마지막 열쇠가 언제나 `listingId`라 값이 모두 같아도 순서가 흔들리지 않는다.
+
+##### 질의 전략 — composite index를 지금 만들지 않는다
+
+Firestore 질의는 **`status == published` 하나뿐**이고, 종류 필터와 정렬은
+application에서 한다. 정렬 셋마다 index를 만들면 production에 index 세 개를
+지금 요구하게 된다 — 초기 상품 수가 작고 pagination도 없으므로 index 없이 시작한다.
+규모가 커지면 index와 pagination을 **함께** 넣는다.
+
+목록에서 snapshot을 추가 조회하지 않는다(N+1 금지) — 공개에 필요한 값은
+listing 문서에 이미 다 있고, snapshot 검증은 게시 시점(B-7C)에 끝났다.
 
 `tests/test_marketplace.py`가 위 전부를 고정한다.
 

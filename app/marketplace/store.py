@@ -30,6 +30,16 @@ LISTINGS = "ggumirror_marketplace_listings"
 SNAPSHOTS = "ggumirror_marketplace_snapshots"
 
 
+def _is_public(listing: Listing) -> bool:
+    """공개해도 되는가.
+
+    `published`이면서 **게시 시각이 있어야** 한다. `publishedAt`이 없는 published
+    문서는 있을 수 없는 상태(B-7C가 항상 채운다)이므로 **거짓 날짜를 지어내지 않고
+    공개에서 제외한다** — 잘못된 기록이 목록에 섞여 정렬을 흔드는 것보다 낫다.
+    """
+    return listing.status is ListingStatus.PUBLISHED and listing.published_at is not None
+
+
 class MarketplaceStore(Protocol):
     def create(self, listing: Listing) -> Listing:
         """draft를 만든다. **수수료를 받지 않는다** — 만들다 만 것에 돈을 받지 않는다."""
@@ -57,6 +67,17 @@ class MarketplaceStore(Protocol):
 
     def unpublish(self, listing_id: str, seller_user_id: str) -> Listing:
         """`published → unlisted`. **경제 mutation 0**이고 수수료도 되돌리지 않는다."""
+
+    def list_published(self) -> list[Listing]:
+        """공개 목록. **`published`만** 돌려준다 — draft/unlisted는 없는 것처럼 다룬다.
+
+        정렬과 종류 필터는 **service가 한다.** 저장소마다 정렬이 달라지면
+        같은 요청이 다른 순서를 내놓는다.
+        """
+
+    def get_published(self, listing_id: str) -> Listing:
+        """공개 상세. `published`가 아니면 `ListingNotFound` —
+        **판매자 자신이라도** 공개 endpoint로는 draft를 볼 수 없다."""
 
 
 class InMemoryMarketplaceStore:
@@ -89,6 +110,15 @@ class InMemoryMarketplaceStore:
         found = self.snapshots.get(snapshot_id)
         if found is None or found.seller_user_id != seller_user_id:
             raise SnapshotNotFound(snapshot_id)
+        return found
+
+    def list_published(self) -> list[Listing]:
+        return [x for x in self.listings.values() if _is_public(x)]
+
+    def get_published(self, listing_id: str) -> Listing:
+        found = self.listings.get(listing_id)
+        if found is None or not _is_public(found):
+            raise ListingNotFound(listing_id)
         return found
 
     # MARK: - 쓰기

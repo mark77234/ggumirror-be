@@ -115,6 +115,40 @@ class Listing:
         return self.status is ListingStatus.PUBLISHED
 
 
+class MarketplaceSort(StrEnum):
+    """공개 목록 정렬. **client UI-P3와 같은 계약이다.**"""
+
+    LATEST = "latest"
+    POPULAR = "popular"
+    LIKES = "likes"
+
+    @classmethod
+    def default(cls) -> "MarketplaceSort":
+        return cls.LATEST
+
+    def sorted(self, listings: list["Listing"]) -> list["Listing"]:
+        """**"인기"의 authority는 다운로드 수 하나다.**
+
+        좋아요와 섞은 가중 점수를 만들지 않는다 — 섞으면 왜 이 순서인지 아무도
+        설명할 수 없다. 이름만 "인기 순"이다.
+
+        마지막 열쇠는 언제나 `id`다. 값이 모두 같아도 순서가 실행마다 흔들리면
+        목록이 이유 없이 재배열돼 보인다.
+        """
+        return sorted(listings, key=self._key)
+
+    def _key(self, listing: "Listing"):
+        # 큰 것이 먼저여야 하는 값은 음수로 뒤집는다. id만 오름차순이다.
+        published = -(listing.published_at.timestamp() if listing.published_at else 0.0)
+        match self:
+            case MarketplaceSort.LATEST:
+                return (published, listing.id)
+            case MarketplaceSort.POPULAR:
+                return (-listing.download_count, published, listing.id)
+            case MarketplaceSort.LIKES:
+                return (-listing.like_count, -listing.download_count, published, listing.id)
+
+
 @dataclass(frozen=True)
 class PublishResult:
     """게시 결과.

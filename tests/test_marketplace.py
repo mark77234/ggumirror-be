@@ -492,3 +492,336 @@ def test_no_gcs_yet():
         code = _code_only((root / path).read_text())
         for banned in ["storage", "bucket", "signed_url", "generate_signed_url"]:
             assert banned not in code.lower(), f"{path}: GCS를 들였다 ({banned})"
+
+
+# MARK: - 공개 조회 (B-7D)
+#
+# 여기서 보는 것 셋:
+# 1. draft/unlisted가 **없는 것처럼** 보이는가
+# 2. "인기"가 오직 downloadCount인가
+# 3. 공개 응답에 내부 값(seller UUID · snapshotId)이 새지 않는가
+
+from datetime import datetime, timedelta, timezone   # noqa: E402
+
+from app.marketplace.models import MarketplaceSort   # noqa: E402
+
+
+def published(
+    store,
+    listing_id: str,
+    *,
+    kind: ContentType = ContentType.MIRROR,
+    downloads: int = 0,
+    likes: int = 0,
+    day: int = 1,
+    price: int = 0,
+    owner: str = SELLER,
+    status: ListingStatus = ListingStatus.PUBLISHED,
+    published_at: datetime | None = ...,
+) -> Listing:
+    """fixture — 저장소에 직접 넣는다(게시 경로는 위에서 이미 검증했다)."""
+    when = (
+        datetime(2026, 8, day, tzinfo=timezone.utc)
+        if published_at is ...
+        else published_at
+    )
+    listing = Listing(
+        id=listing_id,
+        seller_user_id=owner,
+        content_type=kind,
+        title=listing_id,
+        description="설명",
+        price_shards=price,
+        snapshot_id=f"snap-{listing_id}",
+        status=status,
+        publish_fee_paid=status is not ListingStatus.DRAFT,
+        download_count=downloads,
+        like_count=likes,
+        published_at=when,
+    )
+    store.listings[listing_id] = listing
+    return listing
+
+
+def ids(listings) -> list[str]:
+    return [x.id for x in listings]
+
+
+# MARK: - 공개 범위 (§13)
+
+
+def test_browse_shows_only_published(store, service):
+    published(store, "live")
+    published(store, "draft-one", status=ListingStatus.DRAFT, published_at=None)
+    published(store, "taken-down", status=ListingStatus.UNLISTED)
+
+    assert ids(service.browse()) == ["live"]
+
+
+def test_detail_hides_draft_and_unlisted(store, service):
+    published(store, "live")
+    published(store, "draft-one", status=ListingStatus.DRAFT, published_at=None)
+    published(store, "taken-down", status=ListingStatus.UNLISTED)
+
+    assert service.listing("live").id == "live"
+    for hidden in ("draft-one", "taken-down", "missing"):
+        with pytest.raises(ListingNotFound):
+            service.listing(hidden)
+
+
+def test_seller_cannot_see_own_draft_through_the_public_path(store, service):
+    """공개 조회와 판매자 관리를 한 endpoint에 섞지 않는다."""
+    published(store, "mine", status=ListingStatus.DRAFT, published_at=None)
+    with pytest.raises(ListingNotFound):
+        service.listing("mine")
+
+
+def test_published_without_a_date_is_not_public(store, service):
+    """있을 수 없는 상태다 — **거짓 날짜를 지어내지 않고** 공개에서 뺀다."""
+    published(store, "broken", published_at=None)
+    assert service.browse() == []
+    with pytest.raises(ListingNotFound):
+        service.listing("broken")
+
+
+# MARK: - 종류 필터 (§3)
+
+
+def test_browse_filters_by_content_type(store, service):
+    published(store, "mirror-one", kind=ContentType.MIRROR)
+    published(store, "sticker-one", kind=ContentType.STICKER)
+
+    assert ids(service.browse(content_type=ContentType.MIRROR)) == ["mirror-one"]
+    assert ids(service.browse(content_type=ContentType.STICKER)) == ["sticker-one"]
+    assert len(service.browse()) == 2
+
+
+def test_empty_sticker_store_returns_nothing(store, service):
+    """§8 — 가짜 스티커 상품을 만들지 않는다."""
+    published(store, "mirror-only", kind=ContentType.MIRROR)
+    assert service.browse(content_type=ContentType.STICKER) == []
+
+
+# MARK: - 정렬 (§14)
+
+
+def test_latest_sorts_by_published_date(store, service):
+    published(store, "old", day=1)
+    published(store, "newest", day=9)
+    published(store, "middle", day=5)
+
+    assert ids(service.browse(sort=MarketplaceSort.LATEST)) == ["newest", "middle", "old"]
+
+
+def test_default_sort_is_latest(store, service):
+    published(store, "old", day=1)
+    published(store, "new", day=9)
+    assert ids(service.browse()) == ids(service.browse(sort=MarketplaceSort.LATEST))
+    assert MarketplaceSort.default() is MarketplaceSort.LATEST
+
+
+def test_popular_ignores_likes_entirely(store, service):
+    """§5 — 좋아요가 999여도 다운로드가 적으면 뒤로 간다."""
+    published(store, "a", downloads=10, likes=0)
+    published(store, "b", downloads=9, likes=999)
+
+    assert ids(service.browse(sort=MarketplaceSort.POPULAR)) == ["a", "b"]
+
+
+def test_likes_sorts_by_like_count(store, service):
+    published(store, "a", likes=10, downloads=0)
+    published(store, "b", likes=9, downloads=999)
+
+    assert ids(service.browse(sort=MarketplaceSort.LIKES)) == ["a", "b"]
+
+
+def test_popular_tie_breaks_by_date_then_id(store, service):
+    published(store, "older", downloads=5, day=1)
+    published(store, "newer", downloads=5, day=8)
+    assert ids(service.browse(sort=MarketplaceSort.POPULAR)) == ["newer", "older"]
+
+
+def test_likes_tie_breaks_by_downloads(store, service):
+    published(store, "a", likes=7, downloads=8)
+    published(store, "b", likes=7, downloads=1)
+    assert ids(service.browse(sort=MarketplaceSort.LIKES)) == ["a", "b"]
+
+
+@pytest.mark.parametrize("sort", list(MarketplaceSort))
+def test_sorting_is_deterministic_when_everything_ties(store, service, sort):
+    for listing_id in ("c", "a", "b"):
+        published(store, listing_id)
+
+    assert ids(service.browse(sort=sort)) == ["a", "b", "c"]
+    assert ids(service.browse(sort=sort)) == ids(service.browse(sort=sort))
+
+
+def test_no_weighted_popularity_in_source():
+    from pathlib import Path
+
+    code = _code_only(
+        (Path(__file__).resolve().parent.parent / "app/marketplace/models.py").read_text()
+    )
+    for banned in ["score", "weight", "engagement", "like_count +", "+ like_count"]:
+        assert banned not in code, f"인기 순에 가중치가 들어갔다 ({banned})"
+
+
+# MARK: - 값 (§7, §12, §15)
+
+
+def test_free_and_zero_count_listings_are_visible(store, service):
+    published(store, "free", price=0, downloads=0, likes=0)
+
+    found = service.listing("free")
+    assert (found.price_shards, found.download_count, found.like_count) == (0, 0, 0)
+    assert ids(service.browse()) == ["free"]
+
+
+def test_browse_never_mutates_counters(store, service):
+    published(store, "one", downloads=3, likes=4)
+
+    for _ in range(5):
+        service.browse()
+        service.browse(sort=MarketplaceSort.POPULAR)
+        service.listing("one")
+
+    stored = store.listings["one"]
+    assert (stored.download_count, stored.like_count) == (3, 4), "조회가 counter를 올렸다"
+
+
+# MARK: - HTTP (§2, §11, §16)
+
+
+@pytest.fixture
+def client(store, shard_store):
+    from fastapi.testclient import TestClient
+
+    from app.core.config import Settings
+    from app.main import create_app
+
+    app = create_app(
+        Settings(app_env="local"), shard_store=shard_store, marketplace_store=store
+    )
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_public_browse_needs_no_auth(client, store):
+    published(store, "live")
+
+    response = client.get("/marketplace/listings")
+
+    assert response.status_code == 200
+    assert [x["id"] for x in response.json()] == ["live"]
+
+
+def test_public_detail_needs_no_auth(client, store):
+    published(store, "live")
+    assert client.get("/marketplace/listings/live").status_code == 200
+
+
+@pytest.mark.parametrize("hidden", ["draft-one", "taken-down", "missing"])
+def test_public_detail_404s_for_hidden_listings(client, store, hidden):
+    published(store, "draft-one", status=ListingStatus.DRAFT, published_at=None)
+    published(store, "taken-down", status=ListingStatus.UNLISTED)
+
+    assert client.get(f"/marketplace/listings/{hidden}").status_code == 404
+
+
+def test_public_response_never_leaks_internal_values(client, store):
+    """§11 — Firestore 문서를 그대로 내보내지 않는다."""
+    published(store, "live", downloads=2, likes=3, price=120)
+
+    body = client.get("/marketplace/listings/live").json()
+    raw = client.get("/marketplace/listings/live").text
+
+    for banned in [
+        "sellerUserId", "seller_user_id",
+        "snapshotId", "snapshot_id",
+        "publishFeePaid", "publish_fee_paid",
+        "schemaVersion", "schema_version",
+        "createdAt", "created_at", "updatedAt", "updated_at",
+        "status",
+    ]:
+        assert banned not in body, f"{banned}가 공개 응답에 있다"
+    # 내부 user UUID 값 자체도 새지 않는다.
+    assert SELLER not in raw
+    assert "snap-live" not in raw
+
+    assert set(body) == {
+        "id", "contentType", "title", "description",
+        "priceShards", "downloadCount", "likeCount", "publishedAt",
+    }
+    assert body["publishedAt"].startswith("2026-08-01")
+
+
+def test_public_list_items_have_the_same_shape(client, store):
+    published(store, "live")
+    item = client.get("/marketplace/listings").json()[0]
+    assert set(item) == {
+        "id", "contentType", "title", "description",
+        "priceShards", "downloadCount", "likeCount", "publishedAt",
+    }
+
+
+@pytest.mark.parametrize("sort", ["latest", "popular", "likes"])
+def test_http_sort_values(client, store, sort):
+    published(store, "a", downloads=10, likes=1, day=1)
+    published(store, "b", downloads=1, likes=10, day=9)
+
+    response = client.get("/marketplace/listings", params={"sort": sort})
+
+    assert response.status_code == 200
+    expected = {"latest": ["b", "a"], "popular": ["a", "b"], "likes": ["b", "a"]}[sort]
+    assert [x["id"] for x in response.json()] == expected
+
+
+@pytest.mark.parametrize(
+    ("params", "expected"),
+    [({"sort": "trending"}, 422), ({"contentType": "album"}, 422)],
+)
+def test_http_rejects_unknown_enums(client, params, expected):
+    assert client.get("/marketplace/listings", params=params).status_code == expected
+
+
+def test_http_content_type_filter(client, store):
+    published(store, "mirror-one", kind=ContentType.MIRROR)
+    published(store, "sticker-one", kind=ContentType.STICKER)
+
+    for kind, expected in (("mirror", ["mirror-one"]), ("sticker", ["sticker-one"])):
+        response = client.get("/marketplace/listings", params={"contentType": kind})
+        assert [x["id"] for x in response.json()] == expected
+
+
+def test_mutations_still_require_auth(client):
+    """§16 — browse를 열면서 mutation 인증을 약화하지 않았다."""
+    assert client.post("/marketplace/listings", json={
+        "contentType": "mirror", "title": "x", "priceShards": 0, "snapshotId": "s",
+    }).status_code == 401
+    assert client.post("/marketplace/listings/abc/publish").status_code == 401
+    assert client.post("/marketplace/listings/abc/unpublish").status_code == 401
+
+
+def test_no_asset_or_purchase_routes(client):
+    """§18 · purchase는 B-7E다 — 가짜 preview URL도 만들지 않는다."""
+    for path in [
+        "/marketplace/listings/abc/preview",
+        "/marketplace/listings/abc/template",
+        "/marketplace/listings/abc/image",
+        "/marketplace/listings/abc/purchase",
+        "/marketplace/listings/abc/like",
+    ]:
+        assert client.get(path).status_code in {404, 405}
+        assert client.post(path).status_code in {404, 405}
+
+
+def test_no_n_plus_one_snapshot_reads():
+    """§19 — 목록 한 건마다 snapshot을 추가 조회하지 않는다."""
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parent.parent / "app/marketplace/firestore_store.py"
+    ).read_text()
+    start = source.index("def list_published")
+    end = source.index("def get_published")
+    body = _code_only(source[start:end])
+    assert "SNAPSHOTS" not in body, "목록에서 snapshot을 읽는다"

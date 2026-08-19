@@ -11,6 +11,7 @@ import logging
 from app.auth.models import User
 from app.marketplace.models import (
     ContentType,
+    MarketplaceSort,
     InvalidListing,
     Listing,
     ListingStatus,
@@ -92,6 +93,26 @@ class MarketplaceService:
         listing = self._store.unpublish(listing_id, user.id)
         logger.info("marketplace_unpublish status=%s", listing.status.value)
         return listing
+
+    # MARK: - 공개 조회 (B-7D)
+
+    def browse(
+        self, *, content_type: ContentType | None = None, sort: MarketplaceSort | None = None
+    ) -> list[Listing]:
+        """공개 목록. **`published`만** 보이고 정렬은 여기서 한다.
+
+        정렬을 저장소가 아니라 service가 하는 이유: 같은 요청이 저장소에 따라 다른
+        순서를 내놓으면 안 된다. Firestore 질의는 `status == published` 하나뿐이고
+        종류 필터도 여기서 건다 — 정렬마다 composite index를 요구하지 않는다.
+        """
+        listings = self._store.list_published()
+        if content_type is not None:
+            listings = [x for x in listings if x.content_type is content_type]
+        return (sort or MarketplaceSort.default()).sorted(listings)
+
+    def listing(self, listing_id: str) -> Listing:
+        """공개 상세. draft · unlisted · 없는 것은 모두 `ListingNotFound`다."""
+        return self._store.get_published(listing_id)
 
     @staticmethod
     def fee(content_type: ContentType) -> int:
