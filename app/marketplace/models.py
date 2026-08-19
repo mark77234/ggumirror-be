@@ -193,6 +193,35 @@ class Ownership:
 
 
 @dataclass(frozen=True)
+class Like:
+    """"이 사람이 이것을 좋아한다" — **관계 자체가 authority**다.
+
+    `listing.likeCount`는 조회 성능용 projection이고, 진실은 이 문서들의 개수다.
+    최소 필드만 담는다 — `sellerUserId` · `title` · count를 복사하지 않는다.
+    """
+
+    id: str
+    user_id: str
+    listing_id: str
+    created_at: datetime = field(default_factory=utcnow)
+    schema_version: int = SCHEMA_VERSION
+
+
+@dataclass(frozen=True)
+class LikeResult:
+    """좋아요 결과.
+
+    `changed`는 **이번 요청이 관계를 바꿨는가**다. 같은 요청을 반복하면 `False`이고
+    그때도 실패가 아니다 — 연타·재시도는 정상 동작이다.
+    """
+
+    listing_id: str
+    liked: bool
+    changed: bool
+    like_count: int
+
+
+@dataclass(frozen=True)
 class PurchaseResult:
     """획득 결과.
 
@@ -241,6 +270,22 @@ class InvalidListing(MarketplaceError):
     """제목 · 설명 · 가격 · 종류가 규칙에 맞지 않는다."""
 
 
+class SelfLike(MarketplaceError):
+    """자기 상품에 좋아요를 누를 수 없다.
+
+    판매자가 자기 상품의 인기도를 직접 올리지 못하게 한다.
+    **취소는 허용한다** — 잘못 생긴 관계를 지우는 동작이기 때문이다.
+    """
+
+
+class LikeCountInconsistent(MarketplaceError):
+    """`likeCount` projection이 관계와 어긋났다.
+
+    좋아요 관계가 있는데 count가 0이거나 count가 음수인 상태다. **조용히 보정하지
+    않는다** — 거짓 값으로 덮으면 언제부터 틀렸는지 알 수 없게 된다.
+    """
+
+
 class SelfPurchase(MarketplaceError):
     """자기 상품은 살 수 없다.
 
@@ -266,6 +311,18 @@ def ownership_id(user_id: str, listing_id: str) -> str:
     canonical = "|".join(
         f"{len(part.encode())}:{part}"
         for part in ("marketplace_ownership", user_id, listing_id)
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def like_id(user_id: str, listing_id: str) -> str:
+    """좋아요 문서 ID. `(사용자, 상품)` 조합이 곧 유일성 열쇠다.
+
+    소유권 · 원장과 **같은 규칙**이다 — raw id를 문서 ID에 노출하지 않는다.
+    """
+    canonical = "|".join(
+        f"{len(part.encode())}:{part}"
+        for part in ("marketplace_like", user_id, listing_id)
     )
     return hashlib.sha256(canonical.encode()).hexdigest()
 

@@ -1363,3 +1363,584 @@ def test_still_no_gcs_or_asset_delivery():
         code = _code_only((root / path).read_text()).lower()
         for banned in ["bucket", "signed_url", "generate_signed_url", "gcs"]:
             assert banned not in code, f"{path}: {banned}"
+
+
+# MARK: - 좋아요 (B-7E.1)
+#
+# **관계가 authority이고 `likeCount`는 projection이다.** 둘이 어긋나면 안 된다.
+# 조각 경제는 이 경로에 전혀 등장하지 않는다.
+
+from app.marketplace.models import (   # noqa: E402
+    Like,
+    LikeCountInconsistent,
+    SelfLike,
+    like_id,
+)
+
+LIKER = "33333333-4444-4555-8666-777777777777"
+
+
+def liked(store, listing_id: str, user_id: str) -> bool:
+    return like_id(user_id, listing_id) in store.likes_by_id
+
+
+def count(store, listing_id: str) -> int:
+    return store.listings[listing_id].like_count
+
+
+# MARK: - 기본 (§3, §4)
+
+
+@pytest.mark.parametrize("price", [0, 30])
+def test_first_like_counts_once(store, service, price):
+    listing = sale(store, price=price)
+
+    result = service.like(user(LIKER), listing.id)
+
+    assert (result.liked, result.changed, result.like_count) == (True, True, 1)
+    assert liked(store, listing.id, LIKER)
+    assert count(store, listing.id) == 1
+
+
+@pytest.mark.parametrize("times", [2, 8])
+def test_repeated_like_changes_nothing(store, service, times):
+    listing = sale(store)
+
+    results = [service.like(user(LIKER), listing.id) for _ in range(times)]
+
+    assert results[0].changed is True
+    for later in results[1:]:
+        assert (later.liked, later.changed, later.like_count) == (True, False, 1)
+    assert count(store, listing.id) == 1
+    assert len(store.likes_by_id) == 1
+
+
+def test_unlike_removes_the_relation(store, service):
+    listing = sale(store)
+    service.like(user(LIKER), listing.id)
+
+    result = service.unlike(user(LIKER), listing.id)
+
+    assert (result.liked, result.changed, result.like_count) == (False, True, 0)
+    assert not liked(store, listing.id, LIKER)
+    assert count(store, listing.id) == 0
+
+
+@pytest.mark.parametrize("times", [2, 8])
+def test_repeated_unlike_changes_nothing(store, service, times):
+    listing = sale(store)
+    service.like(user(LIKER), listing.id)
+
+    results = [service.unlike(user(LIKER), listing.id) for _ in range(times)]
+
+    assert results[0].changed is True
+    for later in results[1:]:
+        assert (later.liked, later.changed, later.like_count) == (False, False, 0)
+    assert count(store, listing.id) == 0
+
+
+def test_unlike_without_a_like_is_a_no_op(store, service):
+    listing = sale(store, downloads=0)
+
+    result = service.unlike(user(LIKER), listing.id)
+
+    assert (result.liked, result.changed, result.like_count) == (False, False, 0)
+    assert count(store, listing.id) == 0
+
+
+def test_like_id_hides_raw_values():
+    key = like_id("user-abc", "listing-xyz")
+    assert "user-abc" not in key and "listing-xyz" not in key
+    assert key == like_id("user-abc", "listing-xyz")
+    assert key != like_id("listing-xyz", "user-abc")
+
+
+# MARK: - 상태 정책 (§7, §8)
+
+
+def test_draft_cannot_be_liked(store, service):
+    published(store, "draft-one", status=ListingStatus.DRAFT, published_at=None)
+
+    with pytest.raises(ListingNotFound):
+        service.like(user(LIKER), "draft-one")
+
+    assert store.likes_by_id == {}
+
+
+def test_unlisted_cannot_receive_a_new_like(store, service):
+    listing = sale(store)
+    service.unpublish(user(SELLER), listing.id)
+
+    with pytest.raises(ListingNotFound):
+        service.like(user(LIKER), listing.id)
+
+    assert store.likes_by_id == {}
+
+
+def test_existing_like_can_be_removed_after_unpublish(store, service):
+    """§6 — 못 지우면 count가 영구히 남는다."""
+    listing = sale(store)
+    service.like(user(LIKER), listing.id)
+    service.unpublish(user(SELLER), listing.id)
+
+    result = service.unlike(user(LIKER), listing.id)
+
+    assert (result.changed, result.like_count) == (True, 0)
+    assert not liked(store, listing.id, LIKER)
+
+
+def test_self_like_is_refused(store, service):
+    listing = sale(store)
+
+    with pytest.raises(SelfLike):
+        service.like(user(SELLER), listing.id)
+
+    assert count(store, listing.id) == 0
+    assert store.likes_by_id == {}
+
+
+def test_self_unlike_cleans_up_a_stray_relation(store, service):
+    """§8 — 잘못 존재하는 관계는 지울 수 있어야 한다."""
+    listing = sale(store)
+    key = like_id(SELLER, listing.id)
+    store.likes_by_id[key] = Like(id=key, user_id=SELLER, listing_id=listing.id)
+    store.listings[listing.id] = published(
+        store, listing.id, price=30, downloads=0
+    ).__class__(**{**listing.__dict__, "like_count": 1})
+
+    result = service.unlike(user(SELLER), listing.id)
+
+    assert (result.changed, result.like_count) == (True, 0)
+    assert key not in store.likes_by_id
+
+
+# MARK: - projection 안전 (§15)
+
+
+def test_negative_like_count_is_not_silently_fixed(store, service):
+    listing = sale(store)
+    store.listings[listing.id] = type(listing)(**{**listing.__dict__, "like_count": -1})
+
+    with pytest.raises(LikeCountInconsistent):
+        service.like(user(LIKER), listing.id)
+    with pytest.raises(LikeCountInconsistent):
+        service.unlike(user(LIKER), listing.id)
+
+
+def test_relation_without_count_never_goes_negative(store, service):
+    """관계는 있는데 count가 0 — projection이 어긋났다. 음수를 만들지 않는다."""
+    listing = sale(store)
+    key = like_id(LIKER, listing.id)
+    store.likes_by_id[key] = Like(id=key, user_id=LIKER, listing_id=listing.id)
+    assert count(store, listing.id) == 0
+
+    with pytest.raises(LikeCountInconsistent):
+        service.unlike(user(LIKER), listing.id)
+
+    assert count(store, listing.id) == 0, "음수가 됐다"
+
+
+# MARK: - 동시성 (§10, §11, §12)
+
+
+def test_same_user_concurrent_likes_count_once(store, service):
+    listing = sale(store)
+    start = threading.Barrier(8)
+    changes: list[bool] = []
+
+    def run():
+        start.wait()
+        changes.append(service.like(user(LIKER), listing.id).changed)
+
+    threads = [threading.Thread(target=run) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sum(changes) == 1
+    assert count(store, listing.id) == 1
+    assert len(store.likes_by_id) == 1
+
+
+def test_same_user_concurrent_unlikes_count_once(store, service):
+    listing = sale(store)
+    service.like(user(LIKER), listing.id)
+    start = threading.Barrier(8)
+    changes: list[bool] = []
+
+    def run():
+        start.wait()
+        changes.append(service.unlike(user(LIKER), listing.id).changed)
+
+    threads = [threading.Thread(target=run) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sum(changes) == 1
+    assert count(store, listing.id) == 0
+    assert store.likes_by_id == {}
+
+
+def test_different_users_concurrent_likes_count_each(store, service):
+    """§11 — lost update 금지."""
+    likers = [f"liker-{i}" for i in range(8)]
+    listing = sale(store)
+    start = threading.Barrier(len(likers))
+
+    def run(who: str):
+        start.wait()
+        service.like(user(who), listing.id)
+
+    threads = [threading.Thread(target=run, args=(x,)) for x in likers]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(store.likes_by_id) == 8
+    assert count(store, listing.id) == 8, "count가 어긋났다"
+
+
+def test_like_and_unlike_race_stays_consistent(store, service):
+    """§12 — 관계와 projection이 어긋난 조합은 나올 수 없다."""
+    listing = sale(store)
+    start = threading.Barrier(2)
+
+    def do_like():
+        start.wait()
+        service.like(user(LIKER), listing.id)
+
+    def do_unlike():
+        start.wait()
+        service.unlike(user(LIKER), listing.id)
+
+    for _ in range(20):
+        store.likes_by_id.clear()
+        store.listings[listing.id] = type(listing)(**{**listing.__dict__, "like_count": 0})
+        start = threading.Barrier(2)
+        threads = [threading.Thread(target=do_like), threading.Thread(target=do_unlike)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        has_relation = liked(store, listing.id, LIKER)
+        current = count(store, listing.id)
+        # 관계가 있으면 1, 없으면 0. 다른 조합은 divergence다.
+        assert current == (1 if has_relation else 0), (has_relation, current)
+
+
+# MARK: - 경제 격리 (§9, §19)
+
+
+def test_like_never_touches_the_shard_economy(store, service, shard_store):
+    listing = sale(store)
+    seed_before = list(shard_store.entries)
+
+    service.like(user(LIKER), listing.id)
+    service.unlike(user(LIKER), listing.id)
+
+    assert shard_store.entries == seed_before, "원장이 바뀌었다"
+    assert shard_store.wallets == {}, "지갑이 생겼다"
+
+
+def test_like_never_touches_download_count(store, service):
+    listing = sale(store, downloads=5)
+
+    service.like(user(LIKER), listing.id)
+    service.unlike(user(LIKER), listing.id)
+
+    assert store.listings[listing.id].download_count == 5
+
+
+def test_purchase_and_browse_never_touch_like_count(store, shards, service):
+    """§19 — 좋아요는 LIKE/UNLIKE에서만 바뀐다."""
+    seed(shards, 100, who=BUYER)
+    listing = sale(store)
+    service.like(user(LIKER), listing.id)
+
+    service.purchase(user(BUYER), listing.id)
+    service.browse()
+    service.listing(listing.id)
+    service.unpublish(user(SELLER), listing.id)
+
+    assert count(store, listing.id) == 1
+
+
+def test_like_path_has_no_shard_code():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    for path in ["app/marketplace/store.py", "app/marketplace/firestore_store.py"]:
+        source = (root / path).read_text()
+        body = source[source.index("def like("):source.index("def likes(")]
+        # 클래스 중간 조각이라 tokenize할 수 없다 — 주석을 줄 단위로 걷어낸다.
+        code = "\n".join(
+            line.split("#")[0] for line in body.splitlines()
+        )
+        # 호출 모양으로 검사한다 — 이름이 설명 문장에 등장하는 것은 문제가 아니다.
+        for banned in ["apply_in_transaction(", "shards.", ".credit(", ".debit("]:
+            assert banned not in code, f"{path}: 좋아요가 조각을 만진다 ({banned})"
+
+
+# MARK: - 정렬 회귀 (§18)
+
+
+def test_likes_do_not_affect_popular_sort(store, service):
+    published(store, "downloaded", downloads=10, likes=0)
+    published(store, "loved", downloads=1, likes=0)
+    service.like(user(LIKER), "loved")
+    service.like(user(BUYER), "loved")
+
+    assert ids(service.browse(sort=MarketplaceSort.POPULAR)) == ["downloaded", "loved"]
+    assert ids(service.browse(sort=MarketplaceSort.LIKES)) == ["loved", "downloaded"]
+
+
+# MARK: - 내 좋아요 (§16)
+
+
+def test_my_likes_lists_listing_ids(store, service):
+    first = sale(store, "one")
+    second = sale(store, "two")
+    service.like(user(LIKER), first.id)
+    service.like(user(LIKER), second.id)
+
+    assert service.liked_listing_ids(user(LIKER)) == ["one", "two"]
+
+
+def test_my_likes_is_scoped_to_the_user(store, service):
+    listing = sale(store)
+    service.like(user(LIKER), listing.id)
+
+    assert service.liked_listing_ids(user(LIKER)) == [listing.id]
+    assert service.liked_listing_ids(user(BUYER)) == []
+
+
+# MARK: - HTTP (§20, §21)
+
+
+def test_like_endpoints_require_auth(client):
+    assert client.put("/marketplace/listings/abc/like").status_code == 401
+    assert client.delete("/marketplace/listings/abc/like").status_code == 401
+    assert client.get("/users/me/marketplace/likes").status_code == 401
+
+
+def test_public_browse_stays_open(client, store):
+    published(store, "live")
+    assert client.get("/marketplace/listings").status_code == 200
+
+
+def test_like_response_hides_internal_values():
+    from app.api.marketplace import LikeResponse
+
+    fields = set(LikeResponse.model_fields)
+    assert fields == {"listing_id", "liked", "changed", "like_count"}
+    for banned in ["user_id", "userId", "seller_user_id", "snapshot_id"]:
+        assert banned not in fields
+
+
+def test_no_arbitrary_user_like_route(client):
+    for path in [
+        f"/users/{SELLER}/marketplace/likes",
+        "/marketplace/likes",
+        f"/marketplace/likes/{SELLER}",
+    ]:
+        assert client.get(path).status_code in {404, 405}
+
+
+def test_like_endpoint_takes_no_body():
+    import inspect
+
+    from app.api import marketplace as api
+
+    for handler in (api.like_listing, api.unlike_listing):
+        assert "request" not in inspect.signature(handler).parameters
+
+
+# MARK: - 실제 Firestore 구현 + ABORTED 재시도 (§14)
+#
+# 지금까지 marketplace test는 in-memory 저장소만 돌았다. 여기서는 **FirestoreMarketplaceStore
+# 코드 자체**를 최소 fake db로 돌려 재시도 안전성을 본다 — production Firestore를 부르지 않는다.
+
+
+class FakeDocument:
+    def __init__(self, doc_id: str, data: dict | None) -> None:
+        self.id = doc_id
+        self._data = data
+
+    @property
+    def exists(self) -> bool:
+        return self._data is not None
+
+    def to_dict(self) -> dict | None:
+        return dict(self._data) if self._data is not None else None
+
+
+class FakeReference:
+    def __init__(self, store: dict, doc_id: str) -> None:
+        self._store = store
+        self.id = doc_id
+
+    def get(self, transaction=None) -> FakeDocument:
+        return FakeDocument(self.id, self._store.get(self.id))
+
+
+class FakeCollection:
+    def __init__(self, store: dict) -> None:
+        self._store = store
+
+    def document(self, doc_id: str) -> FakeReference:
+        return FakeReference(self._store, doc_id)
+
+
+class FakeDatabase:
+    """`collection().document().get()`과 transaction만 있는 최소 db."""
+
+    def __init__(self) -> None:
+        self.data: dict[str, dict] = {}
+        self.transactions: list = []
+
+    def collection(self, name: str) -> FakeCollection:
+        return FakeCollection(self.data.setdefault(name, {}))
+
+    def transaction(self):
+        tx = FakeFirestoreTransaction(self, aborts=self.aborts)
+        self.transactions.append(tx)
+        return tx
+
+    aborts = 0
+
+
+class FakeFirestoreTransaction:
+    """실제 `@firestore.transactional`이 부르는 것만 구현한다."""
+
+    _max_attempts = 5
+    _read_only = False
+
+    def __init__(self, db: FakeDatabase, aborts: int) -> None:
+        self._db = db
+        self._aborts = aborts
+        self.staged: list = []
+        self.commits = 0
+
+    def _clean_up(self) -> None:
+        self._write_pbs = []
+        self._id = None
+        # 이전 attempt의 staged write는 버린다.
+        self.staged = []
+
+    def _begin(self, retry_id=None) -> None:
+        self._id = b"tx"
+
+    def _commit(self):
+        from google.api_core import exceptions
+
+        if self._aborts > 0:
+            self._aborts -= 1
+            raise exceptions.Aborted("simulated contention")
+        for write in self.staged:
+            write()
+        self.staged = []
+        self.commits += 1
+        return []
+
+    def _rollback(self) -> None:
+        self.staged = []
+
+    # --- store가 부르는 부분 ---
+
+    def create(self, reference, document) -> None:
+        def write():
+            if reference.id in reference._store:
+                raise KeyError(reference.id)
+            reference._store[reference.id] = dict(document)
+
+        self.staged.append(write)
+
+    def update(self, reference, changes) -> None:
+        self.staged.append(lambda: reference._store[reference.id].update(changes))
+
+    def delete(self, reference) -> None:
+        self.staged.append(lambda: reference._store.pop(reference.id, None))
+
+
+@pytest.fixture
+def firestore_like_store():
+    from app.marketplace.firestore_store import FirestoreMarketplaceStore
+    from app.marketplace.store import LISTINGS
+
+    db = FakeDatabase()
+    db.data[LISTINGS] = {
+        "live": {
+            "sellerUserId": SELLER,
+            "contentType": "mirror",
+            "title": "제목",
+            "description": "",
+            "priceShards": 0,
+            "snapshotId": "snap",
+            "status": "published",
+            "publishFeePaid": True,
+            "downloadCount": 0,
+            "likeCount": 0,
+            "createdAt": datetime(2026, 8, 1, tzinfo=timezone.utc),
+            "updatedAt": datetime(2026, 8, 1, tzinfo=timezone.utc),
+            "publishedAt": datetime(2026, 8, 1, tzinfo=timezone.utc),
+            "schemaVersion": 1,
+        }
+    }
+    return FirestoreMarketplaceStore(db), db
+
+
+@pytest.mark.parametrize("aborts", [0, 1, 3])
+def test_firestore_like_survives_aborted_retry(firestore_like_store, aborts):
+    from app.marketplace.store import LIKES, LISTINGS
+
+    store, db = firestore_like_store
+    db.aborts = aborts
+
+    result = store.like("live", LIKER)
+
+    assert (result.liked, result.changed, result.like_count) == (True, True, 1)
+    assert db.data[LISTINGS]["live"]["likeCount"] == 1, "재시도가 count를 두 번 올렸다"
+    assert len(db.data.get(LIKES, {})) == 1, "관계가 두 개 생겼다"
+
+
+@pytest.mark.parametrize("aborts", [0, 1, 3])
+def test_firestore_unlike_survives_aborted_retry(firestore_like_store, aborts):
+    from app.marketplace.store import LIKES, LISTINGS
+
+    store, db = firestore_like_store
+    store.like("live", LIKER)
+    db.aborts = aborts
+
+    result = store.unlike("live", LIKER)
+
+    assert (result.liked, result.changed, result.like_count) == (False, True, 0)
+    assert db.data[LISTINGS]["live"]["likeCount"] == 0, "재시도가 count를 두 번 내렸다"
+    assert db.data.get(LIKES, {}) == {}
+
+
+def test_firestore_repeated_like_is_idempotent(firestore_like_store):
+    from app.marketplace.store import LISTINGS
+
+    store, db = firestore_like_store
+
+    first = store.like("live", LIKER)
+    second = store.like("live", LIKER)
+
+    assert (first.changed, second.changed) == (True, False)
+    assert db.data[LISTINGS]["live"]["likeCount"] == 1
+
+
+def test_firestore_self_like_is_refused(firestore_like_store):
+    from app.marketplace.store import LISTINGS
+
+    store, db = firestore_like_store
+
+    with pytest.raises(SelfLike):
+        store.like("live", SELLER)
+
+    assert db.data[LISTINGS]["live"]["likeCount"] == 0

@@ -15,6 +15,9 @@ from typing import Protocol
 
 from app.marketplace.models import (
     ContentType,
+    Like,
+    LikeCountInconsistent,
+    LikeResult,
     Listing,
     Ownership,
     ListingNotFound,
@@ -22,9 +25,11 @@ from app.marketplace.models import (
     MarketplacePublishPolicy,
     PublishResult,
     PurchaseResult,
+    SelfLike,
     SelfPurchase,
     Snapshot,
     SnapshotNotFound,
+    like_id,
     ownership_id,
 )
 from app.shards.models import utcnow
@@ -34,6 +39,8 @@ LISTINGS = "ggumirror_marketplace_listings"
 SNAPSHOTS = "ggumirror_marketplace_snapshots"
 #: 구매와 소유를 한 문서로 합쳤다(MVP). 별도 purchases collection을 만들지 않는다.
 OWNERSHIP = "ggumirror_marketplace_ownership"
+#: 좋아요 관계. **관계가 authority**이고 listing의 `likeCount`는 projection이다.
+LIKES = "ggumirror_marketplace_likes"
 
 
 def _is_public(listing: Listing) -> bool:
@@ -106,6 +113,28 @@ class MarketplaceStore(Protocol):
     def ownerships(self, user_id: str) -> list[Ownership]:
         """내가 가진 것 전부. **내린 상품도 남는다** — 돈을 냈으면 계속 쓸 수 있어야 한다."""
 
+    def like(self, listing_id: str, user_id: str) -> LikeResult:
+        """좋아요. **관계 생성과 `likeCount +1`이 한 commit이다.**
+
+        `published`만 가능하고 자기 상품은 안 된다. 이미 눌렀으면 아무것도 쓰지 않고
+        `changed=False`로 끝난다 — 연타가 오류가 아니다.
+
+        **조각 경제를 건드리지 않는다.**
+        """
+
+    def unlike(self, listing_id: str, user_id: str) -> LikeResult:
+        """좋아요 취소. **관계 삭제와 `likeCount -1`이 한 commit이다.**
+
+        `unlisted`여도 취소할 수 있다 — 판매자가 내렸다고 사용자가 자기 좋아요를
+        못 지우면 count가 영구히 남는다. 자기 상품 좋아요도 지울 수 있다(정리 동작).
+
+        `likeCount`가 음수가 되지 않는다. 관계가 있는데 count가 0이면
+        `LikeCountInconsistent`다 — **조용히 보정하지 않는다.**
+        """
+
+    def likes(self, user_id: str) -> list[Like]:
+        """내가 좋아요한 것 전부."""
+
 
 class InMemoryMarketplaceStore:
     """test / local용. 실제 Firestore transaction의 **의미**를 흉내 낸다.
@@ -118,6 +147,7 @@ class InMemoryMarketplaceStore:
         self.listings: dict[str, Listing] = {}
         self.snapshots: dict[str, Snapshot] = {}
         self.ownership: dict[str, Ownership] = {}
+        self.likes_by_id: dict[str, Like] = {}
         self._shard_store = shard_store
         self._lock = threading.RLock()
 
@@ -336,3 +366,81 @@ class InMemoryMarketplaceStore:
             updated_at=listing.updated_at,
             published_at=listing.published_at,
         )
+
+    # MARK: - 좋아요 (한 transaction · 조각 경제 무관)
+
+    def like(self, listing_id: str, user_id: str) -> LikeResult:
+        with self._lock:
+            listing = self.get_published(listing_id)
+            key = like_id(user_id, listing_id)
+
+            if key in self.likes_by_id:
+                # 이미 눌렀다. **아무것도 쓰지 않는다.**
+                return LikeResult(
+                    listing_id=listing_id, liked=True, changed=False,
+                    like_count=_checked_like_count(listing),
+                )
+
+            if listing.seller_user_id == user_id:
+                raise SelfLike(listing_id)
+
+            count = _checked_like_count(listing) + 1
+            self.likes_by_id[key] = Like(id=key, user_id=user_id, listing_id=listing_id)
+            self.listings[listing_id] = _with_like_count(listing, count)
+            return LikeResult(
+                listing_id=listing_id, liked=True, changed=True, like_count=count
+            )
+
+    def unlike(self, listing_id: str, user_id: str) -> LikeResult:
+        with self._lock:
+            listing = self.listings.get(listing_id)
+            if listing is None or listing.status is ListingStatus.DRAFT:
+                # draft에 좋아요가 달릴 경로가 없다 — 있으면 malformed다.
+                raise ListingNotFound(listing_id)
+
+            key = like_id(user_id, listing_id)
+            current = _checked_like_count(listing)
+
+            if key not in self.likes_by_id:
+                return LikeResult(
+                    listing_id=listing_id, liked=False, changed=False, like_count=current
+                )
+
+            if current == 0:
+                # 관계는 있는데 projection이 0이다. **거짓 보정 대신 멈춘다.**
+                raise LikeCountInconsistent(listing_id)
+
+            del self.likes_by_id[key]
+            self.listings[listing_id] = _with_like_count(listing, current - 1)
+            return LikeResult(
+                listing_id=listing_id, liked=False, changed=True, like_count=current - 1
+            )
+
+    def likes(self, user_id: str) -> list[Like]:
+        return [x for x in self.likes_by_id.values() if x.user_id == user_id]
+
+
+def _checked_like_count(listing: Listing) -> int:
+    """음수 projection을 **조용히 0으로 만들지 않는다.**"""
+    if listing.like_count < 0:
+        raise LikeCountInconsistent(listing.id)
+    return listing.like_count
+
+
+def _with_like_count(listing: Listing, count: int) -> Listing:
+    return Listing(
+        id=listing.id,
+        seller_user_id=listing.seller_user_id,
+        content_type=listing.content_type,
+        title=listing.title,
+        description=listing.description,
+        price_shards=listing.price_shards,
+        snapshot_id=listing.snapshot_id,
+        status=listing.status,
+        publish_fee_paid=listing.publish_fee_paid,
+        download_count=listing.download_count,
+        like_count=count,
+        created_at=listing.created_at,
+        updated_at=listing.updated_at,
+        published_at=listing.published_at,
+    )

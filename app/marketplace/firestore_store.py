@@ -17,6 +17,9 @@ from google.cloud import firestore
 from app.auth.store import StoreUnavailable
 from app.marketplace.models import (
     ContentType,
+    Like,
+    LikeCountInconsistent,
+    LikeResult,
     Listing,
     Ownership,
     ListingNotFound,
@@ -24,12 +27,14 @@ from app.marketplace.models import (
     MarketplacePublishPolicy,
     PublishResult,
     PurchaseResult,
+    SelfLike,
     SelfPurchase,
     Snapshot,
     SnapshotNotFound,
+    like_id,
     ownership_id,
 )
-from app.marketplace.store import LISTINGS, OWNERSHIP, SNAPSHOTS, _is_public
+from app.marketplace.store import LIKES, LISTINGS, OWNERSHIP, SNAPSHOTS, _is_public
 from app.shards.models import utcnow
 from app.shards.service import ShardLedgerService
 
@@ -328,6 +333,108 @@ class FirestoreMarketplaceStore:
         except gcp_exceptions.GoogleAPIError as error:
             raise self._unavailable("ownership_list", error) from error
 
+    # MARK: - 좋아요 (한 transaction · 조각 경제 무관)
+
+    def like(self, listing_id: str, user_id: str) -> LikeResult:
+        """관계 생성과 `likeCount +1`이 **하나의 commit**이다.
+
+        `ShardLedgerService`를 부르지 않는다 — 좋아요는 조각을 주거나 받지 않는다.
+        """
+        listing_ref = self._db.collection(LISTINGS).document(listing_id)
+        key = like_id(user_id, listing_id)
+        like_ref = self._db.collection(LIKES).document(key)
+
+        @firestore.transactional
+        def run(transaction) -> LikeResult:
+            # 읽기를 먼저. **attempt마다 다시 읽는다** — 재시도가 stale count를 쓰지 않는다.
+            listing_snapshot = listing_ref.get(transaction=transaction)
+            like_snapshot = like_ref.get(transaction=transaction)
+
+            if not listing_snapshot.exists:
+                raise ListingNotFound(listing_id)
+            listing = _listing_from(listing_id, listing_snapshot.to_dict() or {})
+            if not _is_public(listing):
+                # 새 좋아요는 공개 상품에만. draft는 애초에 대상이 아니다.
+                raise ListingNotFound(listing_id)
+            count = _checked_count(listing)
+
+            if like_snapshot.exists:
+                # 이미 눌렀다. **아무것도 쓰지 않는다.**
+                return LikeResult(
+                    listing_id=listing_id, liked=True, changed=False, like_count=count
+                )
+
+            if listing.seller_user_id == user_id:
+                raise SelfLike(listing_id)
+
+            like = Like(id=key, user_id=user_id, listing_id=listing_id)
+            # `create`라 우리가 읽은 뒤 다른 요청이 먼저 자리를 잡았으면 commit이 깨진다.
+            transaction.create(like_ref, _like_document(like))
+            # listing을 transaction에서 읽었으므로 동시 좋아요는 충돌로 재시도된다.
+            transaction.update(listing_ref, {"likeCount": count + 1})
+            return LikeResult(
+                listing_id=listing_id, liked=True, changed=True, like_count=count + 1
+            )
+
+        try:
+            return run(self._db.transaction())
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("listing_like", error) from error
+
+    def unlike(self, listing_id: str, user_id: str) -> LikeResult:
+        """관계 삭제와 `likeCount -1`이 **하나의 commit**이다.
+
+        `unlisted`여도 취소할 수 있다 — 판매자가 내렸다고 사용자가 자기 좋아요를
+        못 지우면 count가 영구히 남는다. 자기 상품 좋아요도 지울 수 있다.
+        """
+        listing_ref = self._db.collection(LISTINGS).document(listing_id)
+        key = like_id(user_id, listing_id)
+        like_ref = self._db.collection(LIKES).document(key)
+
+        @firestore.transactional
+        def run(transaction) -> LikeResult:
+            listing_snapshot = listing_ref.get(transaction=transaction)
+            like_snapshot = like_ref.get(transaction=transaction)
+
+            if not listing_snapshot.exists:
+                raise ListingNotFound(listing_id)
+            listing = _listing_from(listing_id, listing_snapshot.to_dict() or {})
+            if listing.status is ListingStatus.DRAFT:
+                # draft에 좋아요가 달릴 경로가 없다 — 있으면 malformed다.
+                raise ListingNotFound(listing_id)
+            count = _checked_count(listing)
+
+            if not like_snapshot.exists:
+                return LikeResult(
+                    listing_id=listing_id, liked=False, changed=False, like_count=count
+                )
+
+            if count == 0:
+                # 관계는 있는데 projection이 0이다. **거짓 보정 대신 멈춘다.**
+                raise LikeCountInconsistent(listing_id)
+
+            transaction.delete(like_ref)
+            transaction.update(listing_ref, {"likeCount": count - 1})
+            return LikeResult(
+                listing_id=listing_id, liked=False, changed=True, like_count=count - 1
+            )
+
+        try:
+            return run(self._db.transaction())
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("listing_unlike", error) from error
+
+    def likes(self, user_id: str) -> list[Like]:
+        try:
+            found = (
+                self._db.collection(LIKES)
+                .where(filter=firestore.FieldFilter("userId", "==", user_id))
+                .stream()
+            )
+            return [_like_from(x.id, x.to_dict() or {}) for x in found]
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("like_list", error) from error
+
     # MARK: - 내부
 
     def _unavailable(self, operation: str, error: Exception) -> StoreUnavailable:
@@ -425,6 +532,32 @@ def _ownership_from(ownership_id_value: str, data: dict) -> Ownership:
         price_paid=int(data.get("pricePaid") or 0),
         buyer_ledger_entry_id=data.get("buyerLedgerEntryId"),
         seller_ledger_entry_id=data.get("sellerLedgerEntryId"),
+        created_at=data.get("createdAt") or utcnow(),
+        schema_version=int(data.get("schemaVersion") or 1),
+    )
+
+
+def _checked_count(listing: Listing) -> int:
+    """음수 projection을 **조용히 0으로 만들지 않는다.**"""
+    if listing.like_count < 0:
+        raise LikeCountInconsistent(listing.id)
+    return listing.like_count
+
+
+def _like_document(like: Like) -> dict:
+    return {
+        "userId": like.user_id,
+        "listingId": like.listing_id,
+        "createdAt": like.created_at,
+        "schemaVersion": like.schema_version,
+    }
+
+
+def _like_from(like_id_value: str, data: dict) -> Like:
+    return Like(
+        id=like_id_value,
+        user_id=str(data.get("userId") or ""),
+        listing_id=str(data.get("listingId") or ""),
         created_at=data.get("createdAt") or utcnow(),
         schema_version=int(data.get("schemaVersion") or 1),
     )

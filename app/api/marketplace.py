@@ -20,7 +20,9 @@ from app.auth.store import StoreUnavailable
 from app.marketplace.models import (
     ContentType,
     InvalidListing,
+    LikeCountInconsistent,
     MarketplaceSort,
+    SelfLike,
     SelfPurchase,
     InvalidTransition,
     ListingNotFound,
@@ -276,6 +278,68 @@ def purchase_listing(
     )
 
 
+class LikeResponse(BaseModel):
+    """좋아요 결과. `changed`는 **이번 요청이 관계를 바꿨는가**다.
+
+    내부 값(`userId` · `sellerUserId` · `snapshotId`)을 담지 않는다.
+    """
+
+    listing_id: str = Field(serialization_alias="listingId")
+    liked: bool
+    changed: bool
+    like_count: int = Field(serialization_alias="likeCount")
+
+
+def _like(result) -> LikeResponse:
+    return LikeResponse(
+        listing_id=result.listing_id,
+        liked=result.liked,
+        changed=result.changed,
+        like_count=result.like_count,
+    )
+
+
+@router.put("/listings/{listing_id}/like")
+def like_listing(
+    listing_id: str,
+    user: Annotated[User, Depends(current_user)],
+    service: Annotated[MarketplaceService, Depends(marketplace_service)],
+) -> LikeResponse:
+    """**body가 없다.** 같은 요청을 반복해도 `changed=false`로 끝난다(오류가 아니다).
+
+    조각을 주거나 받지 않는다.
+    """
+    try:
+        return _like(service.like(user, listing_id))
+    except ListingNotFound as error:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "listing not found") from error
+    except SelfLike as error:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "cannot like your own listing") from error
+    except LikeCountInconsistent as error:
+        logger.error("marketplace_like_count_inconsistent")
+        raise HTTPException(status.HTTP_409_CONFLICT, "like count is inconsistent") from error
+    except StoreUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+
+
+@router.delete("/listings/{listing_id}/like")
+def unlike_listing(
+    listing_id: str,
+    user: Annotated[User, Depends(current_user)],
+    service: Annotated[MarketplaceService, Depends(marketplace_service)],
+) -> LikeResponse:
+    """내려간 상품도 취소할 수 있다 — 못 지우면 count가 영구히 남는다."""
+    try:
+        return _like(service.unlike(user, listing_id))
+    except ListingNotFound as error:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "listing not found") from error
+    except LikeCountInconsistent as error:
+        logger.error("marketplace_like_count_inconsistent")
+        raise HTTPException(status.HTTP_409_CONFLICT, "like count is inconsistent") from error
+    except StoreUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+
+
 @router.post("/listings/{listing_id}/unpublish")
 def unpublish_listing(
     listing_id: str,
@@ -319,3 +383,19 @@ def my_purchases(
         )
         for ownership, listing in owned
     ]
+
+
+@purchases_router.get("/likes")
+def my_likes(
+    user: Annotated[User, Depends(current_user)],
+    service: Annotated[MarketplaceService, Depends(marketplace_service)],
+) -> list[str]:
+    """내가 좋아요한 상품 id 목록.
+
+    공개 목록에 `likedByMe`를 넣으려고 optional auth를 만들지 않는다 —
+    client가 공개 목록과 이 목록을 합친다. 내부 userId는 응답에 없다.
+    """
+    try:
+        return service.liked_listing_ids(user)
+    except StoreUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error

@@ -12,6 +12,7 @@ from app.auth.models import User
 from app.marketplace.models import (
     ContentType,
     MarketplaceSort,
+    LikeResult,
     Ownership,
     PurchaseResult,
     InvalidListing,
@@ -150,6 +151,27 @@ class MarketplaceService:
                 listing = None
             pairs.append((ownership, listing))
         return pairs
+
+    # MARK: - 좋아요 (B-7E.1)
+
+    def like(self, user: User, listing_id: str) -> LikeResult:
+        """좋아요. **조각 경제와 무관하다** — 이 경로에 원장도 지갑도 없다."""
+        result = self._store.like(listing_id, user.id)
+        logger.info(
+            "marketplace_like changed=%s likes=%d", result.changed, result.like_count
+        )
+        return result
+
+    def unlike(self, user: User, listing_id: str) -> LikeResult:
+        result = self._store.unlike(listing_id, user.id)
+        logger.info(
+            "marketplace_unlike changed=%s likes=%d", result.changed, result.like_count
+        )
+        return result
+
+    def liked_listing_ids(self, user: User) -> list[str]:
+        """내가 좋아요한 상품 id. **관계만** 돌려준다 — 내부 userId를 담지 않는다."""
+        return sorted(x.listing_id for x in self._store.likes(user.id))
 
     @staticmethod
     def fee(content_type: ContentType) -> int:

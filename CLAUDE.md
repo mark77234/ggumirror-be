@@ -20,7 +20,7 @@ Backend repository for 꾸미러.
 - purchase / ownership
 - seller shard settlement
 
-## Current Implementation (Phase B-7E 완료 · 미배포)
+## Current Implementation (Phase B-7E.1 완료 · 미배포)
 
 FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth +
 server-authoritative 조각 원장 + 하루 한 번 출석 + AdMob rewarded SSV + AI 스티커 생성 +
@@ -61,7 +61,8 @@ app/api/iap.py       POST /users/me/iap/shards (body는 signedTransaction 하나
 app/api/app_store.py POST /app-store/notifications/v2 (Apple 서명이 곧 인증)
 app/api/marketplace.py  GET(공개) /marketplace/listings · {id}
                      POST /marketplace/listings · {id}/publish · {id}/unpublish · {id}/purchase
-                     GET /users/me/marketplace/purchases
+                     PUT/DELETE /marketplace/listings/{id}/like
+                     GET /users/me/marketplace/purchases · likes
 app/marketplace/models.py  Listing · Snapshot · 상태 · 등록비 정책
 app/marketplace/store.py   MarketplaceStore protocol + in-memory
 app/marketplace/firestore_store.py  등록비 + 게시가 **한 transaction**
@@ -779,7 +780,42 @@ Firestore transaction은 읽기가 쓰기보다 먼저여야 한다. **marketpla
 원장·지갑이라 서로 다른 문서이고, 그 뒤로 marketplace 문서를 다시 읽지 않는다.
 테스트가 소스에서 이 순서를 고정한다.
 
-`tests/test_marketplace.py`가 위 전부를 고정한다.
+#### 좋아요 (B-7E.1)
+
+```
+PUT    /marketplace/listings/{id}/like     (인증, body 없음)
+DELETE /marketplace/listings/{id}/like     (인증)
+GET    /users/me/marketplace/likes         (인증)
+```
+
+`ggumirror_marketplace_likes/{sha256(len:"marketplace_like"|len:userId|len:listingId)}`
+
+**관계 문서가 authority이고 `listing.likeCount`는 projection이다.** 관계 생성/삭제와
+count 변경이 **한 Firestore commit**이다.
+
+- **조각 경제와 무관하다.** 좋아요 경로에 원장도 지갑도 없다 —
+  `apply_in_transaction(` · `shards.` · `.credit(` · `.debit(`가 없음을 테스트가 검사한다
+- **사용자당 상품당 최대 1개.** 문서 ID가 그 조합의 hash이고 `create()`로 쓴다
+- 새 좋아요는 **`published`만**. draft · unlisted는 404
+- **`unlisted`여도 취소할 수 있다** — 판매자가 내렸다고 사용자가 자기 좋아요를 못 지우면
+  count가 영구히 남는다
+- **자기 상품에 좋아요 불가**(판매자가 자기 인기도를 올리지 못하게). **취소는 허용** —
+  잘못 생긴 관계를 지우는 동작이다
+- 반복 요청은 `changed=false`로 조용히 끝난다. HTTP 오류가 아니다
+- `likeCount`가 **음수가 되지 않는다.** 관계가 있는데 count가 0이거나 count가 음수면
+  `LikeCountInconsistent`다 — **조용히 보정하지 않는다**(거짓 값으로 덮으면 언제부터
+  틀렸는지 알 수 없다)
+- 공개 목록에 `likedByMe`를 넣으려고 **optional auth를 만들지 않았다** —
+  client가 공개 목록과 `/users/me/marketplace/likes`를 합친다
+
+count를 바꾸는 것은 LIKE/UNLIKE뿐이다. browse · detail · purchase · unpublish ·
+republish는 `likeCount`를 건드리지 않고, 좋아요는 `downloadCount`를 건드리지 않는다.
+
+**정렬 회귀 없음** — 좋아요가 늘어도 `popular`(=`downloadCount`) 순서는 그대로다.
+
+`tests/test_marketplace.py`가 위 전부를 고정한다. 여기에는 **최소 fake db로
+`FirestoreMarketplaceStore`를 직접 돌리는 harness**가 있어, 실제 `@firestore.transactional`
+재시도 loop에서 count가 두 번 오르지 않는 것을 확인한다(production Firestore를 부르지 않는다).
 
 ### Admin Shard CLI (A-2) — 운영자 조정은 CLI 하나뿐
 
