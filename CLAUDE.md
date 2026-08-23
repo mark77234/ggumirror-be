@@ -20,7 +20,7 @@ Backend repository for 꾸미러.
 - purchase / ownership
 - seller shard settlement
 
-## Current Implementation (Phase B-7G.1 완료 · 배포)
+## Current Implementation (Marketplace UX Hardening.1 완료 · 배포)
 
 FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth +
 server-authoritative 조각 원장 + 하루 한 번 출석 + AdMob rewarded SSV + AI 스티커 생성 +
@@ -59,6 +59,7 @@ app/shards/attendance.py  KST 날짜 규칙 + 출석 지급
 app/core/config.py   환경변수 + logging
 app/api/iap.py       POST /users/me/iap/shards (body는 signedTransaction 하나)
 app/api/app_store.py POST /app-store/notifications/v2 (Apple 서명이 곧 인증)
+app/api/catalog.py   GET(공개) /catalog/templates/stats · POST acquire · reconcile
 app/api/marketplace.py  GET(공개) /marketplace/listings · {id} · {id}/preview
                      GET  /users/me/marketplace/listings (판매자 자기 목록)
                      POST /marketplace/listings · {id}/publish · {id}/unpublish · {id}/purchase
@@ -1044,6 +1045,41 @@ runtime SA의 bucket 권한을 `objectAdmin` → **`objectUser`**로 좁혔다.
 `objectUser`는 `objectAdmin`보다 엄격히 좁다 — `setIamPolicy` · `getIamPolicy` ·
 `setRetention` · `overrideUnlockedRetention`이 빠지고 create/get/delete는 남는다.
 project 수준 storage role은 없다(`roles/datastore.user`만).
+
+### 내장 템플릿 획득 통계 (catalog)
+
+```
+GET  /catalog/templates/stats?ids=a,b,c          (공개)
+POST /catalog/templates/{templateId}/acquire     (인증, body 없음)
+POST /catalog/templates/reconcile                (인증)
+```
+
+앱에 들어 있는 공식 템플릿 **32종**(artwork 24 + basic 8)이 몇 명에게 받아졌는지만
+센다. **Marketplace와 다른 domain이다** — 저쪽은 소유권·조각·판매자가 있고 이쪽은
+없다. 두 경로를 섞지 않는다(test가 고정).
+
+**등록된 id만 받는다.** client가 보낸 문자열을 그대로 세면 아무 값이나 보내 공개
+통계를 부풀릴 수 있다. 목록은 client `StoreCatalog`의 stable id를 그대로 옮겼고
+**제목으로 검증하지 않는다**(제목은 바뀌고 겹친다).
+
+`downloadCount` 의미는 Marketplace와 **같다**: 서로 다른 사용자의 최초 획득 수.
+같은 사람의 재다운로드 · 구경은 **+0**.
+
+| 컬렉션 | 문서 id | 뜻 |
+|---|---|---|
+| `ggumirror_catalog_acquisitions` | `sha256(len:userId|len:templateId)` | 누가 무엇을 처음 받았나 |
+| `ggumirror_catalog_stats` | `templateId` | 공개 `downloadCount` |
+
+**기록 생성과 카운터가 한 transaction**이다. 갈라지면 "받았는데 안 세어졌다"가 되고
+나중에 고칠 방법이 없다. 문서 id가 `(userId, templateId)`이고 `create`로 쓰므로
+동시 요청에도 +1이다(B-7E 소유권과 같은 규칙).
+
+`reconcile`은 **멱등**이다 — 예전 버전에서 받은 것을 로그인 뒤 한 번 따라잡고,
+몇 번을 불러도 수가 오르지 않는다. 그래서 실패한 획득의 복구 수단으로도 쓴다.
+
+통계 조회는 **공개**다(상점 구경에 로그인 벽을 세우지 않는다). 카드마다 요청을
+하나씩 만들지 않도록 한 번에 묻고, 기록이 없으면 **0**을 돌려준다 — 목록에서 빼면
+화면이 자리를 비운다. **누가 받았는지는 공개 응답에 없다.**
 
 ### Admin Shard CLI (A-2) — 운영자 조정은 CLI 하나뿐
 

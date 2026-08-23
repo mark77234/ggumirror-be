@@ -99,6 +99,15 @@ def app_store_notifications(request: Request) -> AppStoreNotificationService:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
 
 
+def catalog_service(request: Request):
+    """내장 템플릿 통계 service. marketplace와 같은 이유로 처음 쓰일 때 만든다."""
+    try:
+        return request.app.state.catalog_service()
+    except Exception as error:  # Firestore client 생성 실패
+        logger.error("catalog_service_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
 def marketplace_service(request: Request) -> MarketplaceService:
     """상점 service. store와 같은 이유로 처음 쓰일 때 만든다."""
     try:
