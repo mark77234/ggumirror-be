@@ -565,3 +565,160 @@ def test_context_state_never_lives_on_the_transaction(store, shards):
     tx = object()
     assert shards.context(tx) is not shards.context(tx)
     assert shards.context(tx).changed_wallets == set()
+
+
+# MARK: - 쓰기 뒤 읽기 (production 500의 원인)
+#
+# Firestore transaction은 **쓰기가 하나라도 나가면 그 뒤 읽기를 거절한다**
+# (`ReadAfterWriteError`). 지갑 두 개가 움직이는 구매에서 구매자 차감이 곧바로 쓰면
+# 판매자 지급의 읽기가 죽는다 — production에서 실제로 500이 났고, 그때까지 테스트는
+# 전부 통과했다. in-memory fake가 쓰기를 처음부터 미뤄 둬서 이 규칙을 흉내 내지
+# 않았기 때문이다. 아래 fake는 **실제 규칙을 강제한다.**
+
+
+class ReadAfterWrite(Exception):
+    """Firestore가 이 상황에서 던지는 것과 같은 뜻."""
+
+
+class StrictSnapshot:
+    def __init__(self, data): self._data = data
+    @property
+    def exists(self): return self._data is not None
+    def to_dict(self): return dict(self._data or {})
+
+
+class StrictRef:
+    def __init__(self, db, key):
+        self._db, self.key = db, key
+        self.id = key[1]
+
+    def get(self, transaction=None):
+        if transaction is not None and transaction.has_written:
+            # 실제 SDK가 `get_transaction_id`에서 죽는 지점이다.
+            raise ReadAfterWrite(self.key)
+        return StrictSnapshot(self._db.data.get(self.key))
+
+
+class StrictDB:
+    def __init__(self): self.data = {}
+    def collection(self, name):
+        db = self
+        class _C:
+            def document(self, doc_id): return StrictRef(db, (name, doc_id))
+        return _C()
+
+
+class StrictTransaction:
+    """읽기 뒤 쓰기 규칙을 지키는지 확인하는 최소 transaction."""
+
+    def __init__(self, db):
+        self._db = db
+        self.has_written = False
+        self.writes = 0
+
+    def create(self, ref, data):
+        if ref.key in self._db.data:
+            raise AssertionError("create on existing")
+        self.has_written = True
+        self.writes += 1
+        self._db.data[ref.key] = dict(data)
+
+    def set(self, ref, data, merge=False):
+        self.has_written = True
+        self.writes += 1
+        if merge and ref.key in self._db.data:
+            self._db.data[ref.key].update(data)
+        else:
+            self._db.data[ref.key] = dict(data)
+
+
+def test_two_wallets_in_one_transaction_do_not_read_after_write():
+    """§15 회귀 — 유료 구매가 production에서 500이던 바로 그 순서다."""
+    from app.shards.firestore_store import FirestoreShardStore
+
+    db = StrictDB()
+    tx = StrictTransaction(db)
+    store = FirestoreShardStore(db)
+    scoped = store.context(tx)
+
+    # 구매자에게 잔액을 만들어 둔다(원장 경로가 아니라 fixture다).
+    db.data[("ggumirror_shard_wallets", BUYER)] = {
+        "balance": 3, "lifetimeEarned": 3, "lifetimeSpent": 0,
+    }
+
+    # 구매자 차감 → 판매자 지급. **두 번째의 읽기가 죽으면 안 된다.**
+    store.apply_in_transaction(
+        scoped, BUYER, -1, ShardReason.MIRROR_PURCHASE,
+        idempotency_hash(BUYER, ShardReason.MIRROR_PURCHASE, LISTING),
+    )
+    store.apply_in_transaction(
+        scoped, SELLER, 1, ShardReason.MIRROR_SALE,
+        idempotency_hash(SELLER, ShardReason.MIRROR_SALE, LISTING),
+    )
+
+    # 읽기가 끝나기 전에는 아무것도 쓰지 않았다.
+    assert tx.writes == 0, "읽기가 남았는데 벌써 썼다"
+
+    scoped.flush()
+    # 지갑 둘 + 원장 둘.
+    assert tx.writes == 4
+
+    assert db.data[("ggumirror_shard_wallets", BUYER)]["balance"] == 2
+    assert db.data[("ggumirror_shard_wallets", SELLER)]["balance"] == 1
+
+
+def test_insufficient_balance_writes_nothing_even_staged():
+    from app.shards.firestore_store import FirestoreShardStore
+
+    db = StrictDB()
+    tx = StrictTransaction(db)
+    store = FirestoreShardStore(db)
+    scoped = store.context(tx)
+    db.data[("ggumirror_shard_wallets", BUYER)] = {
+        "balance": 0, "lifetimeEarned": 0, "lifetimeSpent": 0,
+    }
+
+    with pytest.raises(InsufficientShards):
+        store.apply_in_transaction(
+            scoped, BUYER, -1, ShardReason.MIRROR_PURCHASE,
+            idempotency_hash(BUYER, ShardReason.MIRROR_PURCHASE, LISTING),
+        )
+
+    scoped.flush()
+    assert tx.writes == 0
+
+
+def test_three_shards_buying_one_is_not_insufficient():
+    """§22 — 잔액 3에 1짜리를 사는 것은 부족이 아니다."""
+    from app.shards.firestore_store import FirestoreShardStore
+
+    db = StrictDB()
+    tx = StrictTransaction(db)
+    store = FirestoreShardStore(db)
+    scoped = store.context(tx)
+    db.data[("ggumirror_shard_wallets", BUYER)] = {
+        "balance": 3, "lifetimeEarned": 3, "lifetimeSpent": 0,
+    }
+
+    wallet, _, applied = store.apply_in_transaction(
+        scoped, BUYER, -1, ShardReason.MIRROR_PURCHASE,
+        idempotency_hash(BUYER, ShardReason.MIRROR_PURCHASE, LISTING),
+    )
+    scoped.flush()
+    assert applied is True
+    assert wallet.balance == 2
+
+
+def test_every_caller_flushes_before_its_own_writes():
+    """읽기를 마친 뒤 flush하지 않으면 조각이 조용히 사라진다."""
+    import pathlib
+
+    for path, calls in [
+        ("app/marketplace/firestore_store.py", 2),   # 구매 · 등록비
+        ("app/capacity/store.py", 1),                # 보관 공간 구매
+    ]:
+        source = _code_only(pathlib.Path(path).read_text(encoding="utf-8"))
+        applies = source.count("apply_in_transaction(")
+        flushes = source.count("scoped.flush()")
+        assert flushes >= calls, f"{path}: flush {flushes} < 지점 {calls}"
+        assert applies > 0, path

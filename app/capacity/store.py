@@ -214,6 +214,9 @@ class FirestoreCapacityStore:
             )
             after = before + pack.slot_delta
 
+            # 읽기가 끝났다. 조각 쓰기를 먼저 내려보낸다.
+            scoped.flush()
+
             # user 문서는 **field 하나만** 건드린다. 다른 domain의 값을 덮지 않는다.
             transaction.set(user_ref, {PURCHASED_SLOTS_FIELD: after}, merge=True)
             # `create`다 — 우리가 읽은 뒤 다른 요청이 먼저 자리를 잡았으면 commit이 깨진다.

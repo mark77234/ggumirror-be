@@ -231,6 +231,26 @@ class ShardTransactionContext:
 
     transaction: object
     changed_wallets: set[str] = field(default_factory=set)
+    #: 아직 transaction에 내려보내지 않은 쓰기.
+    #:
+    #: **Firestore transaction은 쓰기 뒤 읽기를 허용하지 않는다.** 지갑 두 개가
+    #: 움직이는 구매에서 첫 번째(구매자 차감)가 곧바로 쓰면, 두 번째(판매자 지급)의
+    #: 읽기가 `ReadAfterWriteError`로 죽는다 — production에서 실제로 그랬다.
+    #: 그래서 계산만 해 두고 `flush()`에서 한 번에 내려보낸다.
+    pending_writes: list = field(default_factory=list)
+
+    def stage(self, write) -> None:
+        """쓰기를 미뤄 둔다. 아직 transaction을 건드리지 않으므로 뒤에 읽어도 된다."""
+        self.pending_writes.append(write)
+
+    def flush(self) -> None:
+        """미뤄 둔 쓰기를 전부 내려보낸다. **읽기를 모두 마친 뒤에 부른다.**
+
+        이 뒤로는 같은 transaction에서 읽을 수 없다.
+        """
+        for write in self.pending_writes:
+            write()
+        self.pending_writes.clear()
 
     def claim(self, user_id: str) -> None:
         """이 attempt에서 이 지갑을 바꾼다고 표시한다.

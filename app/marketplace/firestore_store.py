@@ -216,6 +216,9 @@ class FirestoreMarketplaceStore:
                 balance = result.wallet.balance
                 charged = result.applied
 
+            # 읽기가 끝났다. 조각 쓰기를 먼저 내려보내고 listing을 쓴다.
+            scoped.flush()
+
             now = utcnow()
             transaction.update(
                 listing_ref,
@@ -355,6 +358,10 @@ class FirestoreMarketplaceStore:
                 )
                 balance = debit.wallet.balance
                 buyer_entry, seller_entry = debit.entry_id, credit.entry_id
+
+            # **여기까지 읽기만 했다.** 두 지갑을 모두 읽은 뒤에 내려보낸다 —
+            # 먼저 쓰면 판매자 지갑 읽기가 `ReadAfterWriteError`로 죽는다.
+            scoped.flush()
 
             ownership = Ownership(
                 id=key,

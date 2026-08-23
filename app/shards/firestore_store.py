@@ -532,9 +532,18 @@ class FirestoreShardStore:
         )
         wallet = _moved(current, delta, now, existed=wallet_snapshot.exists)
 
-        # 원장은 `create` — 우리가 읽은 뒤 다른 요청이 먼저 적었으면 commit이 깨진다.
-        transaction.create(ledger_ref, _entry_document(entry))
-        transaction.set(wallet_ref, _wallet_document(wallet))
+        # **바로 쓰지 않고 미뤄 둔다.** 같은 transaction에서 다음 지갑을 아직 읽어야
+        # 할 수 있고, Firestore는 쓰기 뒤 읽기를 거절한다(`ReadAfterWriteError`).
+        # 호출자가 읽기를 모두 마치고 `context.flush()`를 부른다.
+        entry_document = _entry_document(entry)
+        wallet_document = _wallet_document(wallet)
+
+        def write() -> None:
+            # 원장은 `create` — 우리가 읽은 뒤 다른 요청이 먼저 적었으면 commit이 깨진다.
+            transaction.create(ledger_ref, entry_document)
+            transaction.set(wallet_ref, wallet_document)
+
+        context.stage(write)
         return wallet, entry, True
 
     # MARK: - 내부
