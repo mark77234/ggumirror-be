@@ -3828,3 +3828,59 @@ def test_seller_dto_carries_the_source_content():
     # 판매자 DTO에도 내부 식별자는 없다.
     for banned in ["seller_user_id", "snapshot_id"]:
         assert banned not in _SellerListingResponse.model_fields
+
+
+# MARK: - 가격순 정렬 (Marketplace UX Hardening)
+
+
+def _sortable(listing_id: str, *, price: int, downloads: int, likes: int, published: str):
+    from datetime import datetime, timezone
+    from app.marketplace.models import Listing, ListingStatus
+
+    return Listing(
+        id=listing_id, seller_user_id="seller", content_type="mirror",
+        title=listing_id, description="", price_shards=price,
+        snapshot_id=f"snap-{listing_id}", status=ListingStatus.PUBLISHED,
+        publish_fee_paid=True, download_count=downloads, like_count=likes,
+        published_at=datetime.fromisoformat(published).replace(tzinfo=timezone.utc),
+    )
+
+
+def _fixture_listings():
+    # 명세 §42의 fixture 그대로.
+    return [
+        _sortable("A", price=5, downloads=10, likes=1, published="2026-08-03T00:00:00"),
+        _sortable("B", price=0, downloads=20, likes=0, published="2026-08-01T00:00:00"),
+        _sortable("C", price=1, downloads=5, likes=8, published="2026-08-02T00:00:00"),
+    ]
+
+
+def test_price_sort_is_cheapest_first():
+    from app.marketplace.models import MarketplaceSort
+
+    order = [x.id for x in MarketplaceSort.PRICE.sorted(_fixture_listings())]
+    assert order == ["B", "C", "A"]
+
+
+def test_every_sort_is_deterministic():
+    from app.marketplace.models import MarketplaceSort
+
+    expected = {
+        MarketplaceSort.LATEST: ["A", "C", "B"],
+        MarketplaceSort.POPULAR: ["B", "A", "C"],
+        MarketplaceSort.LIKES: ["C", "A", "B"],
+        MarketplaceSort.PRICE: ["B", "C", "A"],
+    }
+    for sort, order in expected.items():
+        assert [x.id for x in sort.sorted(_fixture_listings())] == order, sort
+
+
+def test_price_ties_break_by_newest_then_id():
+    from app.marketplace.models import MarketplaceSort
+
+    same = [
+        _sortable("z", price=1, downloads=0, likes=0, published="2026-08-01T00:00:00"),
+        _sortable("a", price=1, downloads=0, likes=0, published="2026-08-01T00:00:00"),
+        _sortable("m", price=1, downloads=0, likes=0, published="2026-08-05T00:00:00"),
+    ]
+    assert [x.id for x in MarketplaceSort.PRICE.sorted(same)] == ["m", "a", "z"]

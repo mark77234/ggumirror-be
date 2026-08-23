@@ -186,6 +186,8 @@ class MarketplaceSort(StrEnum):
     LATEST = "latest"
     POPULAR = "popular"
     LIKES = "likes"
+    #: 싼 것부터. 무료 필터와 **다른 것이다** — 필터는 무엇을 보여 줄지, 정렬은 순서다.
+    PRICE = "price"
 
     @classmethod
     def default(cls) -> "MarketplaceSort":
@@ -212,6 +214,9 @@ class MarketplaceSort(StrEnum):
                 return (-listing.download_count, published, listing.id)
             case MarketplaceSort.LIKES:
                 return (-listing.like_count, -listing.download_count, published, listing.id)
+            case MarketplaceSort.PRICE:
+                # 오름차순이라 뒤집지 않는다. 같은 값이면 최신이 먼저다.
+                return (listing.price_shards, published, listing.id)
 
 
 @dataclass(frozen=True)
