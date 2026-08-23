@@ -305,6 +305,31 @@ def referenced_asset_ids(content_type: str, document: dict) -> set[str]:
     raise AssetError("contentType")
 
 
+def source_content_id(content_type: str, document: dict) -> str:
+    """manifest가 어느 **local 콘텐츠**에서 나왔는지. top-level `id`다.
+
+    `MyMirror.id` / `StickerProject.id`이고 두 Codable 모두 이 자리에 문자열로 적는다
+    (`_mirror_shape` · `_sticker_shape`가 이미 문자열임을 확인한다).
+    **새 식별자를 만들지 않는다** — 이미 있는 것을 쓴다.
+
+    거울 id는 UUID가 아닐 수 있다. 내장 템플릿에서 받은 거울은 `art-mint-flower`처럼
+    사람이 읽는 값이고, 사용자가 만든 것은 UUID 문자열이다. 그래서 UUID를 요구하지
+    않는다 — 대신 **경로가 될 수 없는 값**인지 본다(이 값은 저장 경로로 쓰지 않지만,
+    나중에 누가 그렇게 쓰더라도 안전해야 한다).
+    """
+    shape = _mirror_shape if content_type == MIRROR else _sticker_shape
+    if content_type not in (MIRROR, STICKER):
+        raise AssetError("contentType")
+    shape(document)
+    found = _string(document, "id")
+    if not found or len(found) > 128:
+        raise AssetError("id")
+    for banned in ("/", "\\", "..", "\x00"):
+        if banned in found:
+            raise AssetError("id")
+    return found
+
+
 def _mirror_shape(document: dict) -> None:
     """거울을 구분하기에 충분한 최소 구조. **모르는 key는 허용한다.**"""
     _string(document, "id")

@@ -134,6 +134,19 @@ def _listing(listing) -> ListingResponse:
     )
 
 
+class _SellerListingResponse(ListingResponse):
+    """판매자 자신에게만 주는 모양. `ListingResponse` + 연결 식별자 하나.
+
+    **공개 DTO(`PublicListingResponse`)는 그대로다** — 거기에는 계속
+    `sellerUserId` · `snapshotId` · `sourceContentId`가 없다.
+    """
+
+    #: 이 상품이 어느 local 콘텐츠(`MyMirror.id` / `StickerProject.id`)에서 나왔는지.
+    #: 판매자가 "내 거울 → 판매 중"에서 자기 상품을 찾는 데 쓴다.
+    #: 옛 snapshot이라 알 수 없으면 빈 문자열이다 — 거짓 값을 지어내지 않는다.
+    source_content_id: str = Field(default="", serialization_alias="sourceContentId")
+
+
 class SnapshotResponse(BaseModel):
     """올린 내용물. **bucket · object key · gs:// URL을 담지 않는다.**"""
 
@@ -555,7 +568,7 @@ def my_purchases(
 def my_listings(
     user: Annotated[User, Depends(current_user)],
     service: Annotated[MarketplaceService, Depends(marketplace_service)],
-) -> list[ListingResponse]:
+) -> list[_SellerListingResponse]:
     """**내가 올린 것 전부** — `draft` · `published` · `unlisted`.
 
     공개 목록(`GET /marketplace/listings`)과 다른 것이다. 그쪽은 `published`만
@@ -572,7 +585,37 @@ def my_listings(
         listings = service.seller_listings(user)
     except StoreUnavailable as error:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
-    return [_listing(x) for x in listings]
+    return [
+        _SellerListingResponse(
+            **_listing(x).model_dump(),
+            source_content_id=service.source_content(x),
+        )
+        for x in listings
+    ]
+
+
+@purchases_router.delete("/listings/{listing_id}")
+def delete_my_listing(
+    listing_id: str,
+    user: Annotated[User, Depends(current_user)],
+    service: Annotated[MarketplaceService, Depends(marketplace_service)],
+) -> ListingResponse:
+    """상품을 **삭제한다.** 판매자 본인만.
+
+    `deleted`는 **끝 상태**다 — 다시 올릴 수 없다. `unlisted`(잠시 내림)와
+    구분하는 이유: 사용자가 "삭제"를 골랐는데 되살아나는 상품처럼 행동하면 안 된다.
+
+    **아무것도 실제로 지우지 않는다.** snapshot · GCS object · 소유권 · 원장이
+    그대로 남아서 **이미 산 사람은 계속 받는다.** 등록비도 돌려주지 않는다 —
+    상점에 올라가 있던 값은 이미 제공됐다.
+    """
+    try:
+        listing = service.delete_listing(user, listing_id)
+    except ListingNotFound as error:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "listing not found") from error
+    except StoreUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+    return _listing(listing)
 
 
 @purchases_router.get("/listings/{listing_id}/preview")

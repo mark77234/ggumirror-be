@@ -976,6 +976,45 @@ Firestore 질의는 `sellerUserId == currentUserId` **하나뿐**이다. `where`
 주지 않으려고 빼지만, 판매자에게는 자기 상품이 이상한 상태라는 것 자체가 보여야
 한다 — 안 보이면 내릴 수도 없다.
 
+#### 삭제 · 출처 연결 (Marketplace UX hardening)
+
+```
+DELETE /users/me/marketplace/listings/{listingId}      (인증, 판매자 본인)
+```
+
+**`deleted`는 끝 상태다.** `unlisted`(잠시 내림, 다시 올릴 수 있음)와 다른 것이다 —
+사용자가 "삭제"를 골랐는데 되살아나는 상품처럼 행동하면 안 된다.
+`publish`가 `status.is_terminal`을 보고 막는다.
+
+**그런데 아무것도 실제로 지우지 않는다.** snapshot · GCS object · 소유권 · 원장 ·
+`downloadCount` · `likeCount`가 전부 남는다 — **이미 산 사람이 계속 받아야** 하기
+때문이다. 등록비도 돌려주지 않는다(경제 mutation 0). tombstone이다.
+
+| | 삭제 후 |
+|---|---|
+| 공개 목록 · 상세 · 미리보기 | 사라진다 |
+| 판매자 목록 | **남는다**(무엇을 지웠는지 알아야 한다) |
+| 구매자 template · asset | **그대로 받는다** |
+| 재등록 | **불가**(`InvalidTransition`) |
+
+`unpublish`는 기존 문서와 호환 때문에 남겨 두지만 새 client UI는 쓰지 않는다.
+
+#### sourceContentId — local 콘텐츠와의 연결
+
+snapshot 문서에 **manifest top-level `id`**를 함께 적는다. `MyMirror.id` /
+`StickerProject.id`이고 **새 식별자를 만들지 않는다.** 판매자가 "내 거울 → 판매 중"에서
+자기 상품을 찾으려면 이 연결이 필요하다 — 제목으로 맞추면 같은 제목이 여러 개일 때 틀린다.
+
+**검증을 통과한 manifest에서만** 뽑고, 경로가 될 수 있는 값(`/` · `..` · NUL)과
+128자 초과는 거절한다. UUID를 요구하지 않는다 — 내장 템플릿에서 받은 거울은
+`art-mint-flower`처럼 사람이 읽는 id다.
+
+옛 snapshot에는 이 값이 없다. 그때는 **저장된 불변 manifest를 읽어** 응답에만 담는다 —
+**production 문서를 다시 쓰지 않는다.** 알 수 없으면 빈 문자열이고 거짓 값을 만들지 않는다.
+
+판매자 응답(`_SellerListingResponse`)에만 담는다. **공개 DTO는 8칸 그대로**이고
+거기에는 계속 `sellerUserId` · `snapshotId` · `sourceContentId`가 없다.
+
 #### 판매자 전용 미리보기 (B-7H hotfix)
 
 ```

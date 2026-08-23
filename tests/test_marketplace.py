@@ -448,6 +448,19 @@ def test_other_sellers_wallet_is_never_touched(store, shards, service, shard_sto
 # MARK: - 소스 불변식
 
 
+def _method_body(source: str, name: str) -> str:
+    """`def <name>`부터 **바로 다음 method 정의 직전**까지.
+
+    경계를 손으로 적으면(`source.index("def get_published")`) 그 사이에 method가
+    하나 생길 때마다 test가 엉뚱한 코드를 보게 된다 — 실제로 두 번 그랬다.
+    다음 `    def `를 찾아 자동으로 끊는다.
+    """
+    start = source.index(f"def {name}")
+    rest = source[start:]
+    following = rest.find("\n    def ", 1)
+    return rest if following == -1 else rest[:following]
+
+
 def _code_only(source: str) -> str:
     import io
     import tokenize
@@ -816,16 +829,11 @@ def test_no_n_plus_one_snapshot_reads():
     source = (
         Path(__file__).resolve().parent.parent / "app/marketplace/firestore_store.py"
     ).read_text()
-    start = source.index("def list_published")
-    # 경계는 **바로 다음 method**다. 사이에 다른 method가 끼면 대상이 아닌 코드까지 본다.
-    end = source.index("def list_for_seller")
-    body = _code_only(source[start:end])
+    body = _code_only(_method_body(source, "list_published"))
     assert "SNAPSHOTS" not in body, "목록에서 snapshot을 읽는다"
 
     # 판매자 목록도 같은 규칙이다.
-    seller = _code_only(
-        source[source.index("def list_for_seller"):source.index("def get_published")]
-    )
+    seller = _code_only(_method_body(source, "list_for_seller"))
     assert "SNAPSHOTS" not in seller, "판매자 목록에서 snapshot을 읽는다"
 
 
@@ -3260,7 +3268,7 @@ def test_seller_listings_query_needs_no_composite_index():
     source = (
         Path(__file__).resolve().parent.parent / "app/marketplace/firestore_store.py"
     ).read_text()
-    raw = source[source.index("def list_for_seller"):source.index("def get_published")]
+    raw = _method_body(source, "list_for_seller")
     assert 'FieldFilter("sellerUserId", "==", seller_user_id)' in raw
     # **docstring을 걷어낸 코드만** 본다 — 설명에 적은 단어를 잡으면 안 된다.
     body = _code_only("def " + raw.split("def ", 1)[1])
@@ -3530,7 +3538,7 @@ def test_seller_preview_reuses_the_public_reader():
     source = (
         Path(__file__).resolve().parent.parent / "app/marketplace/service.py"
     ).read_text()
-    body = source[source.index("def seller_preview"):source.index("def template")]
+    body = _method_body(source, "seller_preview")
     assert "preview_key(snapshot.id)" in body
     assert "self._read(" in body
     # 자기만의 bucket 접근을 만들지 않았다.
@@ -3552,3 +3560,271 @@ def test_no_signed_url_in_seller_preview_endpoint():
         assert banned not in body, banned
     # 판매자 전용이라 공용 캐시에 두지 않는다.
     assert 'private' in raw and "immutable" in raw
+
+
+# MARK: - 삭제 (Marketplace UX hardening)
+#
+# 사용자는 "내리기"가 아니라 삭제를 원한다. 하지만 **아무것도 실제로 지우지 않는다** —
+# 이미 산 사람이 계속 받아야 하기 때문이다. `deleted`는 tombstone이고 끝 상태다.
+
+
+def test_seller_can_delete(service, store):
+    published(store, "live")
+
+    listing = service.delete_listing(user(SELLER), "live")
+
+    assert listing.status is ListingStatus.DELETED
+    assert store.listings["live"].status is ListingStatus.DELETED
+
+
+def test_delete_is_terminal_and_cannot_be_republished(service, store, shards):
+    """가장 중요 — 삭제를 골랐으면 되살아나지 않는다."""
+    from app.marketplace.models import InvalidTransition
+
+    seed(shards, 100)
+    published(store, "live")
+    service.delete_listing(user(SELLER), "live")
+
+    with pytest.raises(InvalidTransition):
+        service.publish(user(SELLER), "live")
+
+    assert store.listings["live"].status is ListingStatus.DELETED
+
+
+def test_delete_refunds_nothing(service, store, shards):
+    """등록비를 돌려주지 않는다. 상점에 올라가 있던 값은 이미 제공됐다."""
+    seed(shards, 100)
+    listing = draft(service, store)
+    service.publish(user(SELLER), listing.id)
+    after_publish = shards.wallet(SELLER).balance
+    assert after_publish == 90, "등록비가 빠지지 않았다"
+
+    service.delete_listing(user(SELLER), listing.id)
+
+    assert shards.wallet(SELLER).balance == after_publish
+
+
+def test_delete_touches_no_economy(service, store, shards):
+    seed(shards, 100)
+    published(store, "live")
+    before = len(shards.entries(SELLER)) if hasattr(shards, "entries") else None
+
+    service.delete_listing(user(SELLER), "live")
+
+    assert shards.wallet(SELLER).balance == 100
+    del before
+
+
+def test_delete_refuses_another_seller(service, store):
+    published(store, "theirs", owner=OTHER)
+
+    with pytest.raises(ListingNotFound):
+        service.delete_listing(user(SELLER), "theirs")
+
+    assert store.listings["theirs"].status is ListingStatus.PUBLISHED
+
+
+def test_delete_is_idempotent(service, store):
+    published(store, "live")
+    service.delete_listing(user(SELLER), "live")
+
+    again = service.delete_listing(user(SELLER), "live")
+
+    assert again.status is ListingStatus.DELETED
+
+
+def test_deleted_disappears_from_public_browse(service, store):
+    published(store, "live")
+    published(store, "other")
+    assert {x.id for x in service.browse()} == {"live", "other"}
+
+    service.delete_listing(user(SELLER), "live")
+
+    assert {x.id for x in service.browse()} == {"other"}
+
+
+def test_deleted_public_detail_is_gone(service, store):
+    published(store, "live")
+    service.delete_listing(user(SELLER), "live")
+
+    with pytest.raises(ListingNotFound):
+        service.listing("live")
+
+
+def test_deleted_public_preview_is_gone(asset_service, store):
+    snapshot = upload(asset_service)
+    listing_with_snapshot(store, snapshot)
+    assert asset_service.preview("with-asset").data == PNG
+
+    asset_service.delete_listing(user(SELLER), "with-asset")
+
+    with pytest.raises(ListingNotFound):
+        asset_service.preview("with-asset")
+
+
+def test_deleted_still_appears_in_seller_list(service, store):
+    """판매자에게는 남는다 — 무엇을 지웠는지 알 수 있어야 한다."""
+    published(store, "live")
+    service.delete_listing(user(SELLER), "live")
+
+    mine = service.seller_listings(user(SELLER))
+
+    assert [x.id for x in mine] == ["live"]
+    assert mine[0].status is ListingStatus.DELETED
+
+
+def test_delete_keeps_the_snapshot(asset_service, store, storage):
+    """snapshot도 GCS object도 **지우지 않는다.**"""
+    snapshot = upload(asset_service, asset_ids=[ASSET_A])
+    listing_with_snapshot(store, snapshot)
+    before = dict(storage.objects)
+
+    asset_service.delete_listing(user(SELLER), "with-asset")
+
+    assert store.snapshots[snapshot.id] is not None
+    assert set(storage.objects) == set(before), "GCS object가 사라졌다"
+
+
+def test_buyer_keeps_template_access_after_delete(asset_service, store, shards):
+    """**핵심 관문** — 산 사람은 삭제 뒤에도 계속 받는다."""
+    seed(shards, 100, who=BUYER)
+    snapshot = upload(asset_service, asset_ids=[ASSET_A])
+    listing_with_snapshot(store, snapshot)
+    asset_service.purchase(user(BUYER), "with-asset")
+
+    asset_service.delete_listing(user(SELLER), "with-asset")
+
+    # 공개로는 사라졌지만
+    with pytest.raises(ListingNotFound):
+        asset_service.preview("with-asset")
+    # 구매자는 그대로다.
+    assert asset_service.template(user(BUYER), "with-asset").data
+    assert asset_service.template_asset(user(BUYER), "with-asset", ASSET_A).data == PNG
+
+
+def test_delete_keeps_ownership_and_counts(asset_service, store, shards):
+    seed(shards, 100, who=BUYER)
+    snapshot = upload(asset_service)
+    listing_with_snapshot(store, snapshot)
+    asset_service.purchase(user(BUYER), "with-asset")
+    asset_service.like(user(LIKER), "with-asset")
+
+    asset_service.delete_listing(user(SELLER), "with-asset")
+
+    listing = store.listings["with-asset"]
+    assert listing.download_count == 1, "다운로드 기록이 사라졌다"
+    assert listing.like_count == 1, "좋아요 기록이 사라졌다"
+    assert store.ownership("with-asset", BUYER) is not None
+
+
+def test_delete_does_not_hard_delete_anything():
+    """소스에 실제 삭제가 없다 — tombstone뿐이다."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    body = _method_body(
+        (root / "app/marketplace/firestore_store.py").read_text(), "delete"
+    )
+    code = _code_only(body)
+    for banned in [".delete()", "SNAPSHOTS", "OWNERSHIP", "LIKES", "bucket"]:
+        assert banned not in code, f"삭제가 {banned}를 건드린다"
+    assert "ListingStatus.DELETED.value" in code
+
+
+# MARK: - HTTP
+
+
+def test_delete_needs_auth(client):
+    assert client.delete("/users/me/marketplace/listings/abc").status_code == 401
+
+
+def test_no_arbitrary_delete_path(client):
+    """임의 userId로 남의 상품을 지우는 경로를 만들지 않았다."""
+    for path in [
+        f"/users/{SELLER}/marketplace/listings/abc",
+        "/marketplace/listings/abc",
+    ]:
+        assert client.delete(path).status_code in {401, 404, 405}
+
+
+# MARK: - source content id
+
+
+def test_new_snapshot_records_the_source_content(asset_service, store):
+    """manifest top-level `id`를 그대로 쓴다 — 새 식별자를 만들지 않는다."""
+    package = checked_package(
+        content_type="mirror",
+        manifest=as_bytes(mirror_document(id="art-mint-flower")),
+        preview=PNG, assets={},
+    )
+    snapshot = asset_service.create_snapshot(
+        user(), content_type="mirror", package=package
+    )
+
+    assert store.snapshots[snapshot.id].source_content_id == "art-mint-flower"
+
+
+def test_sticker_snapshot_records_its_project_id(asset_service, store):
+    package = checked_package(
+        content_type="sticker",
+        manifest=as_bytes(sticker_document(id="sticker-42")),
+        preview=PNG, assets={},
+    )
+    snapshot = asset_service.create_snapshot(
+        user(), content_type="sticker", package=package
+    )
+
+    assert store.snapshots[snapshot.id].source_content_id == "sticker-42"
+
+
+def test_seller_listing_exposes_the_source_content(asset_service, store):
+    snapshot = upload(asset_service)
+    listing = listing_with_snapshot(store, snapshot)
+
+    assert asset_service.source_content(listing) == "mirror-1"
+
+
+def test_legacy_snapshot_falls_back_to_the_stored_manifest(asset_service, store, storage):
+    """옛 문서에는 `sourceContentId`가 없다. **저장된 manifest에서 읽는다.**
+
+    production Firestore를 다시 쓰지 않는다 — 응답에만 담는다.
+    """
+    snapshot = upload(asset_service)
+    listing = listing_with_snapshot(store, snapshot)
+    # 옛 문서를 흉내 낸다: 값을 지운다.
+    legacy = type(snapshot)(**{**store.snapshots[snapshot.id].__dict__, "source_content_id": ""})
+    store.snapshots[snapshot.id] = legacy
+    assert store.snapshots[snapshot.id].source_content_id == ""
+
+    found = asset_service.source_content(listing)
+
+    assert found == "mirror-1", "저장된 manifest에서 읽지 못했다"
+    # **문서를 고치지 않았다.**
+    assert store.snapshots[snapshot.id].source_content_id == ""
+    del storage
+
+
+def test_unknown_source_content_is_empty_not_invented(service, store):
+    """알 수 없으면 빈 문자열이다. 거짓 값을 지어내지 않는다."""
+    listing = published(store, "live")
+    # snapshot이 없다.
+    assert service.source_content(listing) == ""
+
+
+def test_source_content_is_not_in_the_public_dto(client, store):
+    from app.api.marketplace import PublicListingResponse
+
+    assert "source_content_id" not in PublicListingResponse.model_fields
+    published(store, "live")
+    text = client.get("/marketplace/listings").text
+    for banned in ["sourceContentId", "source_content_id"]:
+        assert banned not in text
+
+
+def test_seller_dto_carries_the_source_content():
+    from app.api.marketplace import _SellerListingResponse
+
+    assert "source_content_id" in _SellerListingResponse.model_fields
+    # 판매자 DTO에도 내부 식별자는 없다.
+    for banned in ["seller_user_id", "snapshot_id"]:
+        assert banned not in _SellerListingResponse.model_fields

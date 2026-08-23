@@ -12,10 +12,13 @@ from __future__ import annotations
 import logging
 
 from google.api_core import exceptions as gcp_exceptions
+from dataclasses import replace
+
 from google.cloud import firestore
 
 from app.auth.store import StoreUnavailable
 from app.marketplace.models import (
+    InvalidTransition,
     ContentType,
     Like,
     LikeCountInconsistent,
@@ -95,6 +98,36 @@ class FirestoreMarketplaceStore:
             logger.error("marketplace_listing_malformed count=%d", len(skipped))
         return [x for x in listings if _is_public(x)]
 
+    def delete(self, listing_id: str, seller_user_id: str) -> Listing:
+        """`deleted`로 표시만 한다. **아무것도 실제로 지우지 않는다.**
+
+        snapshot · GCS object · 소유권 · 원장을 건드리지 않는다 — 이미 산 사람이
+        계속 받아야 한다. 등록비도 돌려주지 않는다(경제 mutation 0).
+        """
+        listing_ref = self._db.collection(LISTINGS).document(listing_id)
+
+        @firestore.transactional
+        def run(transaction) -> Listing:
+            listing = _owned_listing(
+                listing_ref.get(transaction=transaction), listing_id, seller_user_id
+            )
+            if listing.status is ListingStatus.DELETED:
+                # 이미 삭제됐다. 다시 써도 같은 결과다(멱등).
+                return listing
+
+            now = utcnow()
+            transaction.update(
+                listing_ref, {"status": ListingStatus.DELETED.value, "updatedAt": now}
+            )
+            return replace(listing, status=ListingStatus.DELETED, updated_at=now)
+
+        try:
+            return run(self._db.transaction())
+        except (ListingNotFound, InvalidTransition):
+            raise
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("listing_delete", error) from error
+
     def list_for_seller(self, seller_user_id: str) -> list[Listing]:
         """`sellerUserId == seller_user_id` **하나로만** 질의한다.
 
@@ -147,6 +180,13 @@ class FirestoreMarketplaceStore:
                 listing_ref.get(transaction=transaction), listing_id, seller_user_id
             )
             fee = MarketplacePublishPolicy.fee(listing.content_type)
+
+            if listing.status.is_terminal:
+
+                # **삭제는 끝 상태다.** 되살아나지 않는다.
+
+                raise InvalidTransition(listing.status.value)
+
 
             if listing.status is ListingStatus.PUBLISHED:
                 # 이미 올라가 있다. **아무것도 쓰지 않는다** — 재시도·연타가 오류가 아니다.
@@ -572,6 +612,9 @@ def _snapshot_document(snapshot: Snapshot) -> dict:
         "manifestChecksum": snapshot.manifest_checksum,
         "assetCount": snapshot.asset_count,
         "totalBytes": snapshot.total_bytes,
+        # 판매자가 "내 거울 → 판매 중"에서 자기 상품을 찾는 연결.
+        # **공개 응답에는 넣지 않는다.**
+        "sourceContentId": snapshot.source_content_id,
         "createdAt": snapshot.created_at,
         "schemaVersion": snapshot.schema_version,
     }
@@ -585,6 +628,8 @@ def _snapshot_from(snapshot_id: str, data: dict) -> Snapshot:
         manifest_checksum=str(data.get("manifestChecksum") or ""),
         asset_count=int(data.get("assetCount") or 0),
         total_bytes=int(data.get("totalBytes") or 0),
+        # 옛 문서에는 없다. 그때는 저장된 manifest에서 읽는다(service의 fallback).
+        source_content_id=str(data.get("sourceContentId") or ""),
         created_at=data.get("createdAt") or utcnow(),
         schema_version=int(data.get("schemaVersion") or 1),
     )

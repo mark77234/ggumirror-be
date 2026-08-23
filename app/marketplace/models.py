@@ -32,12 +32,27 @@ class ContentType(StrEnum):
 
 
 class ListingStatus(StrEnum):
-    """등록의 상태. **셋뿐이다** — 심사/보류 같은 것을 MVP에 만들지 않는다."""
+    """등록의 상태. 심사/보류 같은 것을 MVP에 만들지 않는다."""
 
     DRAFT = "draft"
     PUBLISHED = "published"
     #: 목록에서 빠지고 살 수 없다. **이미 산 사람은 계속 쓴다.**
+    #:
+    #: 판매자가 잠시 내린 것이고 다시 올릴 수 있다. 새 client UI는 이 상태를
+    #: 만들지 않지만(삭제를 쓴다) 기존 문서와 `unpublish` endpoint 때문에 남긴다.
     UNLISTED = "unlisted"
+    #: **끝 상태.** 판매자가 삭제했다. 다시 올릴 수 없다.
+    #:
+    #: `unlisted`와 다른 것이다 — 사용자가 "삭제"를 골랐으면 되살아나는 상품처럼
+    #: 행동해서는 안 된다. 그렇다고 실제로 지우지도 않는다: snapshot · GCS object ·
+    #: 소유권 · 원장은 **그대로 남는다.** 이미 산 사람이 계속 받아야 하기 때문이다.
+    #: 등록비도 돌려주지 않는다.
+    DELETED = "deleted"
+
+    @property
+    def is_terminal(self) -> bool:
+        """되돌릴 수 없는 상태인가. 여기서 나가는 전이는 없다."""
+        return self is ListingStatus.DELETED
 
 
 class MarketplacePublishPolicy:
@@ -105,6 +120,15 @@ class Snapshot:
     content_type: ContentType
     #: 서버가 계산한 manifest SHA-256. client가 보낸 값을 authority로 쓰지 않는다.
     manifest_checksum: str = ""
+    #: 이 snapshot이 어느 **local 콘텐츠**에서 나왔는지. `MyMirror.id` /
+    #: `StickerProject.id`다 — manifest top-level `id`에서 그대로 뽑는다.
+    #:
+    #: 판매자가 "내 거울 → 판매 중"에서 자기 상품을 찾으려면 이 연결이 필요하다.
+    #: 제목으로 맞추면 같은 제목이 여러 개일 때 틀린다.
+    #:
+    #: **공개 응답에 넣지 않는다.** 판매자 자신에게만 돌려준다.
+    #: 옛 문서에는 이 값이 없다 — 그때는 저장된 manifest에서 읽는다(rewrite 없음).
+    source_content_id: str = ""
     asset_count: int = 0
     total_bytes: int = 0
     created_at: datetime = field(default_factory=utcnow)

@@ -10,6 +10,7 @@ import json
 import logging
 
 from app.auth.models import User
+from app.auth.store import StoreUnavailable
 from app.marketplace.models import (
     ContentType,
     MarketplaceSort,
@@ -33,6 +34,7 @@ from app.marketplace.assets import (
     AssetNotFound,
     AssetStorageUnavailable,
     referenced_asset_ids,
+    source_content_id,
     MarketplaceAssetStorage,
     SnapshotPackage,
     asset_key,
@@ -138,6 +140,42 @@ class MarketplaceService:
         """공개 상세. draft · unlisted · 없는 것은 모두 `ListingNotFound`다."""
         return self._store.get_published(listing_id)
 
+    def delete_listing(self, user: User, listing_id: str) -> Listing:
+        """판매자가 삭제한다. **끝 상태**이고 다시 올릴 수 없다.
+
+        아무것도 실제로 지우지 않는다 — snapshot · GCS object · 소유권 · 원장이
+        그대로 남아서 이미 산 사람이 계속 받는다. 등록비 환불도 없다.
+        """
+        listing = self._store.delete(listing_id, user.id)
+        logger.info("marketplace_delete type=%s", listing.content_type.value)
+        return listing
+
+    def source_content(self, listing: Listing) -> str:
+        """이 listing이 어느 local 콘텐츠에서 나왔는지. 판매자에게만 준다.
+
+        1. snapshot 문서에 있으면 그것을 쓴다
+        2. 없으면(옛 문서) **저장된 manifest를 읽어** top-level `id`를 뽑는다
+        3. 그래도 못 얻으면 빈 문자열이다 — 거짓 값을 지어내지 않는다
+        
+        **옛 문서를 다시 쓰지 않는다.** 응답에만 담는다.
+        """
+        try:
+            snapshot = self._store.snapshot_for_delivery(listing.snapshot_id)
+        except (SnapshotNotFound, StoreUnavailable):
+            return ""
+        if snapshot.source_content_id:
+            return snapshot.source_content_id
+        # 옛 snapshot이다. 불변 manifest에서 읽는다 — 저장된 바이트가 authority다.
+        if self._assets is None:
+            return ""
+        try:
+            stored = self._assets.get(manifest_key(snapshot.id))
+            return source_content_id(
+                listing.content_type.value, json.loads(stored.data)
+            )
+        except (AssetError, ValueError):
+            return ""
+
     def seller_listings(self, user: User) -> list[Listing]:
         """**판매자 자신의** listing 전부 — `draft` · `published` · `unlisted`.
 
@@ -231,7 +269,8 @@ class MarketplaceService:
         # snapshot은 불변이라 나중에 고칠 수 없다. 검증을 한 호출 경로에만
         # 의존하지 않는다 — 우회하면 손해가 구매자에게 간다.
         try:
-            referenced = referenced_asset_ids(kind.value, json.loads(package.manifest))
+            document = json.loads(package.manifest)
+            referenced = referenced_asset_ids(kind.value, document)
         except (AssetError, ValueError) as error:
             # **`InvalidListing`으로 바꾼다.** 그대로 두면 API가 `AssetError`를
             # 저장소 장애(503)로 분류해서, 잘못된 package를 보낸 판매자에게
@@ -267,6 +306,8 @@ class MarketplaceService:
                 manifest_checksum=package.manifest_checksum,
                 asset_count=len(package.assets),
                 total_bytes=package.total_bytes,
+                # **검증을 통과한 manifest에서만** 뽑는다. 새 식별자를 만들지 않는다.
+                source_content_id=source_content_id(kind.value, document),
             )
         )
         logger.info(

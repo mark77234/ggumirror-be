@@ -14,6 +14,7 @@ import threading
 from typing import Protocol
 
 from app.marketplace.models import (
+    InvalidTransition,
     ContentType,
     Like,
     LikeCountInconsistent,
@@ -32,6 +33,8 @@ from app.marketplace.models import (
     like_id,
     ownership_id,
 )
+from dataclasses import replace
+
 from app.shards.models import utcnow
 from app.shards.service import ShardLedgerService
 
@@ -99,6 +102,16 @@ class MarketplaceStore(Protocol):
         판매자가 자기 상품을 관리하려면 아직 안 올린 것과 내린 것까지 보여야 한다.
 
         **다른 판매자의 것은 한 건도 섞이지 않는다.**
+        """
+
+    def delete(self, listing_id: str, seller_user_id: str) -> Listing:
+        """판매자가 **삭제한다.** `deleted`는 끝 상태다 — 다시 올릴 수 없다.
+
+        **아무것도 실제로 지우지 않는다**: snapshot · GCS object · 소유권 · 원장이
+        그대로 남는다. 이미 산 사람이 계속 받아야 하기 때문이다.
+        등록비도 돌려주지 않는다(경제 mutation 0).
+
+        `unlisted`와 다르다 — 사용자가 삭제를 골랐으면 되살아나지 않아야 한다.
         """
 
     def acquire(self, listing_id: str, buyer_user_id: str, shards) -> PurchaseResult:
@@ -204,6 +217,16 @@ class InMemoryMarketplaceStore:
     def list_for_seller(self, seller_user_id: str) -> list[Listing]:
         return [x for x in self.listings.values() if x.seller_user_id == seller_user_id]
 
+    def delete(self, listing_id: str, seller_user_id: str) -> Listing:
+        found = self.listings.get(listing_id)
+        if found is None or found.seller_user_id != seller_user_id:
+            raise ListingNotFound(listing_id)
+        if found.status is ListingStatus.DELETED:
+            return found
+        updated = replace(found, status=ListingStatus.DELETED, updated_at=utcnow())
+        self.listings[listing_id] = updated
+        return updated
+
     # MARK: - 쓰기
 
     def publish(
@@ -212,6 +235,10 @@ class InMemoryMarketplaceStore:
         with self._lock:
             listing = self.listing(listing_id, seller_user_id)
             fee = MarketplacePublishPolicy.fee(listing.content_type)
+
+            if listing.status.is_terminal:
+                # **삭제는 끝 상태다.** 사용자가 삭제를 골랐으면 되살아나지 않는다.
+                raise InvalidTransition(listing.status.value)
 
             if listing.status is ListingStatus.PUBLISHED:
                 # 이미 올라가 있다. 재시도 · 연타는 오류가 아니다.
