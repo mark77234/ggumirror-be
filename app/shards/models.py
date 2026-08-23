@@ -61,6 +61,9 @@ class ShardReason(StrEnum):
     IAP_REFUND = "iap_refund"
     # Apple이 환불을 되돌렸을 때 **회수했던 만큼만** 복구(B-6F-C).
     IAP_REFUND_REVERSED = "iap_refund_reversed"
+    # 거울 보관 공간 확장. 상점 구매와 **다른 사건**이라 이유를 나눈다 —
+    # 원장만 보고 무엇에 썼는지 알 수 있어야 한다.
+    MIRROR_CAPACITY_PURCHASE = "mirror_capacity_purchase"
     ADMIN_ADJUSTMENT = "admin_adjustment"
 
 

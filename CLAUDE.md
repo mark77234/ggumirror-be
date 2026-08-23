@@ -20,7 +20,7 @@ Backend repository for 꾸미러.
 - purchase / ownership
 - seller shard settlement
 
-## Current Implementation (Marketplace UX Hardening.1 완료 · 배포)
+## Current Implementation (Mirror Capacity Purchase 완료)
 
 FastAPI + Apple token 검증 + Firestore User / Session + Bearer auth +
 server-authoritative 조각 원장 + 하루 한 번 출석 + AdMob rewarded SSV + AI 스티커 생성 +
@@ -37,6 +37,8 @@ app/auth/store.py    AuthStore protocol + in-memory
 app/auth/firestore_store.py  Firestore 구현
 app/api/auth.py      POST /auth/apple, POST /auth/logout
 app/api/users.py     GET /users/me · shards · attendance · rewarded-ads
+app/api/capacity.py  GET·POST /users/me/mirror-capacity (거울 보관 공간)
+app/capacity/        models(정책) · store(원자적 구매) · service
 app/api/ads.py       GET /admob/rewarded/ssv (Google 서명이 곧 인증)
 app/api/ai.py        config · POST /ai/stickers · GET {id} · GET {id}/image
 app/ai/models.py     가격 · 상한 · 상태 전이표(can_transition) · lease/grace
@@ -1421,6 +1423,62 @@ capability probe로 확인한 사실:
   Cloud Storage bucket이 없는 것은 아직 안 만들어서가 아니라 **필요가 없어서**다 —
   스티커의 주인은 기기다(`UserStickerAssets/<id>.png`)
 - provider 응답 본문을 로그에 넣지 않는다 — 프롬프트가 그대로 되돌아온다
+
+## 거울 보관 공간 (Mirror Capacity)
+
+거울을 몇 개까지 담을 수 있는가. **client는 authority가 아니다.**
+
+| | |
+|---|---|
+| 무료 기본 | `BASE_MIRROR_SLOTS = 5` |
+| 확장 상품 | `mirror_slots_5` — **10조각 → +5칸** |
+| 반복 구매 | 가능. 상한 없음 |
+| 저장 위치 | `ggumirror_users/{userId}.purchasedMirrorSlots` |
+| 구매 기록 | `ggumirror_mirror_capacity_operations/{hash(user, operationId)}` |
+
+- **가격과 칸 수는 서버가 정한다.** request에는 `packId`와 `operationId` 자리밖에 없다 —
+  `cost` · `slotDelta`를 실을 곳이 없다. 모르는 pack은 404다
+- 예전 사용자 문서에는 field가 없다 → **0으로 본다.** migration을 돌리지 않는다
+- 새 collection을 하나만 만들었다(구매 기록). 칸 수는 이미 있는 user 문서에 얹는다 —
+  그 문서는 생성 때 한 번만 `set`되고 뒤에 덮어쓰이지 않아서 안전하다.
+  지갑과 섞지 않는다(지갑에는 자기 collection이 있다)
+- **몇 개를 쓰고 있는지는 서버가 모른다.** 그건 기기의 사실(`MirrorLibrary` 개수)이고,
+  서버는 "몇 칸까지 담을 수 있는가"만 안다
+
+### operationId — 반복 구매와 재시도를 가르는 것
+
+`user + packId`를 멱등 열쇠로 쓰면 **두 번째 확장을 영원히 못 산다.**
+반대로 재시도마다 새 열쇠를 만들면 응답을 잃었을 때 **조각이 두 번 빠진다.**
+
+그래서 **의도 하나 = `operationId` 하나**가 authority다. client가 UUID를 만들고,
+같은 구매를 재시도할 때는 같은 값을, 새 구매에는 새 값을 보낸다.
+열쇠는 `sha256(len:user_id|len:operation_id)`라 남의 기록에 닿을 수 없다.
+
+### 하나의 transaction
+
+`FirestoreCapacityStore.purchase`가 한 commit 안에서:
+
+```
+1. 구매 기록 읽기(멱등)      ← 우리 문서를 전부 먼저 읽는다
+2. 칸 수 읽기
+3. 조각 -10                  ← apply_in_transaction (B-7B)
+4. purchasedMirrorSlots +5   ← merge, 다른 field를 덮지 않는다
+5. 원장 한 줄
+6. 구매 기록 create
+```
+
+- **읽기가 전부 쓰기보다 앞선다.** Firestore transaction은 쓰기 뒤 읽기를 허용하지 않는다
+- `scoped = shards.context(transaction)`을 **attempt마다** 새로 만든다(B-7B.1).
+  안 그러면 ABORTED 재시도가 `WalletAlreadyChanged`로 잘못 거절된다
+- 잔액이 모자라면 `InsufficientShards`가 올라와 **transaction 전체가 취소된다** —
+  칸도 기록도 원장도 남지 않는다. 409로 나간다
+- 새 지갑 시스템을 만들지 않았다. 조각 이동은 전부 기존 `ShardLedgerService`가 한다
+
+원장 이유는 `mirror_capacity_purchase`다 — 상점 구매와 **다른 사건**이라 나눈다.
+
+`tests/test_mirror_capacity.py`가 위 전부를 고정한다. 실제 SDK wrapper +
+`AbortingCapacityTransaction`으로 **진짜 ABORTED 재시도 loop**를 돌려
+-10과 +5가 시도마다 쌓이지 않는 것을 확인한다.
 
 ## Structure Rules
 

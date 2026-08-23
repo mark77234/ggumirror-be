@@ -29,6 +29,7 @@ from app.marketplace.service import MarketplaceService
 from app.iap.service import IAPService
 from app.iap.apple_verifier import build_apple_verifier
 from app.iap.verifier import TransactionVerifier
+from app.api import capacity as capacity_api
 from app.api import catalog as catalog_api
 from app.api import ads, ai, app_store, auth, health, iap, marketplace, users
 from app.auth.apple import AppleTokenVerifier
@@ -53,6 +54,7 @@ def create_app(
     marketplace_store=None,
     marketplace_assets=None,
     catalog_store=None,
+    capacity_store=None,
 ) -> FastAPI:
     """store를 주면 그것을 쓴다 — test는 in-memory fake와 test key를 넣는다."""
     settings = settings or load_settings()
@@ -206,6 +208,17 @@ def create_app(
         # 조각 원장과 **같은 Firestore client**를 쓴다.
         return CatalogService(catalog_store or FirestoreCatalogStore(_firestore()))
 
+    @lru_cache(maxsize=1)
+    def mirror_capacity():
+        from app.capacity.service import MirrorCapacityService
+        from app.capacity.store import FirestoreCapacityStore
+
+        # 조각 원장과 **같은 service 객체**를 쓴다 — 새 지갑 시스템을 만들지 않는다.
+        return MirrorCapacityService(
+            capacity_store or FirestoreCapacityStore(_firestore()), shards()
+        )
+
+    app.state.mirror_capacity_service = mirror_capacity
     app.state.catalog_service = catalog
     app.state.apple_verifier = verifier
     app.state.auth_store = store
@@ -225,6 +238,7 @@ def create_app(
     app.include_router(app_store.router)
     app.include_router(marketplace.router)
     app.include_router(catalog_api.router)
+    app.include_router(capacity_api.router)
     app.include_router(marketplace.purchases_router)
 
     logger.info("app created env=%s log_level=%s", settings.app_env, settings.log_level)
