@@ -109,6 +109,18 @@ def acquire_template(
     )
 
 
+@router.get("/templates/mine")
+def my_templates(
+    user: Annotated[User, Depends(current_user)],
+    service: Annotated[CatalogService, Depends(catalog_service)],
+) -> dict[str, list[str]]:
+    """내가 가진 내장 템플릿 id. **id만 나간다** — 값도 시각도 필요 없다."""
+    try:
+        return {"templateIds": service.owned_template_ids(user)}
+    except StoreUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
 @router.post("/templates/{template_id}/purchases", response_model_by_alias=True)
 def purchase_template(
     template_id: str,

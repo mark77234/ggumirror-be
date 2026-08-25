@@ -76,6 +76,12 @@ class CatalogService:
             return []
         return self._store.stats(wanted)
 
+    def owned_template_ids(self, user: User) -> list[str]:
+        """이 사람이 가진 내장 템플릿. **CTA가 이걸로 갈린다** —
+        산 뒤 기기에서 지운 사람에게 다시 사라고 하지 않기 위해서다.
+        """
+        return sorted(self._store.acquired_template_ids(user.id))
+
     def purchase(self, user: User, template_id: str) -> AcquisitionResult:
         """조각을 내고 내장 템플릿을 갖는다.
 

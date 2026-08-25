@@ -291,3 +291,19 @@ def test_purchase_takes_no_body_fields(client):
     assert parameters == {"template_id", "user", "service"}
     for forbidden in ("price", "amount", "user_id", "shards"):
         assert forbidden not in parameters
+
+
+def test_owned_list_starts_empty(service):
+    assert service.owned_template_ids(user(ALICE)) == []
+
+
+def test_owned_list_reflects_purchases(service, shards):
+    fund(shards, ALICE, 5)
+    service.purchase(user(ALICE), CHEAP)
+    assert service.owned_template_ids(user(ALICE)) == [CHEAP]
+    # 다른 사람 것이 섞이지 않는다.
+    assert service.owned_template_ids(user(BOB)) == []
+
+
+def test_owned_endpoint_requires_authentication(client):
+    assert client.get("/catalog/templates/mine").status_code == 401
