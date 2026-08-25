@@ -192,3 +192,33 @@ def current_user(
 
 
 CurrentUser = Annotated[User, Depends(current_user)]
+
+
+FORBIDDEN = "권한이 없어요."
+
+
+def admin_user(
+    user: CurrentUser,
+    auth_store: Annotated[AuthStore, Depends(store)],
+) -> User:
+    """**운영자만.** 인증을 먼저 하고 그 다음에 allowlist를 본다.
+
+    client가 보낸 어떤 값도 여기 들어오지 않는다 — body에도 header에도
+    "나는 운영자다"라고 적을 자리가 없다. 판단 근거는 서버가 읽은 문서 하나뿐이다.
+
+    화면이 운영자 메뉴를 숨기는 것은 **편의일 뿐이다.** 강제로 화면을 열어
+    요청을 보내도 여기서 막힌다.
+    """
+    try:
+        allowed = auth_store.is_admin(user.id)
+    except StoreUnavailable as error:
+        # **읽기 실패를 "권한 없음"으로 바꾸지 않는다** — 장애를 권한 문제로
+        # 잘못 보여 주면 운영자가 자기 계정을 의심하게 된다.
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+    if not allowed:
+        logger.warning("admin_denied")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, FORBIDDEN)
+    return user
+
+
+AdminUser = Annotated[User, Depends(admin_user)]

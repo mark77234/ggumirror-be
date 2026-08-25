@@ -13,6 +13,10 @@ from app.auth.models import User
 from app.auth.store import StoreUnavailable
 from app.marketplace.models import (
     ContentType,
+    ModerationReason,
+    ModerationResult,
+    ModerationStatus,
+    checked_note,
     MarketplaceSort,
     LikeResult,
     Ownership,
@@ -45,6 +49,11 @@ from app.marketplace.store import MarketplaceStore
 from app.shards.service import ShardLedgerService
 
 logger = logging.getLogger(__name__)
+
+#: 운영 목록 한 page. 운영자 한 명이 훑는 화면이라 크게 잡을 이유가 없다.
+ADMIN_PAGE_SIZE = 30
+#: client가 요청해도 이 이상은 주지 않는다 — 무제한 읽기를 막는다.
+ADMIN_MAX_PAGE = 50
 
 
 class MarketplaceService:
@@ -384,6 +393,75 @@ class MarketplaceService:
             # 404가 아니다 — 상품은 있고 우리 설정이 없다.
             raise AssetStorageUnavailable("marketplace asset bucket is not configured")
         return self._assets.get(key)
+
+    # MARK: - 운영 조치 (Phase E)
+    #
+    # **여기 있는 것은 전부 운영자 전용이다.** 권한 판단은 이 class가 하지 않는다 —
+    # API의 `require_admin`이 한다. 그래서 이름을 `admin_`으로 시작해서, 공개
+    # endpoint에서 실수로 부르면 눈에 띄게 만든다.
+
+    def admin_listings(
+        self,
+        *,
+        content_type: ContentType | None = None,
+        moderation_status: ModerationStatus | None = None,
+        cursor: str | None = None,
+        limit: int = ADMIN_PAGE_SIZE,
+    ) -> tuple[list[Listing], str | None]:
+        """운영 목록. **모든 상태가 보인다** — draft도 삭제된 것도 조치된 것도.
+
+        걸러내면 운영자가 문제를 볼 수 없다(공개 목록과 정반대 요구다).
+        필터는 읽어 온 page 안에서 건다 — 그래서 page가 `limit`보다 작을 수 있고,
+        `cursor`가 있으면 다음 page가 남아 있다는 뜻이다.
+        """
+        page, next_cursor = self._store.list_for_admin(cursor, max(1, min(limit, ADMIN_MAX_PAGE)))
+        if content_type is not None:
+            page = [x for x in page if x.content_type is content_type]
+        if moderation_status is not None:
+            page = [x for x in page if x.moderation_status is moderation_status]
+        return page, next_cursor
+
+    def admin_listing(self, listing_id: str) -> Listing:
+        """운영 상세. 상태와 무관하게 보인다."""
+        return self._store.any_listing(listing_id)
+
+    def admin_takedown(
+        self, actor: User, listing_id: str, *, reason: ModerationReason, note: str = ""
+    ) -> ModerationResult:
+        """상점에서 내린다. **경제 mutation 0.**
+
+        지갑도 원장도 소유권도 `downloadCount`도 건드리지 않는다 — 이 경로에
+        `ShardLedgerService`가 들어오지 않는다. 새 유통을 막는 것이지
+        이미 산 사람의 파일을 부수는 것이 아니다.
+        """
+        result = self._store.takedown(listing_id, actor.id, reason, checked_note(note))
+        logger.info(
+            "marketplace_takedown type=%s reason=%s changed=%s",
+            result.listing.content_type.value, reason.value, result.changed,
+        )
+        return result
+
+    def admin_restore(self, actor: User, listing_id: str) -> ModerationResult:
+        """다시 공개한다. 판매자가 **삭제한** 것은 되살리지 않는다."""
+        result = self._store.restore(listing_id, actor.id)
+        logger.info(
+            "marketplace_restore type=%s changed=%s",
+            result.listing.content_type.value, result.changed,
+        )
+        return result
+
+    def admin_events(self, listing_id: str):
+        return self._store.moderation_events(listing_id)
+
+    def admin_preview(self, listing_id: str):
+        """운영 미리보기. **내려간 상품도 보인다** — 안 보이면 복구할지 판단할 수 없다.
+
+        새 GCS 사본을 만들지 않는다. 공개 미리보기와 **같은 object를 같은 reader로**
+        읽는다 — 저장 비용도 동기화 문제도 늘리지 않는다.
+        """
+        listing = self._store.any_listing(listing_id)
+        snapshot = self._complete_snapshot(listing.snapshot_id)
+        return self._read(preview_key(snapshot.id))
 
     @staticmethod
     def fee(content_type: ContentType) -> int:

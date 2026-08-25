@@ -55,6 +55,48 @@ class ListingStatus(StrEnum):
         return self is ListingStatus.DELETED
 
 
+class ModerationStatus(StrEnum):
+    """운영자가 이 상품을 어떻게 두었는가. **판매자 상태(`ListingStatus`)와 다른 축이다.**
+
+    한 field로 합치지 않은 이유가 분명하다. 합치면 판매자가 스스로 내린 것과
+    운영자가 내린 것을 구분할 수 없고, 판매자가 다시 올리는 것만으로 운영자 조치가
+    풀린다. 그래서 두 값을 따로 둔다 — 운영자 조치는 **판매자가 만질 수 없는 축**에 있다.
+    """
+
+    ACTIVE = "active"
+    #: 운영자가 내렸다. 목록·상세·구매·좋아요에서 빠진다.
+    #: **이미 산 사람은 그대로 쓴다** — 유통을 막는 것이지 파일을 부수는 것이 아니다.
+    REMOVED = "removed"
+
+    @classmethod
+    def of(cls, raw) -> "ModerationStatus":
+        """**옛 문서에는 이 값이 없다.** 없으면 `active`다 — migration하지 않는다.
+
+        모르는 값이 오면 `removed`로 읽는다. 운영 조치를 알 수 없을 때
+        공개하는 쪽보다 감추는 쪽이 안전하다.
+        """
+        if not raw:
+            return cls.ACTIVE
+        try:
+            return cls(raw)
+        except ValueError:
+            return cls.REMOVED
+
+
+class ModerationReason(StrEnum):
+    """왜 내렸는가. **분류를 늘리지 않는다** — 운영자 한 명이 쓰는 목록이다."""
+
+    INAPPROPRIATE = "inappropriate_content"
+    SPAM = "spam"
+    COPYRIGHT = "copyright"
+    OTHER = "other"
+
+
+class ModerationAction(StrEnum):
+    TAKEDOWN = "takedown"
+    RESTORE = "restore"
+
+
 class MarketplacePublishPolicy:
     """등록 비용. **client 값을 믿지 않는다.**
 
@@ -169,6 +211,12 @@ class Listing:
     updated_at: datetime = field(default_factory=utcnow)
     #: **최초** 게시 시각. republish가 덮어쓰지 않는다(UI의 "업로드 날짜").
     published_at: datetime | None = None
+    #: 운영자 조치. **판매자가 바꿀 수 없다.** 옛 문서에는 없고 없으면 `active`다.
+    moderation_status: ModerationStatus = ModerationStatus.ACTIVE
+    moderation_reason: ModerationReason | None = None
+    moderated_at: datetime | None = None
+    #: 조치한 운영자의 internal id. **판매자에게 내보내지 않는다.**
+    moderated_by: str | None = None
     schema_version: int = SCHEMA_VERSION
 
     @staticmethod
@@ -176,8 +224,12 @@ class Listing:
         return str(uuid.uuid4())
 
     @property
+    def is_moderated(self) -> bool:
+        return self.moderation_status is ModerationStatus.REMOVED
+
+    @property
     def is_visible(self) -> bool:
-        return self.status is ListingStatus.PUBLISHED
+        return self.status is ListingStatus.PUBLISHED and not self.is_moderated
 
 
 class MarketplaceSort(StrEnum):
@@ -348,6 +400,84 @@ class SelfPurchase(MarketplaceError):
 
 class InvalidTransition(MarketplaceError):
     """그 상태에서 할 수 없는 일이다(예: draft를 내리기)."""
+
+
+@dataclass(frozen=True)
+class ModerationEvent:
+    """운영 조치 하나의 기록. **경제 원장과 다른 것이다.**
+
+    조각 원장에 섞지 않는다 — 원장은 조각이 움직인 기록이고 여기에는 조각이
+    움직이지 않는다. 섞으면 잔액 감사에서 조치 기록이 잡음이 된다.
+
+    `actor_user_id`는 **internal id**다. 이름으로 적지 않는다 — 이름은 바뀌고
+    (A1 rename) 계정이 지워지면 사라진다. 기록은 그때도 남아야 한다.
+    """
+
+    id: str
+    listing_id: str
+    content_type: ContentType
+    action: ModerationAction
+    actor_user_id: str
+    reason: ModerationReason | None = None
+    #: 운영자 내부 메모. 판매자에게도 구매자에게도 나가지 않는다.
+    note: str = ""
+    created_at: datetime = field(default_factory=utcnow)
+    schema_version: int = SCHEMA_VERSION
+
+    @staticmethod
+    def new_id() -> str:
+        return str(uuid.uuid4())
+
+
+@dataclass(frozen=True)
+class ModerationResult:
+    """`changed`는 **이번 요청이 상태를 바꿨는가**다.
+
+    이미 내려간 것을 다시 내려도 실패가 아니다 — 그때는 아무것도 쓰지 않고
+    기록도 남기지 않는다. 버튼 연타가 감사 기록을 오염시키면 안 된다.
+    """
+
+    listing: Listing
+    changed: bool
+
+
+class ModeratedListing(MarketplaceError):
+    """운영자가 내린 상품이다. **판매자 쪽 동작으로 풀 수 없다.**"""
+
+
+class NotModerated(MarketplaceError):
+    """내려가 있지 않은 것을 복구할 수 없다."""
+
+
+class TerminalListing(MarketplaceError):
+    """판매자가 삭제한 상품이다. **운영자 복구로 되살리지 않는다** —
+    사용자의 삭제가 운영자 조치보다 우선한다."""
+
+
+MAX_MODERATION_NOTE = 200
+
+
+def moderation_block_id(seller_user_id: str, content_type: str, source_content_id: str) -> str:
+    """재등록 차단 열쇠. `(판매자, 종류, 원본 콘텐츠)` 조합이다.
+
+    같은 거울을 지웠다 다시 올리는 것만으로 조치가 풀리면 조치가 아니다.
+    **같은 원본에서 나온 새 listing까지 막는다.**
+
+    다른 파일로 다시 그려 올리는 것은 여기서 막지 못한다 — 그건 이미지 비교가
+    필요하고 이번 범위가 아니다. 여기서 닫는 것은 **같은 원본 재등록**뿐이다.
+    """
+    canonical = "|".join(
+        f"{len(part.encode())}:{part}"
+        for part in ("marketplace_moderation_block", seller_user_id, content_type, source_content_id)
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def checked_note(raw: str) -> str:
+    note = raw.strip()
+    if len(note) > MAX_MODERATION_NOTE:
+        raise InvalidListing("note")
+    return note
 
 
 def ownership_id(user_id: str, listing_id: str) -> str:

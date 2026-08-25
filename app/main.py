@@ -29,6 +29,7 @@ from app.marketplace.service import MarketplaceService
 from app.iap.service import IAPService
 from app.iap.apple_verifier import build_apple_verifier
 from app.iap.verifier import TransactionVerifier
+from app.api import admin as admin_api
 from app.api import capacity as capacity_api
 from app.api import catalog as catalog_api
 from app.api import ads, ai, app_store, auth, health, iap, marketplace, users
@@ -295,6 +296,8 @@ def create_app(
     app.include_router(catalog_api.router)
     app.include_router(capacity_api.router)
     app.include_router(marketplace.purchases_router)
+    # 운영자 전용. 모든 경로가 `AdminUser`를 지난다.
+    app.include_router(admin_api.router)
 
     logger.info("app created env=%s log_level=%s", settings.app_env, settings.log_level)
     return app

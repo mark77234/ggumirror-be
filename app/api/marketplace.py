@@ -38,6 +38,7 @@ from app.marketplace.assets import (
     AssetTooLarge,
     checked_package,
 )
+from app.marketplace.models import ModeratedListing
 from app.marketplace.models import SnapshotNotFound as SnapshotMissing
 from app.marketplace.service import MarketplaceService
 from app.shards.models import InsufficientShards
@@ -71,6 +72,12 @@ class ListingResponse(BaseModel):
     download_count: int = Field(serialization_alias="downloadCount")
     like_count: int = Field(serialization_alias="likeCount")
     published_at: str | None = Field(serialization_alias="publishedAt")
+    #: 운영자가 내렸는가. **사유는 담지 않는다** — 판매자에게 필요한 것은
+    #: "지금 팔리지 않는다"와 "내가 되돌릴 수 없다"이고, 자세한 분류를 주면
+    #: 그 분류를 두고 다투게 된다. 필요하면 문의로 받는다.
+    moderation_status: str = Field(
+        default="active", serialization_alias="moderationStatus"
+    )
 
 
 class PublicListingResponse(BaseModel):
@@ -160,6 +167,7 @@ def _listing(listing) -> ListingResponse:
         download_count=listing.download_count,
         like_count=listing.like_count,
         published_at=listing.published_at.isoformat() if listing.published_at else None,
+        moderation_status=listing.moderation_status.value,
     )
 
 
@@ -417,6 +425,12 @@ def publish_listing(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "listing not found") from error
     except InsufficientShards as error:
         raise HTTPException(status.HTTP_409_CONFLICT, "not enough shards") from error
+    except ModeratedListing as error:
+        # **조용히 성공시키지 않는다.** 성공했다고 답하면 판매자는 올라간 줄 알고,
+        # 실제로는 목록에 없다 — 그게 더 나쁜 거짓말이다.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "listing was removed by an operator"
+        ) from error
     except InvalidTransition as error:
         raise HTTPException(status.HTTP_409_CONFLICT, "listing cannot be published") from error
     except StoreUnavailable as error:

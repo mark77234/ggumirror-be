@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 USERS = "ggumirror_users"
 IDENTITIES = "ggumirror_auth_identities"
 SESSIONS = "ggumirror_sessions"
+#: 운영자 allowlist. **client가 쓸 수 있는 경로가 없다** — 사람이 직접 만든다.
+ADMIN_USERS = "ggumirror_admin_users"
 
 
 class FirestoreAuthStore:
@@ -106,6 +108,21 @@ class FirestoreAuthStore:
                 else None
             ),
         )
+
+    def is_admin(self, user_id: str) -> bool:
+        """문서 하나 읽기. **cache를 만들지 않는다** — 운영자 요청은 극소량이고,
+        cache가 있으면 권한을 껐을 때 언제 실제로 꺼지는지가 불확실해진다.
+
+        `enabled`가 참일 때만 운영자다. 문서를 지우지 않고 끌 수 있어야
+        기록(누가 언제 운영자였는지)이 남는다.
+        """
+        try:
+            snapshot = self._db.collection(ADMIN_USERS).document(user_id).get()
+        except gcp_exceptions.GoogleAPIError as error:
+            # **읽기 실패를 "운영자 아님"으로 바꾸지 않는다** — 그러면 Firestore가
+            # 흔들릴 때 조용히 권한이 사라진 것처럼 보인다. 503으로 올린다.
+            raise self._unavailable("admin_lookup", error) from error
+        return bool(snapshot.exists and (snapshot.to_dict() or {}).get("enabled") is True)
 
     # MARK: - 프로필 이름
 

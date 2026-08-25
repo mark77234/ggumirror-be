@@ -35,6 +35,19 @@ class AuthStore(Protocol):
 
     def user(self, user_id: str) -> User | None: ...
 
+    def is_admin(self, user_id: str) -> bool:
+        """**운영자 권한의 authority는 이 한 곳이다.**
+
+        `User` 문서에 `isAdmin`을 두지 않는다 — 그러면 프로필을 쓰는 모든 경로가
+        권한을 건드릴 수 있는 자리가 되고, `/users/me` 응답에 실려 나가면 client가
+        자기 권한을 아는 것처럼 보인다. 별도 collection이면 **쓰는 경로가 없다** —
+        운영자 등록은 사람이 Firestore에서 직접 한다.
+
+        이름 · 이메일 · Apple subject로 판단하지 않는다. 그것들은 사용자가 바꿀 수
+        있거나 로그인 때마다 달라진다.
+        """
+
+
     def seed_display_name(self, user_id: str, name: str) -> User:
         """Apple이 준 이름으로 **비어 있을 때만** 채운다.
 
@@ -57,6 +70,8 @@ class InMemoryAuthStore:
         self.users: dict[str, User] = {}
         self.identities: dict[str, str] = {}
         self.sessions: dict[str, Session] = {}
+        #: 운영자 allowlist. test에서 직접 채운다 — API로 쓰는 경로가 없다.
+        self.admins: dict[str, bool] = {}
 
     def seed_display_name(self, user_id: str, name: str) -> User:
         user = self.users[user_id]
@@ -105,3 +120,7 @@ class InMemoryAuthStore:
 
     def user(self, user_id: str) -> User | None:
         return self.users.get(user_id)
+
+    def is_admin(self, user_id: str) -> bool:
+        # 문서가 있어도 `enabled`가 아니면 운영자가 아니다 — 지우지 않고 끌 수 있다.
+        return self.admins.get(user_id, False)

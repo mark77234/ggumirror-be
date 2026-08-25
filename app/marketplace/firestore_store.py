@@ -20,6 +20,15 @@ from app.auth.store import StoreUnavailable
 from app.marketplace.models import (
     InvalidTransition,
     ContentType,
+    ModeratedListing,
+    ModerationAction,
+    ModerationEvent,
+    ModerationReason,
+    ModerationResult,
+    ModerationStatus,
+    NotModerated,
+    TerminalListing,
+    moderation_block_id,
     Like,
     LikeCountInconsistent,
     LikeResult,
@@ -37,7 +46,9 @@ from app.marketplace.models import (
     like_id,
     ownership_id,
 )
-from app.marketplace.store import LIKES, LISTINGS, OWNERSHIP, SNAPSHOTS, _is_public
+from app.marketplace.store import (
+    LIKES, LISTINGS, MODERATION_BLOCKS, MODERATION_EVENTS, OWNERSHIP, SNAPSHOTS, _is_public,
+)
 from app.shards.models import utcnow
 from app.shards.service import ShardLedgerService
 
@@ -188,6 +199,10 @@ class FirestoreMarketplaceStore:
                 raise InvalidTransition(listing.status.value)
 
 
+            if listing.is_moderated:
+                # **운영자가 내린 것을 판매자가 다시 올릴 수 없다.**
+                raise ModeratedListing(listing_id)
+
             if listing.status is ListingStatus.PUBLISHED:
                 # 이미 올라가 있다. **아무것도 쓰지 않는다** — 재시도·연타가 오류가 아니다.
                 wallet = shards.wallet(seller_user_id)
@@ -197,9 +212,20 @@ class FirestoreMarketplaceStore:
                 )
 
             snapshot_ref = self._db.collection(SNAPSHOTS).document(listing.snapshot_id)
-            _owned_snapshot(
+            snapshot = _owned_snapshot(
                 snapshot_ref.get(transaction=transaction), listing.snapshot_id, seller_user_id
             )
+
+            # 조치된 원본을 지우고 새 listing으로 다시 올리는 우회를 막는다.
+            # **읽기 단계에서** 확인한다 — 쓰기가 시작된 뒤에는 읽을 수 없다.
+            if snapshot.source_content_id:
+                block_ref = self._db.collection(MODERATION_BLOCKS).document(
+                    moderation_block_id(
+                        seller_user_id, listing.content_type.value, snapshot.source_content_id
+                    )
+                )
+                if block_ref.get(transaction=transaction).exists:
+                    raise ModeratedListing(listing_id)
 
             balance = shards.wallet(seller_user_id).balance
             charged = False
@@ -230,19 +256,11 @@ class FirestoreMarketplaceStore:
                     "updatedAt": now,
                 },
             )
-            published = Listing(
-                id=listing.id,
-                seller_user_id=listing.seller_user_id,
-                content_type=listing.content_type,
-                title=listing.title,
-                description=listing.description,
-                price_shards=listing.price_shards,
-                snapshot_id=listing.snapshot_id,
+            # field를 하나씩 옮겨 적지 않는다 — 나중에 늘어난 field가 조용히 사라진다.
+            published = replace(
+                listing,
                 status=ListingStatus.PUBLISHED,
                 publish_fee_paid=True,
-                download_count=listing.download_count,
-                like_count=listing.like_count,
-                created_at=listing.created_at,
                 updated_at=now,
                 published_at=listing.published_at or now,
             )
@@ -272,22 +290,7 @@ class FirestoreMarketplaceStore:
             transaction.update(
                 listing_ref, {"status": ListingStatus.UNLISTED.value, "updatedAt": now}
             )
-            return Listing(
-                id=listing.id,
-                seller_user_id=listing.seller_user_id,
-                content_type=listing.content_type,
-                title=listing.title,
-                description=listing.description,
-                price_shards=listing.price_shards,
-                snapshot_id=listing.snapshot_id,
-                status=ListingStatus.UNLISTED,
-                publish_fee_paid=listing.publish_fee_paid,
-                download_count=listing.download_count,
-                like_count=listing.like_count,
-                created_at=listing.created_at,
-                updated_at=now,
-                published_at=listing.published_at,
-            )
+            return replace(listing, status=ListingStatus.UNLISTED, updated_at=now)
 
         try:
             return run(self._db.transaction())
@@ -544,7 +547,211 @@ class FirestoreMarketplaceStore:
             raise ListingNotFound(listing_id)
         return _listing_from(listing_id, found.to_dict() or {})
 
+    # MARK: - 운영 조치 (Phase E)
+
+    def takedown(
+        self, listing_id: str, actor_user_id: str,
+        reason: ModerationReason, note: str,
+    ) -> ModerationResult:
+        """**상태 · 재등록 차단 · 기록이 하나의 commit이다.**
+
+        지갑 · 원장 · 소유권 · counter를 건드리지 않는다 — 이 경로에
+        `ShardLedgerService`가 아예 들어오지 않는다.
+        """
+        listing_ref = self._db.collection(LISTINGS).document(listing_id)
+
+        @firestore.transactional
+        def run(transaction) -> ModerationResult:
+            listing = self._read_for_moderation(listing_ref, transaction, listing_id)
+            if listing.is_moderated:
+                # 이미 내려가 있다. **기록도 남기지 않는다** — 연타가 감사 기록을 채우면
+                # 진짜 조치가 언제였는지 알 수 없게 된다.
+                return ModerationResult(listing=listing, changed=False)
+
+            # 읽기를 전부 먼저. 차단 열쇠를 만들려면 원본 id가 필요하다.
+            source = self._source_content_id(listing, transaction)
+
+            now = utcnow()
+            transaction.update(
+                listing_ref,
+                {
+                    "moderationStatus": ModerationStatus.REMOVED.value,
+                    "moderationReason": reason.value,
+                    "moderatedAt": now,
+                    "moderatedBy": actor_user_id,
+                    "updatedAt": now,
+                },
+            )
+            if source:
+                transaction.set(
+                    self._block_ref(listing, source),
+                    {
+                        "sellerUserId": listing.seller_user_id,
+                        "contentType": listing.content_type.value,
+                        "listingId": listing.id,
+                        "createdAt": now,
+                    },
+                )
+            self._write_event(
+                transaction, listing, ModerationAction.TAKEDOWN, actor_user_id, reason, note, now
+            )
+            return ModerationResult(
+                listing=replace(
+                    listing,
+                    moderation_status=ModerationStatus.REMOVED,
+                    moderation_reason=reason,
+                    moderated_at=now,
+                    moderated_by=actor_user_id,
+                    updated_at=now,
+                ),
+                changed=True,
+            )
+
+        try:
+            return run(self._db.transaction())
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("listing_takedown", error) from error
+
+    def restore(self, listing_id: str, actor_user_id: str) -> ModerationResult:
+        listing_ref = self._db.collection(LISTINGS).document(listing_id)
+
+        @firestore.transactional
+        def run(transaction) -> ModerationResult:
+            listing = self._read_for_moderation(listing_ref, transaction, listing_id)
+            if listing.status.is_terminal:
+                # 판매자가 삭제했다. **운영자 복구가 사용자의 삭제를 뒤집지 않는다.**
+                raise TerminalListing(listing_id)
+            if not listing.is_moderated:
+                raise NotModerated(listing_id)
+
+            source = self._source_content_id(listing, transaction)
+            block_ref = self._block_ref(listing, source) if source else None
+            # **다른 listing이 만든 차단은 풀지 않는다.**
+            owns_block = False
+            if block_ref is not None:
+                block = block_ref.get(transaction=transaction)
+                owns_block = block.exists and (block.to_dict() or {}).get("listingId") == listing.id
+
+            now = utcnow()
+            transaction.update(
+                listing_ref,
+                {
+                    "moderationStatus": ModerationStatus.ACTIVE.value,
+                    "moderationReason": None,
+                    "moderatedAt": now,
+                    "moderatedBy": actor_user_id,
+                    "updatedAt": now,
+                },
+            )
+            if owns_block:
+                transaction.delete(block_ref)
+            self._write_event(
+                transaction, listing, ModerationAction.RESTORE, actor_user_id, None, "", now
+            )
+            return ModerationResult(
+                listing=replace(
+                    listing,
+                    moderation_status=ModerationStatus.ACTIVE,
+                    moderation_reason=None,
+                    moderated_at=now,
+                    moderated_by=actor_user_id,
+                    updated_at=now,
+                ),
+                changed=True,
+            )
+
+        try:
+            return run(self._db.transaction())
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("listing_restore", error) from error
+
+    def list_for_admin(self, cursor: str | None, limit: int) -> tuple[list[Listing], str | None]:
+        """**전체를 한 번에 읽지 않는다.** `createdAt` 내림차순으로 끊어 읽는다.
+
+        `where`를 걸지 않는 이유: 종류·조치 상태 필터를 query에 넣으면 composite
+        index가 필요해지고, 지금 그것을 production에 요구할 이유가 없다(`list_published`와
+        같은 판단이다). 필터는 service가 **읽어 온 page 안에서** 건다 — 그래서 걸러진
+        page는 `limit`보다 적게 나올 수 있고, cursor는 그래도 앞으로 나아간다.
+        """
+        try:
+            query = (
+                self._db.collection(LISTINGS)
+                .order_by("createdAt", direction=firestore.Query.DESCENDING)
+                .order_by("__name__", direction=firestore.Query.DESCENDING)
+            )
+            if cursor:
+                anchor = self._db.collection(LISTINGS).document(cursor).get()
+                if anchor.exists:
+                    query = query.start_after(anchor)
+            found = list(query.limit(limit + 1).stream())
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("listing_admin_list", error) from error
+
+        page = [_listing_from(x.id, x.to_dict() or {}) for x in found[:limit]]
+        # 한 건 더 읽어서 다음이 있는지 본다 — 빈 page를 한 번 더 받지 않는다.
+        return page, (page[-1].id if len(found) > limit else None)
+
+    def moderation_events(self, listing_id: str) -> list[ModerationEvent]:
+        try:
+            found = (
+                self._db.collection(MODERATION_EVENTS)
+                .where(filter=firestore.FieldFilter("listingId", "==", listing_id))
+                .stream()
+            )
+            events = [_event_from(x.id, x.to_dict() or {}) for x in found]
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("moderation_events_read", error) from error
+        return sorted(events, key=lambda x: (x.created_at, x.id))
+
+    def is_source_blocked(
+        self, seller_user_id: str, listing: Listing, source_content_id: str
+    ) -> bool:
+        if not source_content_id:
+            return False
+        key = moderation_block_id(seller_user_id, listing.content_type.value, source_content_id)
+        try:
+            return self._db.collection(MODERATION_BLOCKS).document(key).get().exists
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("moderation_block_read", error) from error
+
     # MARK: - 내부
+
+    def _read_for_moderation(self, listing_ref, transaction, listing_id: str) -> Listing:
+        """**주인을 묻지 않는다** — 운영자는 남의 상품을 다룬다."""
+        found = listing_ref.get(transaction=transaction)
+        if not found.exists:
+            raise ListingNotFound(listing_id)
+        return _listing_from(listing_id, found.to_dict() or {})
+
+    def _source_content_id(self, listing: Listing, transaction) -> str:
+        """옛 snapshot에는 없다. 그때는 빈 문자열이고 **차단을 만들지 않는다** —
+        거짓 열쇠로 엉뚱한 상품을 막는 것보다 낫다."""
+        found = (
+            self._db.collection(SNAPSHOTS).document(listing.snapshot_id).get(transaction=transaction)
+        )
+        return str((found.to_dict() or {}).get("sourceContentId") or "") if found.exists else ""
+
+    def _block_ref(self, listing: Listing, source_content_id: str):
+        return self._db.collection(MODERATION_BLOCKS).document(
+            moderation_block_id(
+                listing.seller_user_id, listing.content_type.value, source_content_id
+            )
+        )
+
+    def _write_event(self, transaction, listing, action, actor_user_id, reason, note, now) -> None:
+        event = ModerationEvent(
+            id=ModerationEvent.new_id(),
+            listing_id=listing.id,
+            content_type=listing.content_type,
+            action=action,
+            actor_user_id=actor_user_id,
+            reason=reason,
+            note=note,
+            created_at=now,
+        )
+        transaction.create(
+            self._db.collection(MODERATION_EVENTS).document(event.id), _event_document(event)
+        )
 
     def _unavailable(self, operation: str, error: Exception) -> StoreUnavailable:
         logger.warning("firestore_failed operation=%s error=%s", operation, type(error).__name__)
@@ -569,6 +776,12 @@ def _document(listing: Listing) -> dict:
         "createdAt": listing.created_at,
         "updatedAt": listing.updated_at,
         "publishedAt": listing.published_at,
+        # 운영 조치. 새 문서에도 `active`를 적어 둔다 — 옛 문서(값 없음)와
+        # 같은 뜻이지만, 있는 쪽이 Firestore console에서 읽기 쉽다.
+        "moderationStatus": listing.moderation_status.value,
+        "moderationReason": listing.moderation_reason.value if listing.moderation_reason else None,
+        "moderatedAt": listing.moderated_at,
+        "moderatedBy": listing.moderated_by,
         "schemaVersion": listing.schema_version,
     }
 
@@ -599,8 +812,23 @@ def _listing_from(listing_id: str, data: dict) -> Listing:
         created_at=data.get("createdAt") or utcnow(),
         updated_at=data.get("updatedAt") or utcnow(),
         published_at=data.get("publishedAt"),
+        # **옛 문서에는 없다.** 없으면 `active`이고 migration하지 않는다(§6).
+        moderation_status=ModerationStatus.of(data.get("moderationStatus")),
+        moderation_reason=_reason(data.get("moderationReason")),
+        moderated_at=data.get("moderatedAt"),
+        moderated_by=data.get("moderatedBy"),
         schema_version=int(data.get("schemaVersion") or 1),
     )
+
+
+def _reason(raw) -> ModerationReason | None:
+    """모르는 사유를 지어내지 않는다 — 읽을 수 없으면 `기타`다."""
+    if not raw:
+        return None
+    try:
+        return ModerationReason(raw)
+    except ValueError:
+        return ModerationReason.OTHER
 
 
 def _owned_snapshot(found, snapshot_id: str, seller_user_id: str) -> Snapshot:
@@ -692,6 +920,35 @@ def _like_from(like_id_value: str, data: dict) -> Like:
         id=like_id_value,
         user_id=str(data.get("userId") or ""),
         listing_id=str(data.get("listingId") or ""),
+        created_at=data.get("createdAt") or utcnow(),
+        schema_version=int(data.get("schemaVersion") or 1),
+    )
+
+
+def _event_document(event: ModerationEvent) -> dict:
+    """**조각 원장과 섞지 않는다.** 여기에는 금액도 잔액도 없다."""
+    return {
+        "listingId": event.listing_id,
+        "contentType": event.content_type.value,
+        "action": event.action.value,
+        # 이름이 아니라 internal id다 — 이름은 바뀌고 계정은 지워진다.
+        "actorUserId": event.actor_user_id,
+        "reason": event.reason.value if event.reason else None,
+        "note": event.note,
+        "createdAt": event.created_at,
+        "schemaVersion": event.schema_version,
+    }
+
+
+def _event_from(event_id: str, data: dict) -> ModerationEvent:
+    return ModerationEvent(
+        id=event_id,
+        listing_id=str(data.get("listingId") or ""),
+        content_type=ContentType(data.get("contentType") or ContentType.MIRROR.value),
+        action=ModerationAction(data.get("action") or ModerationAction.TAKEDOWN.value),
+        actor_user_id=str(data.get("actorUserId") or ""),
+        reason=_reason(data.get("reason")),
+        note=str(data.get("note") or ""),
         created_at=data.get("createdAt") or utcnow(),
         schema_version=int(data.get("schemaVersion") or 1),
     )

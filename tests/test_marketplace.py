@@ -1819,25 +1819,60 @@ class FakeCollection:
     def stream(self):
         return FakeQuery(self._store, None, None).stream()
 
+    def order_by(self, field: str, direction: str = "ASCENDING", **kwargs):
+        return FakeQuery(self._store, None, None).order_by(field, direction)
+
 
 class FakeQuery:
-    """`where(...).stream()`만 있는 최소 query."""
+    """`where(...)` 또는 `order_by(...)` **둘 중 하나만** 있는 최소 query."""
 
     def __init__(self, store: dict, field: str | None, value) -> None:
         self._store = store
         self._field = field
         self._value = value
+        self._order: list[tuple[str, bool]] = []
+        self._after: str | None = None
+        self._limit: int | None = None
 
     def where(self, *, filter):   # noqa: A002
         raise AssertionError("이 fake는 조건 하나만 지원한다 — composite index가 필요해진다")
 
-    def order_by(self, *args, **kwargs):
-        raise AssertionError("query 정렬은 composite index를 요구한다")
+    def order_by(self, field: str, direction: str = "ASCENDING", **kwargs):
+        """정렬은 **필터가 없을 때만** 허용한다.
+
+        `where` + `order_by`는 composite index를 요구하므로 원래대로 막는다.
+        필터 없는 단일 field 정렬은 Firestore가 자동으로 만드는 index로 되므로
+        production에 새 index를 요구하지 않는다 — 운영 목록(`list_for_admin`)이 그 경우다.
+        """
+        assert self._field is None, "where + order_by는 composite index를 요구한다"
+        self._order.append((field, str(direction).upper().startswith("DESC")))
+        return self
+
+    def start_after(self, anchor):
+        self._after = anchor.id
+        return self
+
+    def limit(self, count: int):
+        self._limit = count
+        return self
 
     def stream(self):
-        for doc_id, data in list(self._store.items()):
-            if self._field is not None and data.get(self._field) != self._value:
-                continue
+        rows = [
+            (doc_id, data)
+            for doc_id, data in list(self._store.items())
+            if self._field is None or data.get(self._field) == self._value
+        ]
+        for field, descending in reversed(self._order):
+            rows.sort(
+                key=lambda row: row[0] if field == "__name__" else row[1].get(field),
+                reverse=descending,
+            )
+        if self._after is not None:
+            ids = [x[0] for x in rows]
+            rows = rows[ids.index(self._after) + 1:] if self._after in ids else []
+        if self._limit is not None:
+            rows = rows[: self._limit]
+        for doc_id, data in rows:
             yield FakeSnapshot(doc_id, data)
 
 
@@ -1922,6 +1957,9 @@ class FakeFirestoreTransaction:
 
     def delete(self, reference) -> None:
         self.staged.append(lambda: reference._store.pop(reference.id, None))
+
+    def set(self, reference, document) -> None:
+        self.staged.append(lambda: reference._store.__setitem__(reference.id, dict(document)))
 
 
 @pytest.fixture

@@ -16,6 +16,15 @@ from typing import Protocol
 from app.marketplace.models import (
     InvalidTransition,
     ContentType,
+    ModeratedListing,
+    ModerationAction,
+    ModerationEvent,
+    ModerationReason,
+    ModerationResult,
+    ModerationStatus,
+    NotModerated,
+    TerminalListing,
+    moderation_block_id,
     Like,
     LikeCountInconsistent,
     LikeResult,
@@ -44,6 +53,10 @@ SNAPSHOTS = "ggumirror_marketplace_snapshots"
 OWNERSHIP = "ggumirror_marketplace_ownership"
 #: 좋아요 관계. **관계가 authority**이고 listing의 `likeCount`는 projection이다.
 LIKES = "ggumirror_marketplace_likes"
+#: 운영 조치 기록. **경제 원장과 다른 collection이다** — 조각이 움직이지 않는다.
+MODERATION_EVENTS = "ggumirror_marketplace_moderation_events"
+#: 조치된 원본의 재등록 차단. 문서 자리가 곧 열쇠다.
+MODERATION_BLOCKS = "ggumirror_marketplace_moderation_blocks"
 
 
 def _is_public(listing: Listing) -> bool:
@@ -53,6 +66,11 @@ def _is_public(listing: Listing) -> bool:
     문서는 있을 수 없는 상태(B-7C가 항상 채운다)이므로 **거짓 날짜를 지어내지 않고
     공개에서 제외한다** — 잘못된 기록이 목록에 섞여 정렬을 흔드는 것보다 낫다.
     """
+    if listing.moderation_status is ModerationStatus.REMOVED:
+        # **운영자가 내렸다.** 여기 한 곳에서 막으면 목록 · 상세 · 구매 · 좋아요가
+        # 전부 닫힌다 — 네 경로가 모두 이 함수를 지나기 때문이다. 경로마다 따로
+        # 검사하면 나중에 생기는 경로 하나가 조용히 빠진다.
+        return False
     return listing.status is ListingStatus.PUBLISHED and listing.published_at is not None
 
 
@@ -170,6 +188,33 @@ class MarketplaceStore(Protocol):
         """상태·주인과 무관하게 listing 하나. **템플릿 전달에만** 쓴다 —
         판매자가 내려도 기존 구매자는 받아야 하기 때문이다."""
 
+    # MARK: - 운영 조치 (Phase E)
+
+    def takedown(
+        self, listing_id: str, actor_user_id: str,
+        reason: ModerationReason, note: str,
+    ) -> ModerationResult:
+        """운영자가 내린다. **상태 변경 · 재등록 차단 · 기록이 한 commit이다.**
+
+        경제를 건드리지 않는다 — 지갑 · 원장 · 소유권 · `downloadCount`가 그대로다.
+        이미 내려가 있으면 아무것도 쓰지 않고 `changed=False`다(기록도 안 남긴다).
+        """
+
+    def restore(self, listing_id: str, actor_user_id: str) -> ModerationResult:
+        """운영자가 다시 공개한다. 차단 해제와 기록이 함께 간다.
+
+        판매자가 **삭제한** 상품은 되살리지 않는다 — `TerminalListing`이다.
+        """
+
+    def list_for_admin(self, cursor: str | None, limit: int) -> tuple[list[Listing], str | None]:
+        """운영 목록. **전체를 한 번에 읽지 않는다** — cursor로 끊어 읽는다."""
+
+    def moderation_events(self, listing_id: str) -> list[ModerationEvent]:
+        """그 상품의 조치 기록. 운영자에게만."""
+
+    def is_source_blocked(self, seller_user_id: str, listing: Listing, source_content_id: str) -> bool:
+        """이 원본이 지금 차단돼 있는가."""
+
 
 class InMemoryMarketplaceStore:
     """test / local용. 실제 Firestore transaction의 **의미**를 흉내 낸다.
@@ -183,6 +228,9 @@ class InMemoryMarketplaceStore:
         self.snapshots: dict[str, Snapshot] = {}
         self.ownership_records: dict[str, Ownership] = {}
         self.likes_by_id: dict[str, Like] = {}
+        self.moderation_event_log: list[ModerationEvent] = []
+        #: block id → 그 차단을 만든 listing id. 복구할 때 주인을 확인한다.
+        self.moderation_blocks: dict[str, str] = {}
         self._shard_store = shard_store
         self._lock = threading.RLock()
 
@@ -240,6 +288,11 @@ class InMemoryMarketplaceStore:
                 # **삭제는 끝 상태다.** 사용자가 삭제를 골랐으면 되살아나지 않는다.
                 raise InvalidTransition(listing.status.value)
 
+            if listing.is_moderated:
+                # **운영자가 내린 것을 판매자가 다시 올릴 수 없다.**
+                # 조용히 성공시키면 판매자는 올라간 줄 알고, 실제로는 목록에 없다.
+                raise ModeratedListing(listing_id)
+
             if listing.status is ListingStatus.PUBLISHED:
                 # 이미 올라가 있다. 재시도 · 연타는 오류가 아니다.
                 return PublishResult(
@@ -248,7 +301,13 @@ class InMemoryMarketplaceStore:
                 )
 
             # 내용물이 서버에 있는지 확인한다 — client가 준 문자열만 믿지 않는다.
-            self.snapshot(listing.snapshot_id, seller_user_id)
+            snapshot = self.snapshot(listing.snapshot_id, seller_user_id)
+
+            # 조치된 원본을 지우고 새 listing으로 다시 올리는 우회를 막는다.
+            if snapshot.source_content_id and moderation_block_id(
+                seller_user_id, listing.content_type.value, snapshot.source_content_id
+            ) in self.moderation_blocks:
+                raise ModeratedListing(listing_id)
 
             now = utcnow()
             charged = not listing.publish_fee_paid
@@ -266,19 +325,10 @@ class InMemoryMarketplaceStore:
                     balance = result.wallet.balance
                     charged = result.applied
 
-                published = Listing(
-                    id=listing.id,
-                    seller_user_id=listing.seller_user_id,
-                    content_type=listing.content_type,
-                    title=listing.title,
-                    description=listing.description,
-                    price_shards=listing.price_shards,
-                    snapshot_id=listing.snapshot_id,
+                published = replace(
+                    listing,
                     status=ListingStatus.PUBLISHED,
                     publish_fee_paid=True,
-                    download_count=listing.download_count,
-                    like_count=listing.like_count,
-                    created_at=listing.created_at,
                     updated_at=now,
                     # **최초 게시 시각을 유지한다.** republish가 덮어쓰지 않는다.
                     published_at=listing.published_at or now,
@@ -301,23 +351,8 @@ class InMemoryMarketplaceStore:
             if listing.status is not ListingStatus.PUBLISHED:
                 return listing   # 이미 내려가 있거나 아직 안 올렸다. 조용히 끝낸다.
 
-            unlisted = Listing(
-                id=listing.id,
-                seller_user_id=listing.seller_user_id,
-                content_type=listing.content_type,
-                title=listing.title,
-                description=listing.description,
-                price_shards=listing.price_shards,
-                snapshot_id=listing.snapshot_id,
-                status=ListingStatus.UNLISTED,
-                # 아래 전부 **그대로 둔다** — 내렸다고 낸 돈이 돌아오지 않는다.
-                publish_fee_paid=listing.publish_fee_paid,
-                download_count=listing.download_count,
-                like_count=listing.like_count,
-                created_at=listing.created_at,
-                updated_at=utcnow(),
-                published_at=listing.published_at,
-            )
+            # 나머지는 **그대로 둔다** — 내렸다고 낸 돈도 counter도 돌아오지 않는다.
+            unlisted = replace(listing, status=ListingStatus.UNLISTED, updated_at=utcnow())
             self.listings[listing.id] = unlisted
             return unlisted
 
@@ -402,22 +437,9 @@ class InMemoryMarketplaceStore:
 
     @staticmethod
     def _with_download_count(listing: Listing, count: int) -> Listing:
-        return Listing(
-            id=listing.id,
-            seller_user_id=listing.seller_user_id,
-            content_type=listing.content_type,
-            title=listing.title,
-            description=listing.description,
-            price_shards=listing.price_shards,
-            snapshot_id=listing.snapshot_id,
-            status=listing.status,
-            publish_fee_paid=listing.publish_fee_paid,
-            download_count=count,
-            like_count=listing.like_count,
-            created_at=listing.created_at,
-            updated_at=listing.updated_at,
-            published_at=listing.published_at,
-        )
+        # **field를 하나씩 옮겨 적지 않는다.** 그렇게 쓰면 나중에 늘어난 field가
+        # 조용히 사라진다 — 운영 조치가 구매 한 번으로 풀리는 식이다.
+        return replace(listing, download_count=count)
 
     # MARK: - 좋아요 (한 transaction · 조각 경제 무관)
 
@@ -495,6 +517,113 @@ class InMemoryMarketplaceStore:
             raise ListingNotFound(listing_id)
         return found
 
+    # MARK: - 운영 조치 (Phase E)
+
+    def takedown(
+        self, listing_id: str, actor_user_id: str,
+        reason: ModerationReason, note: str,
+    ) -> ModerationResult:
+        with self._lock:
+            listing = self.any_listing(listing_id)
+            if listing.is_moderated:
+                # 이미 내려가 있다. **기록을 남기지 않는다** — 연타가 감사 기록을 채우면
+                # 진짜 조치가 언제였는지 알 수 없게 된다.
+                return ModerationResult(listing=listing, changed=False)
+
+            now = utcnow()
+            removed = replace(
+                listing,
+                moderation_status=ModerationStatus.REMOVED,
+                moderation_reason=reason,
+                moderated_at=now,
+                moderated_by=actor_user_id,
+                updated_at=now,
+            )
+            self.listings[listing_id] = removed
+            self._block_source(removed)
+            self._record(removed, ModerationAction.TAKEDOWN, actor_user_id, reason, note, now)
+            return ModerationResult(listing=removed, changed=True)
+
+    def restore(self, listing_id: str, actor_user_id: str) -> ModerationResult:
+        with self._lock:
+            listing = self.any_listing(listing_id)
+            if listing.status.is_terminal:
+                # 판매자가 삭제했다. **운영자 복구가 사용자의 삭제를 뒤집지 않는다.**
+                raise TerminalListing(listing_id)
+            if not listing.is_moderated:
+                raise NotModerated(listing_id)
+
+            now = utcnow()
+            restored = replace(
+                listing,
+                moderation_status=ModerationStatus.ACTIVE,
+                moderation_reason=None,
+                moderated_at=now,
+                moderated_by=actor_user_id,
+                updated_at=now,
+            )
+            self.listings[listing_id] = restored
+            self._unblock_source(restored)
+            self._record(restored, ModerationAction.RESTORE, actor_user_id, None, "", now)
+            return ModerationResult(listing=restored, changed=True)
+
+    def list_for_admin(self, cursor: str | None, limit: int) -> tuple[list[Listing], str | None]:
+        with self._lock:
+            ordered = sorted(
+                self.listings.values(), key=lambda x: (x.created_at, x.id), reverse=True
+            )
+        if cursor is not None:
+            ids = [x.id for x in ordered]
+            start = ids.index(cursor) + 1 if cursor in ids else len(ids)
+            ordered = ordered[start:]
+        page = ordered[:limit]
+        # 다음 자리가 남아 있을 때만 cursor를 준다 — 빈 page를 한 번 더 받지 않는다.
+        return page, (page[-1].id if page and len(ordered) > limit else None)
+
+    def moderation_events(self, listing_id: str) -> list[ModerationEvent]:
+        return [x for x in self.moderation_event_log if x.listing_id == listing_id]
+
+    def is_source_blocked(self, seller_user_id: str, listing: Listing, source_content_id: str) -> bool:
+        if not source_content_id:
+            return False
+        key = moderation_block_id(seller_user_id, listing.content_type.value, source_content_id)
+        return key in self.moderation_blocks
+
+    def _block_source(self, listing: Listing) -> None:
+        source = self.snapshots.get(listing.snapshot_id)
+        if source is None or not source.source_content_id:
+            return   # 옛 snapshot이라 원본을 모른다. 거짓 열쇠를 만들지 않는다.
+        key = moderation_block_id(
+            listing.seller_user_id, listing.content_type.value, source.source_content_id
+        )
+        self.moderation_blocks[key] = listing.id
+
+    def _unblock_source(self, listing: Listing) -> None:
+        source = self.snapshots.get(listing.snapshot_id)
+        if source is None or not source.source_content_id:
+            return
+        key = moderation_block_id(
+            listing.seller_user_id, listing.content_type.value, source.source_content_id
+        )
+        # **다른 listing이 만든 차단은 풀지 않는다** — 같은 원본에서 두 번 조치했다면
+        # 하나를 복구했다고 나머지 조치까지 사라지면 안 된다.
+        if self.moderation_blocks.get(key) == listing.id:
+            del self.moderation_blocks[key]
+
+    def _record(self, listing, action, actor_user_id, reason, note, now) -> None:
+        self.moderation_event_log.append(
+            ModerationEvent(
+                id=ModerationEvent.new_id(),
+                listing_id=listing.id,
+                content_type=listing.content_type,
+                action=action,
+                actor_user_id=actor_user_id,
+                reason=reason,
+                note=note,
+                created_at=now,
+            )
+        )
+
 
 def _checked_like_count(listing: Listing) -> int:
     """음수 projection을 **조용히 0으로 만들지 않는다.**"""
@@ -504,19 +633,5 @@ def _checked_like_count(listing: Listing) -> int:
 
 
 def _with_like_count(listing: Listing, count: int) -> Listing:
-    return Listing(
-        id=listing.id,
-        seller_user_id=listing.seller_user_id,
-        content_type=listing.content_type,
-        title=listing.title,
-        description=listing.description,
-        price_shards=listing.price_shards,
-        snapshot_id=listing.snapshot_id,
-        status=listing.status,
-        publish_fee_paid=listing.publish_fee_paid,
-        download_count=listing.download_count,
-        like_count=count,
-        created_at=listing.created_at,
-        updated_at=listing.updated_at,
-        published_at=listing.published_at,
-    )
+    """`_with_download_count`와 같은 이유로 `replace`다."""
+    return replace(listing, like_count=count)
