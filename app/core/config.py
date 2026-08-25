@@ -59,6 +59,8 @@ class Settings:
     # 값은 로그에 남기지 않는다. 이 필드를 print / repr에 싣는 코드를 만들지 않는다.
     ai_image_api_key: str = ""
     ai_image_model: str = ""
+    #: 하루에 provider까지 가는 AI 거울 생성 횟수. **서버가 정한다.**
+    ai_mirror_daily_limit: int = 3
     ai_image_quality: str = "low"
     # 생성 결과를 잠시 두는 꾸미러 전용 private bucket. **DailyOPIc bucket을 쓰지 않는다.**
     #
@@ -157,6 +159,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         admob_reward_item=admob_reward_item,
         ai_image_api_key=ai_image_api_key,
         ai_image_model=ai_image_model,
+        ai_mirror_daily_limit=int(env.get("AI_MIRROR_DAILY_LIMIT") or 3),
         ai_image_quality=ai_image_quality,
         ai_result_bucket=ai_result_bucket,
         marketplace_asset_bucket=marketplace_asset_bucket,

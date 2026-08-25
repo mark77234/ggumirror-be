@@ -252,6 +252,26 @@ def create_app(
             },
         )
 
+    @lru_cache(maxsize=1)
+    def ai_mirrors():
+        from app.ai.mirror import AIMirrorQuota, AIMirrorService
+        from app.ai.firestore_store import AI_MIRROR_QUOTAS
+
+        # **AI 스티커가 쓰는 provider를 그대로 쓴다** — 두 번째 provider 체계를
+        # 만들지 않는다. 다른 것은 비용 보호 방식뿐이다(조각 대신 하루 횟수).
+        return AIMirrorService(
+            image_provider or build_provider(
+                api_key=settings.ai_image_api_key,
+                model=settings.ai_image_model,
+                quality=settings.ai_image_quality,
+            ),
+            AIMirrorQuota(
+                _firestore(), AI_MIRROR_QUOTAS, settings.ai_mirror_daily_limit
+            ) if settings.ai_image_api_key or generation_store is not None else None,
+            settings.ai_image_model,
+        )
+
+    app.state.ai_mirror_service = ai_mirrors
     app.state.account_deletion = account_deleting
     app.state.mirror_capacity_service = mirror_capacity
     app.state.catalog_service = catalog

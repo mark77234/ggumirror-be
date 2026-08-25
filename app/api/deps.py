@@ -126,6 +126,15 @@ def marketplace_service(request: Request) -> MarketplaceService:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
 
 
+def ai_mirror_service(request: Request):
+    """AI 거울 service. store와 같은 이유로 처음 쓰일 때 만든다."""
+    try:
+        return request.app.state.ai_mirror_service()
+    except Exception as error:  # provider / Firestore 준비 실패
+        logger.error("ai_mirror_service_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
 def account_deletion(request: Request):
     """계정 삭제 service. store와 같은 이유로 처음 쓰일 때 만든다."""
     try:

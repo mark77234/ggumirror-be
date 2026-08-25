@@ -28,6 +28,8 @@ from app.shards.models import utcnow
 logger = logging.getLogger(__name__)
 
 GENERATIONS = "ggumirror_ai_generations"
+#: AI 거울 하루 횟수. **원장이 아니다** — 돈이 아니라 비용을 막는 계수기다.
+AI_MIRROR_QUOTAS = "ggumirror_ai_mirror_quotas"
 
 
 class FirestoreGenerationStore:
