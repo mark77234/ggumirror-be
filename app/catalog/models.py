@@ -42,6 +42,48 @@ BASIC_TEMPLATE_IDS = frozenset({
 #: 통계를 셀 수 있는 것 전부. **여기 없는 id는 거절한다.**
 TEMPLATE_IDS = ARTWORK_TEMPLATE_IDS | BASIC_TEMPLATE_IDS
 
+#: 값이 싼 쪽 8종. 예전에 무료였던 손그림 템플릿이다.
+_ENTRY_ARTWORK_IDS = frozenset({
+    "art-pink-ribbon", "art-ink-heart", "art-cream-note", "art-lavender-star",
+    "art-sky-cloud", "art-mint-flower", "art-gray-check", "art-red-point",
+})
+
+#: 조각 가격. **이것이 유일한 authority다** — client가 보낸 가격을 쓰지 않는다.
+#:
+#: 예전 값을 그대로 옮긴 결정적 매핑이다(0 → 1, 4 → 3). 어떤 그림이 더 예뻐
+#: 보이는지로 값을 새로 매기지 않았다 — 그건 사람이 정할 일이고, 정할 때는
+#: 이 표만 고치면 된다.
+#:
+#: **단색 기본 거울 8종은 0이다.** 앱이 기본값으로 쓰는 거울이라 값을 매기면
+#: 처음 켠 사람이 거울을 못 쓴다. `0`은 "값이 정해지지 않음"이 아니라
+#: **무료라는 뜻**이고, 그래서 예전 무료 획득 경로가 이것들에만 열려 있다.
+CATALOG_TEMPLATE_PRICES: dict[str, int] = {
+    **{template_id: 1 for template_id in _ENTRY_ARTWORK_IDS},
+    **{
+        template_id: 3
+        for template_id in ARTWORK_TEMPLATE_IDS - _ENTRY_ARTWORK_IDS
+    },
+    **{template_id: 0 for template_id in BASIC_TEMPLATE_IDS},
+}
+
+#: 값을 매길 수 있는 범위. 표에 이 밖의 값이 들어가면 시작할 때 걸린다.
+MIN_TEMPLATE_PRICE = 0
+MAX_TEMPLATE_PRICE = 3
+
+
+def template_price(template_id: str) -> int:
+    """이 템플릿의 값. **모르는 id는 거절한다** — 임의 문자열에 값을 매기지 않는다."""
+    try:
+        return CATALOG_TEMPLATE_PRICES[template_id]
+    except KeyError as error:
+        raise UnknownTemplate(template_id) from error
+
+
+def is_free(template_id: str) -> bool:
+    """값이 없는 템플릿인가. 예전 무료 획득 경로는 **이것만** 만들 수 있다."""
+    return template_price(template_id) == 0
+
+
 #: 한 번에 맞춰 볼 수 있는 개수. 내장 목록이 32종이라 넉넉하다.
 #: 상한을 두는 이유는 요청 하나가 임의로 커지지 않게 하기 위해서다.
 MAX_BATCH = 64
@@ -49,6 +91,14 @@ MAX_BATCH = 64
 
 class UnknownTemplate(Exception):
     """등록되지 않은 template id. **공개 통계를 임의 문자열로 만들 수 없다.**"""
+
+
+class PurchaseRequired(Exception):
+    """값이 있는 템플릿을 무료 경로로 가지려 했다.
+
+    구버전 client가 예전 무료 획득을 부를 때 난다. **조각을 대신 빼지 않는다** —
+    사용자는 결제 화면을 본 적이 없다. 새 client가 구매 경로로 다시 오게 한다.
+    """
 
 
 def is_known(template_id: str) -> bool:

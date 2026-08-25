@@ -31,7 +31,13 @@ from app.catalog.models import (
 from app.catalog.service import CatalogService
 from app.catalog.store import InMemoryCatalogStore
 
-MINT = "art-mint-flower"
+#: 이 파일의 "평범한 템플릿". **값이 없는 것으로 둔다** — 여기 test들은 세는 규칙과
+#: 멱등을 보는 것이지 결제를 보는 것이 아니다. 유료 템플릿을 무료 경로로 가져갈 수
+#: 없다는 것은 아래 별도 test가 고정한다.
+MINT = "basic-mint"
+SECOND = "basic-sky"
+#: 값이 있는 템플릿.
+PAID = "art-mint-flower"
 ALICE = "11111111-2222-4333-8444-555555555555"
 BOB = "99999999-8888-4777-8666-555555555555"
 
@@ -136,11 +142,11 @@ def test_second_user_counts(service):
 def test_users_are_counted_independently(service, store):
     service.acquire(user(ALICE), MINT)
     service.acquire(user(BOB), MINT)
-    service.acquire(user(ALICE), "art-pink-ribbon")
+    service.acquire(user(ALICE), SECOND)
 
     assert store.counts[MINT] == 2
-    assert store.counts["art-pink-ribbon"] == 1
-    assert store.acquired_template_ids(ALICE) == {MINT, "art-pink-ribbon"}
+    assert store.counts[SECOND] == 1
+    assert store.acquired_template_ids(ALICE) == {MINT, SECOND}
     assert store.acquired_template_ids(BOB) == {MINT}
 
 
@@ -197,10 +203,10 @@ def test_concurrent_different_users_all_count(service, store):
 
 def test_stats_are_zero_when_nothing_recorded(service):
     """없는 것과 0은 사용자에게 같은 뜻이다. 목록에서 빼면 화면이 자리를 비운다."""
-    found = service.stats([MINT, "art-pink-ribbon"])
+    found = service.stats([MINT, SECOND])
 
     assert {x.template_id: x.download_count for x in found} == {
-        MINT: 0, "art-pink-ribbon": 0
+        MINT: 0, SECOND: 0
     }
 
 
@@ -266,20 +272,20 @@ def test_reconcile_records_a_previous_download(service, store):
 
 
 def test_reconcile_records_several(service, store):
-    results = service.reconcile(user(ALICE), [MINT, "art-pink-ribbon", "basic-mint"])
+    results = service.reconcile(user(ALICE), [MINT, SECOND, "basic-mint"])
 
     assert all(x.first_acquisition for x in results)
-    assert store.counts == {MINT: 1, "art-pink-ribbon": 1, "basic-mint": 1}
+    assert store.counts == {MINT: 1, SECOND: 1, "basic-mint": 1}
 
 
 def test_reconcile_twice_adds_nothing(service, store):
     """**멱등** — 두 번째 호출로 수가 오르면 안 된다."""
-    service.reconcile(user(ALICE), [MINT, "art-pink-ribbon"])
+    service.reconcile(user(ALICE), [MINT, SECOND])
 
-    again = service.reconcile(user(ALICE), [MINT, "art-pink-ribbon"])
+    again = service.reconcile(user(ALICE), [MINT, SECOND])
 
     assert all(not x.first_acquisition for x in again)
-    assert store.counts == {MINT: 1, "art-pink-ribbon": 1}
+    assert store.counts == {MINT: 1, SECOND: 1}
 
 
 def test_reconcile_ten_times_stays_the_same(service, store):
@@ -362,13 +368,12 @@ def test_stats_endpoint_is_public(client):
 
 def test_stats_endpoint_batches(client):
     response = client.get(
-        f"/catalog/templates/stats?ids={MINT},art-pink-ribbon,basic-mint"
+        f"/catalog/templates/stats?ids={MINT},{SECOND},{PAID}"
     )
 
     assert response.status_code == 200
-    assert [x["templateId"] for x in response.json()] == [
-        MINT, "art-pink-ribbon", "basic-mint"
-    ]
+    # 통계는 값과 무관하다 — 유료 템플릿도 공개 통계에는 그대로 나온다.
+    assert [x["templateId"] for x in response.json()] == [MINT, SECOND, PAID]
 
 
 def test_stats_endpoint_with_no_ids(client):

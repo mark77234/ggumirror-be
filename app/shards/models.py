@@ -64,6 +64,9 @@ class ShardReason(StrEnum):
     # 거울 보관 공간 확장. 상점 구매와 **다른 사건**이라 이유를 나눈다 —
     # 원장만 보고 무엇에 썼는지 알 수 있어야 한다.
     MIRROR_CAPACITY_PURCHASE = "mirror_capacity_purchase"
+    #: 내장 템플릿 구매. **판매자가 없다** — 파는 사람 없이 사라지는 값이라
+    #: Marketplace의 `mirror_purchase`/`mirror_sale` 짝과 섞지 않는다.
+    CATALOG_TEMPLATE_PURCHASE = "catalog_template_purchase"
     ADMIN_ADJUSTMENT = "admin_adjustment"
 
 

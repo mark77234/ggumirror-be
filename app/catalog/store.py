@@ -14,6 +14,7 @@ from threading import RLock
 from typing import Protocol
 
 from app.auth.store import StoreUnavailable
+from app.shards.models import ShardReason
 from app.catalog.models import (
     AcquisitionResult,
     TemplateAcquisition,
@@ -28,6 +29,16 @@ STATS = "ggumirror_catalog_stats"
 
 
 class CatalogStore(Protocol):
+    def purchase(
+        self, shards, user_id: str, template_id: str, price: int
+    ) -> "AcquisitionResult":
+        """조각을 내고 내장 템플릿을 갖는다. **하나의 transaction이다.**
+
+        멱등의 열쇠는 **`(사용자, 템플릿)` 기록 자체**다 — 그것이 있으면 값을 내지
+        않는다. 별도 operation id를 두지 않는 이유가 그것이다: 다른 id로 다시
+        보내도 같은 기록을 겨루므로 두 번 빠질 수 없다.
+        """
+
     def acquire(self, user_id: str, template_id: str) -> AcquisitionResult:
         """**최초 획득만 센다.** 이미 있으면 `first_acquisition=False`이고 수는 그대로다.
 
@@ -69,6 +80,29 @@ class InMemoryCatalogStore:
                 download_count=self.counts[template_id],
             )
 
+    def purchase(self, shards, user_id: str, template_id: str, price: int) -> AcquisitionResult:
+        with self._lock:
+            key = acquisition_id(user_id, template_id)
+            if key in self.acquisitions:
+                # 이미 가지고 있다. **값을 내지 않는다.**
+                return AcquisitionResult(
+                    template_id=template_id, first_acquisition=False,
+                    download_count=self.counts.get(template_id, 0),
+                )
+            if price > 0:
+                shards.debit(
+                    user_id, price, ShardReason.CATALOG_TEMPLATE_PURCHASE,
+                    external_event_id=key,
+                )
+            self.acquisitions[key] = TemplateAcquisition(
+                user_id=user_id, template_id=template_id
+            )
+            self.counts[template_id] = self.counts.get(template_id, 0) + 1
+            return AcquisitionResult(
+                template_id=template_id, first_acquisition=True,
+                download_count=self.counts[template_id],
+            )
+
     def stats(self, template_ids: list[str]) -> list[TemplateStat]:
         with self._lock:
             return [
@@ -88,6 +122,70 @@ class FirestoreCatalogStore:
 
     def __init__(self, db) -> None:
         self._db = db
+
+    def purchase(self, shards, user_id: str, template_id: str, price: int) -> AcquisitionResult:
+        """조각을 내고 갖는다. **읽기를 전부 먼저 한다** — Firestore transaction은
+        쓰기 뒤에 읽을 수 없다(유료 Marketplace 구매에서 실제로 터졌던 자리다).
+
+        멱등의 열쇠는 `(사용자, 템플릿)` 기록이다. 이미 있으면 값을 내지 않고,
+        원장 열쇠도 같은 값이라 다른 요청 id로 다시 보내도 두 번 빠지지 않는다.
+        """
+        from google.api_core import exceptions as gcp_exceptions
+        from google.cloud import firestore
+
+        key = acquisition_id(user_id, template_id)
+        record_ref = self._db.collection(ACQUISITIONS).document(key)
+        stat_ref = self._db.collection(STATS).document(template_id)
+
+        @firestore.transactional
+        def run(transaction) -> AcquisitionResult:
+            scoped = shards.context(transaction)
+
+            # **읽기 먼저.**
+            existing = record_ref.get(transaction=transaction)
+            stat = stat_ref.get(transaction=transaction)
+            count = int((stat.to_dict() or {}).get("downloadCount") or 0) if stat.exists else 0
+
+            if existing.exists:
+                # 이미 가지고 있다. **조각을 빼지 않는다** — 값이 오른 뒤에도 그대로다.
+                return AcquisitionResult(
+                    template_id=template_id, first_acquisition=False, download_count=count
+                )
+
+            if price > 0:
+                # 잔액이 모자라면 여기서 끝나고 **기록도 수도 남지 않는다.**
+                shards.apply_in_transaction(
+                    scoped, user_id, -price,
+                    ShardReason.CATALOG_TEMPLATE_PURCHASE, key,
+                )
+
+            # 읽기가 끝났다. 조각 쓰기를 먼저 내려보낸다.
+            scoped.flush()
+
+            record = TemplateAcquisition(user_id=user_id, template_id=template_id)
+            # `create`라 동시에 두 번 사도 하나만 남는다 — 마지막 방어선.
+            transaction.create(
+                record_ref,
+                {
+                    "userId": record.user_id,
+                    "templateId": record.template_id,
+                    "createdAt": record.created_at,
+                    "pricePaid": price,
+                },
+            )
+            if stat.exists:
+                transaction.update(stat_ref, {"downloadCount": count + 1})
+            else:
+                transaction.set(stat_ref, {"downloadCount": count + 1})
+            return AcquisitionResult(
+                template_id=template_id, first_acquisition=True, download_count=count + 1
+            )
+
+        try:
+            return run(self._db.transaction())
+        except gcp_exceptions.GoogleAPIError as error:
+            logger.error("catalog_purchase_unavailable error=%s", type(error).__name__)
+            raise StoreUnavailable("catalog purchase failed") from error
 
     def acquire(self, user_id: str, template_id: str) -> AcquisitionResult:
         from google.api_core import exceptions as gcp_exceptions

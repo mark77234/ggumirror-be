@@ -19,6 +19,7 @@ from app.api.deps import catalog_service, current_user
 from app.auth.models import User
 from app.auth.store import StoreUnavailable
 from app.catalog.models import UnknownTemplate
+from app.shards.models import InsufficientShards
 from app.catalog.service import CatalogService
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,36 @@ def acquire_template(
         result = service.acquire(user, template_id)
     except UnknownTemplate as error:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "template not found") from error
+    except StoreUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+    return AcquisitionResponse(
+        template_id=result.template_id,
+        first_acquisition=result.first_acquisition,
+        download_count=result.download_count,
+    )
+
+
+@router.post("/templates/{template_id}/purchases", response_model_by_alias=True)
+def purchase_template(
+    template_id: str,
+    user: Annotated[User, Depends(current_user)],
+    service: Annotated[CatalogService, Depends(catalog_service)],
+) -> AcquisitionResponse:
+    """조각을 내고 내장 템플릿을 갖는다.
+
+    **body가 없다.** 가격도 수량도 사용자도 client가 정하는 자리를 만들지 않는다 —
+    값은 서버 표가, 사람은 token이 정한다.
+
+    이미 가진 것은 값을 내지 않고 그대로 돌려준다(`firstAcquisition=false`).
+    같은 요청을 여러 번 보내도 조각은 한 번만 빠진다 —
+    멱등의 열쇠가 `(사용자, 템플릿)` 기록 자체이기 때문이다.
+    """
+    try:
+        result = service.purchase(user, template_id)
+    except UnknownTemplate as error:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "template not found") from error
+    except InsufficientShards as error:
+        raise HTTPException(status.HTTP_409_CONFLICT, "not enough shards") from error
     except StoreUnavailable as error:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
     return AcquisitionResponse(

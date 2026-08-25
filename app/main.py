@@ -206,7 +206,9 @@ def create_app(
         from app.catalog.store import FirestoreCatalogStore
 
         # 조각 원장과 **같은 Firestore client**를 쓴다.
-        return CatalogService(catalog_store or FirestoreCatalogStore(_firestore()))
+        return CatalogService(
+            catalog_store or FirestoreCatalogStore(_firestore()), shards()
+        )
 
     @lru_cache(maxsize=1)
     def mirror_capacity():

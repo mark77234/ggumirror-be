@@ -16,8 +16,11 @@ from app.catalog.models import (
     TEMPLATE_IDS,
     AcquisitionResult,
     TemplateStat,
+    PurchaseRequired,
     UnknownTemplate,
+    is_free,
     is_known,
+    template_price,
 )
 from app.catalog.store import CatalogStore
 
@@ -25,8 +28,11 @@ logger = logging.getLogger(__name__)
 
 
 class CatalogService:
-    def __init__(self, store: CatalogStore) -> None:
+    def __init__(self, store: CatalogStore, shards=None) -> None:
         self._store = store
+        # 조각 원장. **새 지갑 체계를 만들지 않는다** — 이미 있는 것을 그대로 쓴다.
+        # 값이 없는 템플릿만 다루는 곳에서는 없어도 된다.
+        self._shards = shards
 
     def acquire(self, user: User, template_id: str) -> AcquisitionResult:
         """이 사용자가 이 템플릿을 받았다고 기록한다.
@@ -36,6 +42,14 @@ class CatalogService:
         """
         if not is_known(template_id):
             raise UnknownTemplate(template_id)
+        # **값이 있는 템플릿을 여기서 공짜로 만들 수 없다.**
+        #
+        # 이 경로는 값이 없던 시절의 것이다. 그대로 두면 구버전 앱으로
+        # 유료 템플릿을 전부 무료로 받을 수 있다. 이미 가진 것은 그대로
+        # 돌려주되(구버전 client가 깨지지 않는다), 없는 것을 새로 만들지는 않는다.
+        if not is_free(template_id):
+            if template_id not in self._store.acquired_template_ids(user.id):
+                raise PurchaseRequired(template_id)
         result = self._store.acquire(user.id, template_id)
         logger.info(
             "catalog_acquire template=%s first=%s count=%d",
@@ -62,6 +76,22 @@ class CatalogService:
             return []
         return self._store.stats(wanted)
 
+    def purchase(self, user: User, template_id: str) -> AcquisitionResult:
+        """조각을 내고 내장 템플릿을 갖는다.
+
+        **값은 서버 표가 정한다** — client가 보낸 가격을 받지 않는다.
+        이미 가진 것은 값을 내지 않는다(값이 오른 뒤에도 그대로다).
+        """
+        if not is_known(template_id):
+            raise UnknownTemplate(template_id)
+        price = template_price(template_id)
+        result = self._store.purchase(self._shards, user.id, template_id, price)
+        logger.info(
+            "catalog_purchase template=%s price=%d first=%s count=%d",
+            template_id, price, result.first_acquisition, result.download_count,
+        )
+        return result
+
     def reconcile(self, user: User, template_ids: list[str]) -> list[AcquisitionResult]:
         """앱에 이미 있는 내장 템플릿을 **한 번씩** 기록으로 남긴다.
 
@@ -81,7 +111,15 @@ class CatalogService:
             if len(wanted) >= MAX_BATCH:
                 break
 
-        results = [self._store.acquire(user.id, x) for x in wanted]
+        # **맞춰 보기는 이미 있는 것을 확인하는 일이다.** 없는 것을 만들어 주지 않는다 —
+        # 만들 수 있게 두면 client가 id 32개를 보내 유료 템플릿을 전부 가져간다.
+        # 값이 없는 템플릿만 예전처럼 만들 수 있다.
+        owned = self._store.acquired_template_ids(user.id)
+        results = [
+            self._store.acquire(user.id, x)
+            for x in wanted
+            if is_free(x) or x in owned
+        ]
         added = sum(1 for x in results if x.first_acquisition)
         logger.info("catalog_reconcile requested=%d new=%d", len(wanted), added)
         return results
