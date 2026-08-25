@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 from app.api.deps import catalog_service, current_user
 from app.auth.models import User
 from app.auth.store import StoreUnavailable
-from app.catalog.models import UnknownTemplate
+from app.catalog.models import PurchaseRequired, UnknownTemplate
 from app.shards.models import InsufficientShards
 from app.catalog.service import CatalogService
 
@@ -100,6 +100,16 @@ def acquire_template(
         result = service.acquire(user, template_id)
     except UnknownTemplate as error:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "template not found") from error
+    except PurchaseRequired as error:
+        # **값이 생긴 템플릿을 이 경로로 받으려 한 것이다.**
+        #
+        # 이 경로는 모든 손그림이 공짜였던 1.0.7의 것이다. Phase B로 값이 붙은
+        # 뒤에도 구버전 앱은 계속 여기를 부른다 — 예상된 일이고 오류가 아니다.
+        # 잡지 않으면 500이 나가고, 정상적인 구버전 사용 하나하나가 서버 장애처럼
+        # 기록돼 진짜 장애가 묻힌다.
+        raise HTTPException(
+            status.HTTP_402_PAYMENT_REQUIRED, "template requires purchase"
+        ) from error
     except StoreUnavailable as error:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
     return AcquisitionResponse(

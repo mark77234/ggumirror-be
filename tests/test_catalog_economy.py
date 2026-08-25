@@ -307,3 +307,62 @@ def test_owned_list_reflects_purchases(service, shards):
 
 def test_owned_endpoint_requires_authentication(client):
     assert client.get("/catalog/templates/mine").status_code == 401
+
+
+# MARK: - 1.0.7 → 1.1.0 전환 (release-critical)
+
+
+def _authenticated(catalog_store):
+    """1.0.7 앱이 쓰던 그대로의 요청을 보낼 수 있는 client."""
+    from datetime import UTC, datetime, timedelta
+
+    from fastapi.testclient import TestClient
+
+    from app.auth.models import Session, User as AuthUser, sha256_hex
+    from app.auth.store import InMemoryAuthStore
+    from app.core.config import Settings
+    from app.main import create_app
+
+    auth = InMemoryAuthStore()
+    who = AuthUser(id=ALICE, created_at=datetime.now(UTC))
+    auth.users[who.id] = who
+    token = "legacy-client-token"
+    auth.sessions[sha256_hex(token)] = Session(
+        token_hash=sha256_hex(token),
+        user_id=who.id,
+        created_at=datetime.now(UTC),
+        expires_at=datetime.now(UTC) + timedelta(days=1),
+    )
+    app = create_app(
+        Settings(app_env="local"), auth_store=auth, catalog_store=catalog_store
+    )
+    return TestClient(app, raise_server_exceptions=False), {
+        "Authorization": f"Bearer {token}"
+    }
+
+
+def test_legacy_acquire_of_a_paid_template_is_not_a_server_error(store):
+    """**구버전 앱의 정상 동작이 500으로 기록되면 안 된다.**
+
+    1.0.7은 손그림이 전부 공짜였을 때 만들어졌고, 지금도 이 경로를 부른다.
+    값이 붙은 템플릿에서 여기가 터지면 정상적인 구버전 사용 하나하나가
+    서버 장애처럼 쌓여 **진짜 장애가 묻힌다.**
+    """
+    client, headers = _authenticated(store)
+
+    response = client.post(f"/catalog/templates/{PRICEY}/acquire", headers=headers)
+
+    assert response.status_code == 402
+    assert response.status_code < 500
+    # 공짜로 주지도 않는다.
+    assert store.acquisitions == {}
+
+
+def test_legacy_acquire_of_a_free_template_still_works(store):
+    """무료 템플릿은 예전 그대로다 — 전환이 구버전을 깨뜨리지 않는다."""
+    client, headers = _authenticated(store)
+
+    response = client.post(f"/catalog/templates/{FREE}/acquire", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["firstAcquisition"] is True
