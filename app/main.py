@@ -218,6 +218,39 @@ def create_app(
             capacity_store or FirestoreCapacityStore(_firestore()), shards()
         )
 
+    @lru_cache(maxsize=1)
+    def account_deleting():
+        from app.auth.deletion import AccountDeletionService
+        from app.marketplace.store import LIKES, LISTINGS
+        from app.auth.firestore_store import IDENTITIES, SESSIONS, USERS
+        from app.shards.firestore_store import LEDGER, QUOTAS, WALLETS
+        from app.marketplace.store import OWNERSHIP
+        from app.iap.store import REFUNDS, TRANSACTIONS
+        from app.capacity.store import OPERATIONS
+        from app.catalog.store import ACQUISITIONS
+
+        # 지울 것과 남길 것을 **한 곳에** 적는다. 흩어 두면 새 collection이 생겼을 때
+        # 조용히 빠진다 — 개인 데이터가 남는 쪽이 최악이다.
+        return AccountDeletionService(
+            _firestore(),
+            {
+                "users": USERS,
+                "identities": IDENTITIES,
+                "sessions": SESSIONS,
+                "wallets": WALLETS,
+                "ledger": LEDGER,
+                "quotas": QUOTAS,
+                "ownership": OWNERSHIP,
+                "likes": LIKES,
+                "listings": LISTINGS,
+                "iap_transactions": TRANSACTIONS,
+                "iap_refunds": REFUNDS,
+                "capacity_operations": OPERATIONS,
+                "acquisitions": ACQUISITIONS,
+            },
+        )
+
+    app.state.account_deletion = account_deleting
     app.state.mirror_capacity_service = mirror_capacity
     app.state.catalog_service = catalog
     app.state.apple_verifier = verifier

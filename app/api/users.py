@@ -15,11 +15,18 @@ client가 정할 수 있는 값이 하나도 없다.
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
 from app.ads.service import RewardedAdService
-from app.api.deps import CurrentUser, rewarded_ad_service, shard_service, store as auth_store_dep
+from app.api.deps import (
+    CurrentUser,
+    account_deletion,
+    rewarded_ad_service,
+    shard_service,
+    store as auth_store_dep,
+)
+from app.auth.deletion import AccountDeleting
 from app.auth.models import issue_session_token, utcnow
 from app.auth.profile import (
     DisplayNameCooldown,
@@ -140,6 +147,32 @@ def me(user: CurrentUser) -> dict[str, object]:
             else None
         ),
     }
+
+
+@router.delete("/me/account", status_code=status.HTTP_204_NO_CONTENT)
+def delete_account(
+    user: CurrentUser,
+    deletion: Annotated[AccountDeleting, Depends(account_deletion)],
+) -> Response:
+    """**본인 계정을 지운다.** 되돌릴 수 없다.
+
+    다른 user id를 받아 지우는 자리를 만들지 않는다 — 지울 수 있는 것은
+    지금 인증된 사람 자신뿐이다.
+
+    여러 번 불러도 안전하다(멱등). 중간에 실패하면 그대로 다시 부르면 된다.
+
+    **Apple 연결 해제는 여기서 하지 않는다.** 그러려면 Apple에 보낼 client secret
+    (`.p8`)과 authorization code가 필요한데 지금 우리는 둘 다 갖고 있지 않다.
+    없다고 계정 삭제를 막지는 않는다 — 삭제는 끝내고, 사용자에게 설정에서 직접
+    연결을 해제하는 방법을 안내한다.
+    """
+    try:
+        deletion.delete(user.id)
+    except StoreUnavailable as error:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "잠시 뒤 다시 시도해 주세요."
+        ) from error
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.patch("/me/profile", response_model=ProfilePayload, response_model_by_alias=True)

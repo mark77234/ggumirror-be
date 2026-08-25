@@ -126,6 +126,15 @@ def marketplace_service(request: Request) -> MarketplaceService:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
 
 
+def account_deletion(request: Request):
+    """계정 삭제 service. store와 같은 이유로 처음 쓰일 때 만든다."""
+    try:
+        return request.app.state.account_deletion()
+    except Exception as error:  # Firestore client 생성 실패
+        logger.error("account_deletion_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
 def bearer_token(request: Request) -> str:
     """`Authorization: Bearer <token>`. **header를 로그에 남기지 않는다.**"""
     header = request.headers.get("Authorization", "")
