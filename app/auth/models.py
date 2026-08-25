@@ -57,6 +57,12 @@ class User:
     id: str = field(default_factory=lambda: str(uuid4()))
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)
+    #: 사람에게 보이는 이름. **없는 것이 정상이다** — 1.0.7 사용자에게는 이 값이 없고,
+    #: 화면은 그때 "이름을 정해주세요"를 보여 준다. 여기에 기본 이름을 지어 넣지 않는다.
+    display_name: str | None = None
+    #: 마지막으로 **사용자가 직접** 바꾼 시각. Apple이 넣어 준 최초 값은 여기 남기지
+    #: 않는다 — 그래야 첫 로그인 직후에도 한 번은 바로 고칠 수 있다(30일 규칙 밖).
+    display_name_changed_at: datetime | None = None
 
 
 @dataclass(frozen=True)

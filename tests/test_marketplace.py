@@ -763,6 +763,7 @@ def test_public_response_never_leaks_internal_values(client, store):
     assert set(body) == {
         "id", "contentType", "title", "description",
         "priceShards", "downloadCount", "likeCount", "publishedAt",
+        "sellerDisplayName",
     }
     assert body["publishedAt"].startswith("2026-08-01")
 
@@ -773,6 +774,8 @@ def test_public_list_items_have_the_same_shape(client, store):
     assert set(item) == {
         "id", "contentType", "title", "description",
         "priceShards", "downloadCount", "likeCount", "publishedAt",
+        # 1.1.0: 판매자를 **이름으로만** 보여 준다. 내부 id는 여전히 나가지 않는다.
+        "sellerDisplayName",
     }
 
 
@@ -3319,6 +3322,7 @@ def test_public_listing_contract_is_unchanged(client, store):
     assert set(PublicListingResponse.model_fields) == {
         "id", "content_type", "title", "description",
         "price_shards", "download_count", "like_count", "published_at",
+        "seller_display_name",
     }
 
     published(store, "live")

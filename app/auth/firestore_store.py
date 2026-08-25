@@ -16,6 +16,7 @@ from uuid import uuid4
 from google.api_core import exceptions as gcp_exceptions
 from google.cloud import firestore
 
+from app.auth.profile import DisplayNameCooldown, can_change, next_change_at
 from app.auth.models import Session, User, identity_key, utcnow
 from app.auth.store import StoreUnavailable
 
@@ -96,7 +97,76 @@ class FirestoreAuthStore:
             id=user_id,
             created_at=_as_datetime(data.get("createdAt")),
             updated_at=_as_datetime(data.get("updatedAt")),
+            # 예전 문서에는 이 두 값이 없다. **migration을 돌리지 않는다** —
+            # 없으면 없는 것으로 읽고, 사용자가 이름을 정할 때 비로소 생긴다.
+            display_name=data.get("displayName"),
+            display_name_changed_at=(
+                _as_datetime(data["displayNameChangedAt"])
+                if data.get("displayNameChangedAt") is not None
+                else None
+            ),
         )
+
+    # MARK: - 프로필 이름
+
+    def seed_display_name(self, user_id: str, name: str) -> User:
+        """**비어 있을 때만** 채운다. 이미 있으면 그대로 둔다.
+
+        transaction 안에서 읽고 쓴다 — 동시에 두 번 로그인해도 한쪽만 쓴다.
+        `displayNameChangedAt`은 **남기지 않는다**: Apple이 넣어 준 값은 사용자가
+        고른 것이 아니므로 30일 규칙을 소비하면 안 된다.
+        """
+        user_ref = self._db.collection(USERS).document(user_id)
+
+        @firestore.transactional
+        def run(transaction: firestore.Transaction) -> User:
+            snapshot = user_ref.get(transaction=transaction)
+            if not snapshot.exists:
+                raise StoreUnavailable("user document missing")
+            data = snapshot.to_dict() or {}
+            if data.get("displayName"):
+                return _user_with_profile(user_id, data)
+            transaction.update(user_ref, {"displayName": name, "updatedAt": utcnow()})
+            return _user_with_profile(user_id, {**data, "displayName": name})
+
+        try:
+            return run(self._db.transaction())
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("display_name_seed", error) from error
+
+    def set_display_name(self, user_id: str, name: str, now: datetime) -> User:
+        """사용자가 직접 바꾼다. **읽기·검사·쓰기가 한 transaction이다.**
+
+        나누면 동시에 들어온 두 요청이 둘 다 "아직 30일 안 지났나? 아니네" 하고
+        지나가 이름이 연속으로 바뀐다.
+        """
+        user_ref = self._db.collection(USERS).document(user_id)
+
+        @firestore.transactional
+        def run(transaction: firestore.Transaction) -> User:
+            snapshot = user_ref.get(transaction=transaction)
+            if not snapshot.exists:
+                raise StoreUnavailable("user document missing")
+            data = snapshot.to_dict() or {}
+            changed_at = (
+                _as_datetime(data["displayNameChangedAt"])
+                if data.get("displayNameChangedAt") is not None
+                else None
+            )
+            if not can_change(changed_at, now):
+                raise DisplayNameCooldown(next_change_at(changed_at))
+            transaction.update(
+                user_ref,
+                {"displayName": name, "displayNameChangedAt": now, "updatedAt": now},
+            )
+            return _user_with_profile(
+                user_id, {**data, "displayName": name, "displayNameChangedAt": now}
+            )
+
+        try:
+            return run(self._db.transaction())
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("display_name_set", error) from error
 
     # MARK: - session
 
@@ -155,3 +225,18 @@ def _as_datetime(value: object) -> datetime:
 
 def _as_optional_datetime(value: object) -> datetime | None:
     return value if isinstance(value, datetime) else None
+
+
+def _user_with_profile(user_id: str, data: dict) -> User:
+    """문서 하나를 User로. **없는 값은 없는 것으로 읽는다** — 기본 이름을 지어내지 않는다."""
+    return User(
+        id=user_id,
+        created_at=_as_datetime(data.get("createdAt")),
+        updated_at=_as_datetime(data.get("updatedAt")),
+        display_name=data.get("displayName"),
+        display_name_changed_at=(
+            _as_datetime(data["displayNameChangedAt"])
+            if data.get("displayNameChangedAt") is not None
+            else None
+        ),
+    )

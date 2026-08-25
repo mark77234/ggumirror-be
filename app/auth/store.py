@@ -6,10 +6,12 @@ repository interface 계층을 더 쌓지 않고, 구현은 Firestore 하나 + t
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from typing import Protocol
 
 from app.auth.models import Session, User, identity_key, utcnow
+from app.auth.profile import DisplayNameCooldown, can_change, next_change_at
 
 
 class StoreUnavailable(Exception):
@@ -33,6 +35,20 @@ class AuthStore(Protocol):
 
     def user(self, user_id: str) -> User | None: ...
 
+    def seed_display_name(self, user_id: str, name: str) -> User:
+        """Apple이 준 이름으로 **비어 있을 때만** 채운다.
+
+        이미 이름이 있으면 아무것도 하지 않는다 — 로그인할 때마다 사용자가 정한
+        이름이 Apple 이름으로 되돌아가면 안 된다. 30일 규칙도 소비하지 않는다.
+        """
+
+    def set_display_name(self, user_id: str, name: str, now: datetime) -> User:
+        """사용자가 직접 바꾼다. **30일 규칙을 여기서 강제한다.**
+
+        읽고-검사하고-쓰는 일이 한 transaction 안에 있어야 한다. 나누면 동시에 들어온
+        두 요청이 둘 다 통과해 연속으로 이름을 바꿀 수 있다.
+        """
+
 
 class InMemoryAuthStore:
     """test / local용. Firestore에 붙지 않는다."""
@@ -41,6 +57,21 @@ class InMemoryAuthStore:
         self.users: dict[str, User] = {}
         self.identities: dict[str, str] = {}
         self.sessions: dict[str, Session] = {}
+
+    def seed_display_name(self, user_id: str, name: str) -> User:
+        user = self.users[user_id]
+        if user.display_name is None:
+            user = replace(user, display_name=name)
+            self.users[user_id] = user
+        return user
+
+    def set_display_name(self, user_id: str, name: str, now: datetime) -> User:
+        user = self.users[user_id]
+        if not can_change(user.display_name_changed_at, now):
+            raise DisplayNameCooldown(next_change_at(user.display_name_changed_at))
+        user = replace(user, display_name=name, display_name_changed_at=now)
+        self.users[user_id] = user
+        return user
 
     def user_for_identity(self, provider: str, subject: str) -> tuple[User, bool]:
         key = identity_key(provider, subject)

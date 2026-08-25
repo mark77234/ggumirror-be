@@ -175,7 +175,15 @@ def test_valid_bearer_resolves_user(client, apple_key):
     body = sign_in(client, apple_key).json()
     response = client.get("/users/me", headers=bearer(body["accessToken"]))
     assert response.status_code == 200
-    assert response.json() == {"id": body["user"]["id"]}
+    payload = response.json()
+    assert payload["id"] == body["user"]["id"]
+    # 프로필 필드가 **더해졌다**(1.1.0). 1.0.7 client는 `id`만 읽고 나머지를 버린다.
+    assert payload["displayName"] is None
+    assert payload["canChangeDisplayName"] is True
+    assert payload["nextDisplayNameChangeAt"] is None
+    # 여전히 새어 나가면 안 되는 것들. 이 test의 원래 목적이다.
+    assert set(payload) == {"id", "displayName", "canChangeDisplayName", "nextDisplayNameChangeAt"}
+    assert "email" not in payload and "sub" not in payload
 
 
 def test_missing_bearer_rejected(client):

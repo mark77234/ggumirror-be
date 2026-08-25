@@ -14,9 +14,9 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from pydantic import BaseModel, Field
 
-from app.api.deps import current_user, marketplace_service
+from app.api.deps import current_user, marketplace_service, store as auth_store_dep
 from app.auth.models import User
-from app.auth.store import StoreUnavailable
+from app.auth.store import AuthStore, StoreUnavailable
 from app.marketplace.models import (
     ContentType,
     InvalidListing,
@@ -80,8 +80,9 @@ class PublicListingResponse(BaseModel):
     `snapshotId` · `publishFeePaid` · `schemaVersion` · `createdAt` · `updatedAt`은
     사는 사람이 알 필요가 없다. 필드를 늘리려면 **왜 공개해야 하는지**부터 답한다.
 
-    판매자 표시 이름도 없다 — seller profile이 없으므로 "익명" 같은 가짜 이름을
-    지어내지 않는다(그런 값이 생기면 그때 공개 seller model과 함께 추가한다).
+    **판매자는 이름으로만 나간다**(1.1.0). `sellerUserId`는 여전히 나가지 않는다 —
+    누가 올렸는지 보여 주는 데 내부 id가 필요하지 않다. 이름을 정하지 않은
+    판매자는 `null`이고, "익명" 같은 가짜 이름을 지어내지 않는다.
     """
 
     id: str
@@ -93,6 +94,11 @@ class PublicListingResponse(BaseModel):
     like_count: int = Field(serialization_alias="likeCount")
     #: 최초 게시 시각. client의 "업로드 날짜"와 같은 값이다.
     published_at: str = Field(serialization_alias="publishedAt")
+    #: 판매자가 정한 이름. **없을 수 있다** — 아직 이름을 정하지 않은 판매자와
+    #: 1.0.7 시절에 올라온 상품이 그렇다. 그때는 화면이 알아서 처리한다.
+    seller_display_name: str | None = Field(
+        default=None, serialization_alias="sellerDisplayName"
+    )
 
 
 class PublishResponse(BaseModel):
@@ -106,8 +112,31 @@ class PublishResponse(BaseModel):
     listing: ListingResponse
 
 
-def _public(listing) -> PublicListingResponse:
+def _seller_names(user_ids: set[str], auth_store: AuthStore) -> dict[str, str]:
+    """user id → 이름. **이름을 정한 판매자만** 담는다.
+
+    listing 문서에 이름을 복사해 두지 않는 이유: 복사하면 이름을 바꿀 때마다 그
+    사람의 모든 상품을 다시 써야 하고, 그 사이 화면에는 옛 이름이 남는다. 예전에
+    올라온 상품에는 값 자체가 없어 backfill도 필요해진다. 지금 규모(고유 판매자
+    한 자릿수)에서는 문서를 몇 개 더 읽는 쪽이 훨씬 싸고 단순하며, 이름이 언제나
+    최신이고 legacy 상품도 그냥 동작한다.
+
+    읽기가 실패해도 목록을 깨뜨리지 않는다 — 이름이 없는 것으로 둔다.
+    """
+    names: dict[str, str] = {}
+    for user_id in user_ids:
+        try:
+            user = auth_store.user(user_id)
+        except StoreUnavailable:
+            continue
+        if user is not None and user.display_name:
+            names[user_id] = user.display_name
+    return names
+
+
+def _public(listing, seller_name: str | None = None) -> PublicListingResponse:
     return PublicListingResponse(
+        seller_display_name=seller_name,
         id=listing.id,
         content_type=listing.content_type.value,
         title=listing.title,
@@ -305,6 +334,7 @@ def listing_template_asset(
 @router.get("/listings")
 def browse_listings(
     service: Annotated[MarketplaceService, Depends(marketplace_service)],
+    auth_store: Annotated[AuthStore, Depends(auth_store_dep)],
     contentType: ContentType | None = None,
     sort: MarketplaceSort = MarketplaceSort.LATEST,
 ) -> list[PublicListingResponse]:
@@ -319,13 +349,17 @@ def browse_listings(
         listings = service.browse(content_type=contentType, sort=sort)
     except StoreUnavailable as error:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
-    return [_public(x) for x in listings]
+    # **판매자 이름은 한 번에 모아 읽는다.** 상품마다 조회하면 목록 하나에 N번
+    # 읽게 되고, 같은 판매자의 상품이 여러 개일 때 같은 문서를 반복해서 읽는다.
+    names = _seller_names({x.seller_user_id for x in listings}, auth_store)
+    return [_public(x, names.get(x.seller_user_id)) for x in listings]
 
 
 @router.get("/listings/{listing_id}")
 def listing_detail(
     listing_id: str,
     service: Annotated[MarketplaceService, Depends(marketplace_service)],
+    auth_store: Annotated[AuthStore, Depends(auth_store_dep)],
 ) -> PublicListingResponse:
     """공개 상세. **draft · unlisted · 없는 것 모두 404**다.
 
@@ -333,7 +367,9 @@ def listing_detail(
     판매자 관리를 한 endpoint에 섞지 않는다.
     """
     try:
-        return _public(service.listing(listing_id))
+        listing = service.listing(listing_id)
+        names = _seller_names({listing.seller_user_id}, auth_store)
+        return _public(listing, names.get(listing.seller_user_id))
     except ListingNotFound as error:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "listing not found") from error
     except StoreUnavailable as error:
