@@ -30,6 +30,7 @@ from app.iap.service import IAPService
 from app.iap.apple_verifier import build_apple_verifier
 from app.iap.verifier import TransactionVerifier
 from app.api import admin as admin_api
+from app.api import notifications as notifications_api
 from app.api import capacity as capacity_api
 from app.api import catalog as catalog_api
 from app.api import ads, ai, app_store, auth, health, iap, marketplace, users
@@ -56,6 +57,8 @@ def create_app(
     marketplace_assets=None,
     catalog_store=None,
     capacity_store=None,
+    push_store=None,
+    notification_store=None,
 ) -> FastAPI:
     """store를 주면 그것을 쓴다 — test는 in-memory fake와 test key를 넣는다."""
     settings = settings or load_settings()
@@ -222,6 +225,44 @@ def create_app(
         )
 
     @lru_cache(maxsize=1)
+    @lru_cache(maxsize=1)
+    def push_provider():
+        """자격 증명이 다 있으면 진짜 APNs, 아니면 아무것도 보내지 않는 것.
+
+        **여기서 예외를 던지지 않는다** — 알림이 안 가는 것과 앱이 안 뜨는 것은
+        전혀 다른 사고다.
+        """
+        from app.push.provider import build_push_provider
+
+        return build_push_provider(
+            key_id=settings.apns_key_id,
+            team_id=settings.apns_team_id,
+            private_key=settings.apns_private_key,
+            bundle_id=settings.apns_bundle_id,
+        )
+
+    @lru_cache(maxsize=1)
+    def pushes():
+        from app.push.service import PushService
+
+        store = push_store
+        if store is None:
+            from app.push.firestore_store import FirestorePushStore
+
+            store = FirestorePushStore(_firestore())
+        return PushService(store, push_provider())
+
+    @lru_cache(maxsize=1)
+    def notifications_center():
+        from app.notifications.service import NotificationService
+
+        store = notification_store
+        if store is None:
+            from app.notifications.firestore_store import FirestoreNotificationStore
+
+            store = FirestoreNotificationStore(_firestore())
+        return NotificationService(store, marketplace_listings())
+
     def account_deleting():
         from app.auth.deletion import AccountDeletionService
         from app.marketplace.store import LIKES, LISTINGS
@@ -231,6 +272,8 @@ def create_app(
         from app.iap.store import REFUNDS, TRANSACTIONS
         from app.capacity.store import OPERATIONS
         from app.catalog.store import ACQUISITIONS
+        from app.notifications.store import NOTIFICATIONS
+        from app.push.store import PUSH_DEVICES
 
         # 지울 것과 남길 것을 **한 곳에** 적는다. 흩어 두면 새 collection이 생겼을 때
         # 조용히 빠진다 — 개인 데이터가 남는 쪽이 최악이다.
@@ -250,6 +293,12 @@ def create_app(
                 "iap_refunds": REFUNDS,
                 "capacity_operations": OPERATIONS,
                 "acquisitions": ACQUISITIONS,
+                # **push token은 개인 데이터다 — 지운다.** 남겨 두면 계정이 없는
+                # 사람의 기기로 알림을 보낼 수 있는 열쇠가 그대로 남는다.
+                "push_devices": PUSH_DEVICES,
+                # 판매 알림 기록도 그 사람의 것이다. 구매자의 소유권·원장과 다르다 —
+                # 저쪽은 남기고 이쪽은 지운다.
+                "notifications": NOTIFICATIONS,
             },
         )
 
@@ -284,6 +333,8 @@ def create_app(
     app.state.iap_service = shard_iap
     app.state.app_store_notifications = notifications
     app.state.marketplace_service = marketplace_listings
+    app.state.push_service = pushes
+    app.state.notification_service = notifications_center
 
     app.include_router(health.router)
     app.include_router(auth.router)
@@ -298,6 +349,7 @@ def create_app(
     app.include_router(marketplace.purchases_router)
     # 운영자 전용. 모든 경로가 `AdminUser`를 지난다.
     app.include_router(admin_api.router)
+    app.include_router(notifications_api.router)
 
     logger.info("app created env=%s log_level=%s", settings.app_env, settings.log_level)
     return app

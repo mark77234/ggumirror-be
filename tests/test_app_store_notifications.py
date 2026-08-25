@@ -304,8 +304,13 @@ def test_no_app_store_server_api_client():
     root = Path(__file__).resolve().parent.parent
     for path in ["app/iap/notifications.py", "app/api/app_store.py", "app/core/config.py"]:
         code = _code_only((root / path).read_text())
-        for banned in ["AppStoreServerAPIClient", "issuer_id", "key_id", "send_consumption"]:
+        for banned in ["AppStoreServerAPIClient", "issuer_id", "send_consumption"]:
             assert banned not in code, f"{path}: {banned}"
+
+    # `key_id`는 App Store 알림 경로에서만 막는다 — config에는 Phase F의 APNs
+    # key id가 있고 그것은 다른 자격 증명이다(`test_iap_verification`과 같은 판단).
+    for path in ["app/iap/notifications.py", "app/api/app_store.py"]:
+        assert "key_id" not in _code_only((root / path).read_text()), f"{path}: key_id"
 
 
 def test_official_library_is_used_for_notifications():

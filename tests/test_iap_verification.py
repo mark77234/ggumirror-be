@@ -382,8 +382,18 @@ def test_app_store_server_api_credentials_are_not_required():
     root = Path(__file__).resolve().parent.parent
     for path in ["app/iap/apple_verifier.py", "app/core/config.py", "app/main.py"]:
         code = _code_only((root / path).read_text())
-        for banned in ["issuer_id", "issuerId", "key_id", "private_key_p8", "AppStoreServerAPIClient"]:
+        for banned in ["issuer_id", "issuerId", "private_key_p8", "AppStoreServerAPIClient"]:
             assert banned not in code, f"{path}: 불필요한 Apple secret/API client를 들였다 ({banned})"
+
+    # `key_id`는 **검증기 안에서만** 금지한다. Phase F가 APNs key id를 들여왔는데
+    # 그것은 전혀 다른 Apple 자격 증명이다 — 이름이 닮았다고 같이 막으면, 이 test는
+    # 원래 잡으려던 것(App Store Server API 도입) 대신 무관한 기능을 막게 된다.
+    # JWS 검증 경로에 key id가 나타나는 것은 여전히 드리프트다.
+    assert "key_id" not in _code_only((root / "app/iap/apple_verifier.py").read_text())
+    # config에서도 App Store 쪽 이름은 계속 막는다.
+    config = _code_only((root / "app/core/config.py").read_text())
+    for banned in ["app_store_key_id", "iap_key_id", "app_store_private_key"]:
+        assert banned not in config, f"config: {banned}"
 
 
 # MARK: - 로그

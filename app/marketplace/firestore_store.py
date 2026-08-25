@@ -47,8 +47,11 @@ from app.marketplace.models import (
     ownership_id,
 )
 from app.marketplace.store import (
-    LIKES, LISTINGS, MODERATION_BLOCKS, MODERATION_EVENTS, OWNERSHIP, SNAPSHOTS, _is_public,
+    LIKES, LISTINGS, MODERATION_BLOCKS, MODERATION_EVENTS, OWNERSHIP, SNAPSHOTS,
+    _is_public, _sale_event,
 )
+from app.notifications.firestore_store import _document as _notification_document
+from app.notifications.store import NOTIFICATIONS
 from app.shards.models import utcnow
 from app.shards.service import ShardLedgerService
 
@@ -383,9 +386,19 @@ class FirestoreMarketplaceStore:
             count = listing.download_count + 1
             transaction.update(listing_ref, {"downloadCount": count})
 
+            # **판매 알림도 같은 commit이다.** 밖에서 쓰면 "돈은 오갔는데 판매자는
+            # 모르는" 상태가 생기고, 나중에 그것을 메울 방법이 없다.
+            # 문서 자리가 소유권 열쇠에서 나오므로 재시도가 알림을 두 번 만들지 않는다.
+            sale = _sale_event(listing, key, price)
+            transaction.create(
+                self._db.collection(NOTIFICATIONS).document(sale.id),
+                _notification_document(sale),
+            )
+
             return PurchaseResult(
                 ownership=ownership, purchased=True, already_owned=False,
                 price_paid=price, balance=balance, download_count=count,
+                sale_event=sale,
             )
 
         try:

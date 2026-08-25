@@ -338,6 +338,12 @@ class PurchaseResult:
     price_paid: int
     balance: int
     download_count: int
+    #: 판매자에게 남긴 판매 알림. **소유권과 같은 commit에서 만들어졌다.**
+    #:
+    #: 이미 갖고 있던 경우에는 `None`이다 — 아무것도 새로 팔리지 않았다.
+    #: 부르는 쪽은 commit이 끝난 **뒤에** 이것으로 push를 보낸다.
+    #: push는 transaction 밖이고, 실패해도 이 기록은 남는다.
+    sale_event: "object | None" = None
 
 
 @dataclass(frozen=True)

@@ -61,6 +61,16 @@ class Settings:
     ai_image_model: str = ""
     #: 하루에 provider까지 가는 AI 거울 생성 횟수. **서버가 정한다.**
     ai_mirror_daily_limit: int = 3
+
+    # MARK: - 판매 알림 (Phase F)
+    #
+    # **넷이 모두 있어야 보낸다.** 하나라도 없으면 아무것도 보내지 않는다 —
+    # 반쯤 설정된 상태로 시도하다 실패하는 것보다 안 보내는 것이 낫다.
+    # private key는 **Secret Manager에서만** 온다. repo에도 client에도 없다.
+    apns_key_id: str = ""
+    apns_team_id: str = ""
+    apns_private_key: str = ""
+    apns_bundle_id: str = ""
     ai_image_quality: str = "low"
     # 생성 결과를 잠시 두는 꾸미러 전용 private bucket. **DailyOPIc bucket을 쓰지 않는다.**
     #
@@ -165,6 +175,14 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         marketplace_asset_bucket=marketplace_asset_bucket,
         iap_allowed_environments=iap_allowed_environments,
         iap_app_apple_id=iap_app_apple_id,
+        # **값을 여기서 검사하지 않는다.** 없으면 없는 대로 두고 provider가
+        # `is_available=False`가 된다 — 알림 자격 증명이 없다고 앱이 뜨지 않으면
+        # 상점도 로그인도 함께 죽는다.
+        apns_key_id=(env.get("APNS_KEY_ID") or "").strip(),
+        apns_team_id=(env.get("APNS_TEAM_ID") or "").strip(),
+        # 줄바꿈이 들어간 PEM이다. Secret Manager가 원문 그대로 준다.
+        apns_private_key=env.get("APNS_PRIVATE_KEY") or "",
+        apns_bundle_id=(env.get("APNS_BUNDLE_ID") or "").strip(),
     )
 
 

@@ -14,7 +14,8 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from pydantic import BaseModel, Field
 
-from app.api.deps import current_user, marketplace_service, store as auth_store_dep
+from app.api.deps import current_user, marketplace_service, push_service, store as auth_store_dep
+from app.push.service import PushService
 from app.auth.models import User
 from app.auth.store import AuthStore, StoreUnavailable
 from app.marketplace.models import (
@@ -480,10 +481,14 @@ def purchase_listing(
     listing_id: str,
     user: Annotated[User, Depends(current_user)],
     service: Annotated[MarketplaceService, Depends(marketplace_service)],
+    pushes: Annotated[PushService, Depends(push_service)],
 ) -> PurchaseResponse:
     """**body가 없다.** 가격 · 판매자 · 수량을 client가 정하는 자리를 만들지 않는다.
 
-    구매자 차감 · 판매자 지급 · 소유권 · 다운로드 수가 **한 commit**이다.
+    구매자 차감 · 판매자 지급 · 소유권 · 다운로드 수 · **판매 알림 기록**이
+    한 commit이다. push는 그 commit이 끝난 **뒤에** 최선을 다해 보낸다 —
+    APNs를 transaction 안에서 부르면 network 지연이 잠금을 붙들고, 실패가
+    구매를 되돌린다.
     """
     try:
         result = service.purchase(user, listing_id)
@@ -495,6 +500,15 @@ def purchase_listing(
         raise HTTPException(status.HTTP_409_CONFLICT, "not enough shards") from error
     except StoreUnavailable as error:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+
+    # **commit 뒤다. 여기서 무엇이 실패해도 구매는 이미 끝났다.**
+    # 이미 갖고 있던 경우에는 `sale_event`가 없다 — 새로 팔린 것이 없으므로
+    # 알림도 없다(연타가 판매자에게 같은 알림을 여러 번 보내지 않는다).
+    if result.sale_event is not None:
+        try:
+            pushes.notify_sale(result.sale_event)
+        except Exception:   # noqa: BLE001 — 전송 실패가 구매 응답을 실패로 만들지 않는다
+            logger.warning("sale_push_failed")
 
     return PurchaseResponse(
         purchased=result.purchased,

@@ -135,6 +135,29 @@ def ai_mirror_service(request: Request):
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
 
 
+def notification_service(request: Request):
+    """알림센터 service. store와 같은 이유로 처음 쓰일 때 만든다."""
+    try:
+        return request.app.state.notification_service()
+    except Exception as error:  # Firestore client 생성 실패
+        logger.error("notification_service_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
+def push_service(request: Request):
+    """Push service.
+
+    APNs 자격 증명이 없는 것은 **여기서 실패하지 않는다** — service는 만들어지고
+    `is_available`이 False가 될 뿐이다(AI provider와 같은 규칙). 알림이 안 갈 뿐
+    기기 등록과 판매는 그대로 동작해야 한다.
+    """
+    try:
+        return request.app.state.push_service()
+    except Exception as error:  # Firestore client 생성 실패
+        logger.error("push_service_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
 def account_deletion(request: Request):
     """계정 삭제 service. store와 같은 이유로 처음 쓰일 때 만든다."""
     try:

@@ -44,6 +44,7 @@ from app.marketplace.models import (
 )
 from dataclasses import replace
 
+from app.notifications.models import NotificationEvent, NotificationType, sale_event_id
 from app.shards.models import utcnow
 from app.shards.service import ShardLedgerService
 
@@ -223,7 +224,7 @@ class InMemoryMarketplaceStore:
     둘 다 반영되지 않는다.
     """
 
-    def __init__(self, shard_store) -> None:
+    def __init__(self, shard_store, notifications=None) -> None:
         self.listings: dict[str, Listing] = {}
         self.snapshots: dict[str, Snapshot] = {}
         self.ownership_records: dict[str, Ownership] = {}
@@ -232,6 +233,8 @@ class InMemoryMarketplaceStore:
         #: block id → 그 차단을 만든 listing id. 복구할 때 주인을 확인한다.
         self.moderation_blocks: dict[str, str] = {}
         self._shard_store = shard_store
+        # 판매 알림을 **구매와 같은 lock 안에서** 쓴다(Firestore transaction과 같은 뜻).
+        self._notifications = notifications
         self._lock = threading.RLock()
 
     # MARK: - 읽기
@@ -408,6 +411,15 @@ class InMemoryMarketplaceStore:
                     seller_ledger_entry_id=seller_entry,
                 )
                 counted = self._with_download_count(listing, listing.download_count + 1)
+                # **판매 알림도 같은 commit이다.** 밖에서 쓰면 "돈은 오갔는데
+                # 판매자는 모르는" 상태가 생기고, 그것을 나중에 메울 방법이 없다.
+                sale = _sale_event(listing, key, price)
+
+                def write_notification():
+                    if self._notifications is None:
+                        return lambda: None
+                    self._notifications.create(sale)
+                    return lambda: None
 
                 def write_ownership():
                     if key in self.ownership_records:
@@ -423,11 +435,13 @@ class InMemoryMarketplaceStore:
 
                 tx.add(write_ownership)
                 tx.add(write_counter)
+                tx.add(write_notification)
 
             return PurchaseResult(
                 ownership=ownership, purchased=True, already_owned=False,
                 price_paid=price, balance=balance,
                 download_count=counted.download_count,
+                sale_event=sale,
             )
 
     def ownerships(self, user_id: str) -> list[Ownership]:
@@ -623,6 +637,23 @@ class InMemoryMarketplaceStore:
                 created_at=now,
             )
         )
+
+
+def _sale_event(listing: Listing, ownership_key: str, price: int) -> NotificationEvent:
+    """판매 알림 하나. **문서 자리가 소유권에서 나오므로 두 번 생기지 않는다.**
+
+    제목은 **팔린 그때의 값**을 복사한다 — 나중에 판매자가 제목을 바꿔도 기록은
+    그때 팔린 것을 가리켜야 한다. 구매자는 담지 않는다.
+    """
+    return NotificationEvent(
+        id=sale_event_id(ownership_key),
+        user_id=listing.seller_user_id,
+        type=NotificationType.MARKETPLACE_SALE,
+        listing_id=listing.id,
+        content_type=listing.content_type.value,
+        title_snapshot=listing.title,
+        shard_amount=price,
+    )
 
 
 def _checked_like_count(listing: Listing) -> int:

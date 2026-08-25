@@ -183,7 +183,11 @@ class AccountDeletionService:
 
         # userId 필드로 찾는 문서.
         for name in ("sessions", "ledger", "ownership", "quotas", "acquisitions",
-                     "reward_contexts", "ai_generations"):
+                     "reward_contexts", "ai_generations",
+                     # Phase F. push token은 개인 데이터이고, 판매 알림 기록도
+                     # 그 사람의 것이다. **구매자의 소유권·원장은 여기 없다** —
+                     # 저쪽은 다른 사람의 권리라 남는다.
+                     "push_devices", "notifications"):
             collection = self._c.get(name)
             if collection is None:
                 continue
