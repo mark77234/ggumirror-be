@@ -29,6 +29,9 @@ class PushStore(Protocol):
     def disable(self, device_id: str) -> None:
         """APNs가 **끝났다**고 한 token을 끈다. 일시적 실패에는 부르지 않는다."""
 
+    def registered_user_ids(self) -> list[str]:
+        """기기를 등록한 사람 전부. 정기 발송의 후보를 여기서 얻는다."""
+
 
 class InMemoryPushStore:
     def __init__(self) -> None:
@@ -62,6 +65,9 @@ class InMemoryPushStore:
             (x for x in self.devices_by_id.values() if x.user_id == user_id and x.enabled),
             key=lambda x: x.id,
         )
+
+    def registered_user_ids(self) -> list[str]:
+        return sorted({x.user_id for x in self.devices_by_id.values() if x.enabled})
 
     def disable(self, device_id: str) -> None:
         with self._lock:

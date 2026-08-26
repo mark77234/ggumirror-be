@@ -82,6 +82,22 @@ class FirestorePushStore:
         # 꺼진 기기는 여기서 뺀다 — query에 조건을 하나 더 걸면 composite index가 필요해진다.
         return sorted((x for x in devices if x.enabled), key=lambda x: x.id)
 
+    def registered_user_ids(self) -> list[str]:
+        """기기를 등록한 사람 전부.
+
+        지금 규모에서는 collection 하나를 훑는 것이 가장 단순하다. 커지면
+        그때 별도 색인이나 page 단위 job을 검토한다.
+        """
+        try:
+            found = self._db.collection(PUSH_DEVICES).stream()
+            return sorted({
+                str((x.to_dict() or {}).get("userId") or "")
+                for x in found
+                if (x.to_dict() or {}).get("enabled", True)
+            } - {""})
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("push_registered_users", error) from error
+
     def disable(self, device_id: str) -> None:
         try:
             self._db.collection(PUSH_DEVICES).document(device_id).update(

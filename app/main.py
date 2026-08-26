@@ -30,6 +30,7 @@ from app.iap.service import IAPService
 from app.iap.apple_verifier import build_apple_verifier
 from app.iap.verifier import TransactionVerifier
 from app.api import admin as admin_api
+from app.api import jobs as jobs_api
 from app.api import notifications as notifications_api
 from app.api import capacity as capacity_api
 from app.api import catalog as catalog_api
@@ -59,6 +60,8 @@ def create_app(
     capacity_store=None,
     push_store=None,
     notification_store=None,
+    preference_store=None,
+    delivery_store=None,
 ) -> FastAPI:
     """store를 주면 그것을 쓴다 — test는 in-memory fake와 test key를 넣는다."""
     settings = settings or load_settings()
@@ -242,6 +245,25 @@ def create_app(
         )
 
     @lru_cache(maxsize=1)
+    def preferences():
+        from app.notifications.preferences import NotificationPreferenceService
+
+        store = preference_store
+        if store is None:
+            from app.notifications.preference_store import FirestorePreferenceStore
+
+            store = FirestorePreferenceStore(_firestore())
+        return NotificationPreferenceService(store)
+
+    @lru_cache(maxsize=1)
+    def deliveries():
+        if delivery_store is not None:
+            return delivery_store
+        from app.notifications.preference_store import FirestoreDeliveryStore
+
+        return FirestoreDeliveryStore(_firestore())
+
+    @lru_cache(maxsize=1)
     def pushes():
         from app.push.service import PushService
 
@@ -250,7 +272,22 @@ def create_app(
             from app.push.firestore_store import FirestorePushStore
 
             store = FirestorePushStore(_firestore())
-        return PushService(store, push_provider())
+        # **설정을 아는 push service다.** 판매 알림을 끈 사람에게는 보내지 않는다.
+        return PushService(store, push_provider(), preferences=preferences())
+
+    @lru_cache(maxsize=1)
+    def mirror_digests():
+        from app.notifications.digest import MirrorDigestService
+
+        store = notification_store
+        if store is None:
+            from app.notifications.firestore_store import FirestoreNotificationStore
+
+            store = FirestoreNotificationStore(_firestore())
+        # **공개 판정을 다시 만들지 않는다** — marketplace service가 그대로 authority다.
+        return MirrorDigestService(
+            marketplace_listings(), store, deliveries(), preferences(), pushes()
+        )
 
     @lru_cache(maxsize=1)
     def notifications_center():
@@ -272,6 +309,8 @@ def create_app(
         from app.iap.store import REFUNDS, TRANSACTIONS
         from app.capacity.store import OPERATIONS
         from app.catalog.store import ACQUISITIONS
+        from app.notifications.delivery import DIGEST_DELIVERIES
+        from app.notifications.preferences import NOTIFICATION_PREFERENCES
         from app.notifications.store import NOTIFICATIONS
         from app.push.store import PUSH_DEVICES
 
@@ -299,6 +338,10 @@ def create_app(
                 # 판매 알림 기록도 그 사람의 것이다. 구매자의 소유권·원장과 다르다 —
                 # 저쪽은 남기고 이쪽은 지운다.
                 "notifications": NOTIFICATIONS,
+                # 설정과 발송 기록도 그 사람의 것이다. 남겨 두면 탈퇴한 사람이
+                # 정기 발송 대상으로 남는다.
+                "notification_preferences": NOTIFICATION_PREFERENCES,
+                "notification_deliveries": DIGEST_DELIVERIES,
             },
         )
 
@@ -337,6 +380,8 @@ def create_app(
     app.state.marketplace_service = marketplace_listings
     app.state.push_service = pushes
     app.state.notification_service = notifications_center
+    app.state.notification_preferences = preferences
+    app.state.mirror_digest_service = mirror_digests
 
     app.include_router(health.router)
     app.include_router(auth.router)
@@ -352,6 +397,8 @@ def create_app(
     # 운영자 전용. 모든 경로가 `AdminUser`를 지난다.
     app.include_router(admin_api.router)
     app.include_router(notifications_api.router)
+    # 정기 발송. **Cloud Run invoker IAM 뒤에 있다** — 공개 경로가 아니다.
+    app.include_router(jobs_api.router)
 
     logger.info("app created env=%s log_level=%s", settings.app_env, settings.log_level)
     return app

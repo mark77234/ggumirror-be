@@ -144,6 +144,15 @@ def notification_service(request: Request):
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
 
 
+def notification_preferences(request: Request):
+    """알림 설정 service. store와 같은 이유로 처음 쓰일 때 만든다."""
+    try:
+        return request.app.state.notification_preferences()
+    except Exception as error:  # Firestore client 생성 실패
+        logger.error("notification_preferences_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
 def push_service(request: Request):
     """Push service.
 

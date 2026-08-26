@@ -114,6 +114,8 @@ def _document(event: NotificationEvent) -> dict:
         "contentType": event.content_type,
         "titleSnapshot": event.title_snapshot,
         "shardAmount": event.shard_amount,
+        "headline": event.headline,
+        "body": event.body,
         "createdAt": event.created_at,
         "readAt": event.read_at,
         "schemaVersion": event.schema_version,
@@ -124,11 +126,15 @@ def _event_from(event_id: str, data: dict) -> NotificationEvent:
     return NotificationEvent(
         id=event_id,
         user_id=str(data.get("userId") or ""),
-        type=NotificationType(data.get("type") or NotificationType.MARKETPLACE_SALE.value),
+        # **모르는 종류가 페이지 전체를 깨뜨리지 않는다.**
+        type=NotificationType.of(data.get("type")),
         listing_id=str(data.get("listingId") or ""),
         content_type=str(data.get("contentType") or "mirror"),
         title_snapshot=str(data.get("titleSnapshot") or ""),
         shard_amount=int(data.get("shardAmount") or 0),
+        # 옛 판매 문서에는 없다. 없으면 빈 문자열이고 화면이 알아서 문장을 만든다.
+        headline=str(data.get("headline") or ""),
+        body=str(data.get("body") or ""),
         created_at=data.get("createdAt") or utcnow(),
         read_at=data.get("readAt"),
         schema_version=int(data.get("schemaVersion") or 1),

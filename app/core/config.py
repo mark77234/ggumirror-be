@@ -71,6 +71,10 @@ class Settings:
     apns_team_id: str = ""
     apns_private_key: str = ""
     apns_bundle_id: str = ""
+
+    #: 정기 발송 endpoint의 추가 자물쇠. **비어 있으면 Cloud Run invoker IAM 하나에
+    #: 기댄다.** 설정해 두면 그것이 잘못 열려도 이 header 없이는 돌지 않는다.
+    jobs_token: str = ""
     ai_image_quality: str = "low"
     # 생성 결과를 잠시 두는 꾸미러 전용 private bucket. **DailyOPIc bucket을 쓰지 않는다.**
     #
@@ -183,6 +187,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         # 줄바꿈이 들어간 PEM이다. Secret Manager가 원문 그대로 준다.
         apns_private_key=env.get("APNS_PRIVATE_KEY") or "",
         apns_bundle_id=(env.get("APNS_BUNDLE_ID") or "").strip(),
+        jobs_token=(env.get("JOBS_TOKEN") or "").strip(),
     )
 
 

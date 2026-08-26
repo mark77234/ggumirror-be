@@ -25,10 +25,42 @@ MAX_PAGE = 50
 
 
 class NotificationType(StrEnum):
-    """**하나로 시작한다.** 거울과 스티커는 `content_type`으로 갈린다 —
-    종류마다 새 enum 값을 만들면 화면이 값마다 분기하게 된다."""
+    """알림의 종류.
+
+    **모르는 값 하나 때문에 목록 전체가 깨지면 안 된다.** 나중에 서버가 새 종류를
+    보내도 옛 앱은 그것만 일반 알림으로 보여 주고 나머지를 계속 읽어야 한다.
+    그래서 `UNKNOWN`이 있고, 읽기는 `of()`를 지난다.
+    """
 
     MARKETPLACE_SALE = "marketplace_sale"
+    #: 새로 올라온 거울 모아 보기. 특정 상품 하나에 매이지 않는다.
+    MIRROR_DIGEST = "mirror_digest"
+    #: 다시 둘러보라는 소식. **알림센터에 쌓지 않는다**(push 전용).
+    RECOMMENDATION = "recommendation"
+    #: 이 앱이 모르는 종류. 저장하는 값이 아니라 **읽을 때만** 나온다.
+    UNKNOWN = "unknown"
+
+    @classmethod
+    def of(cls, raw) -> "NotificationType":
+        """모르는 값을 만나도 던지지 않는다.
+
+        예전에는 `NotificationType(...)`을 그대로 불러서, 새 종류가 하나라도
+        섞이면 그 페이지 전체가 `ValueError`로 죽었다 — 알림센터가 통째로 비었다.
+        """
+        if not raw:
+            return cls.MARKETPLACE_SALE
+        try:
+            return cls(raw)
+        except ValueError:
+            return cls.UNKNOWN
+
+    @property
+    def is_stored_in_center(self) -> bool:
+        """알림센터에 남길 종류인가.
+
+        추천 소식은 남기지 않는다 — 홍보성 알림이 쌓이면 판매 소식이 묻힌다.
+        """
+        return self is not NotificationType.RECOMMENDATION
 
 
 @dataclass(frozen=True)
@@ -46,11 +78,18 @@ class NotificationEvent:
     id: str
     user_id: str
     type: NotificationType
-    listing_id: str
-    content_type: str
-    title_snapshot: str
+    #: **판매 알림에만 있다.** 모아 보기는 상품 하나에 매이지 않는다.
+    listing_id: str = ""
+    content_type: str = ""
+    title_snapshot: str = ""
     #: 이번 판매로 판매자가 받은 조각. **원장이 확정한 값의 사본**이다.
-    shard_amount: int
+    shard_amount: int = 0
+    #: 종류와 무관하게 화면이 그대로 보여 줄 수 있는 문구.
+    #:
+    #: 판매 알림에는 없다(옛 문서에도 없다) — 그때는 화면이 상품 이름과 조각으로
+    #: 문장을 만든다. 모아 보기처럼 상품이 없는 알림은 이 값을 쓴다.
+    headline: str = ""
+    body: str = ""
     created_at: datetime = field(default_factory=utcnow)
     read_at: datetime | None = None
     schema_version: int = SCHEMA_VERSION

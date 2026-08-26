@@ -175,8 +175,16 @@ class AccountDeletionService:
         count = 0
 
         # id가 곧 user id인 문서.
-        for name in ("users", "wallets"):
-            reference = self._db.collection(self._c[name]).document(user_id)
+        # id가 곧 user id인 문서에 알림 설정도 들어간다.
+        #
+        # **없는 이름은 건너뛴다.** 아래 field 기반 목록과 같은 규칙이다 — 부르는
+        # 쪽이 아직 그 collection을 모르면(옛 구성 · test fixture) 삭제 전체가
+        # 죽는 것이 가장 나쁘다. 지울 것이 없으면 지울 것이 없는 것이다.
+        for name in ("users", "wallets", "notification_preferences"):
+            collection = self._c.get(name)
+            if collection is None:
+                continue
+            reference = self._db.collection(collection).document(user_id)
             if reference.get().exists:
                 reference.delete()
                 count += 1
@@ -187,7 +195,7 @@ class AccountDeletionService:
                      # Phase F. push token은 개인 데이터이고, 판매 알림 기록도
                      # 그 사람의 것이다. **구매자의 소유권·원장은 여기 없다** —
                      # 저쪽은 다른 사람의 권리라 남는다.
-                     "push_devices", "notifications"):
+                     "push_devices", "notifications", "notification_deliveries"):
             collection = self._c.get(name)
             if collection is None:
                 continue

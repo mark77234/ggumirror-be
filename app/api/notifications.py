@@ -12,7 +12,10 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
 
-from app.api.deps import CurrentUser, marketplace_service, notification_service, push_service
+from app.api.deps import (
+    CurrentUser, marketplace_service, notification_preferences,
+    notification_service, push_service,
+)
 from app.auth.store import StoreUnavailable
 from app.notifications.models import (
     MAX_PAGE,
@@ -20,6 +23,7 @@ from app.notifications.models import (
     NotificationNotFound,
 )
 from app.notifications.service import NotificationService
+from app.notifications.preferences import DigestFrequency
 from app.push.models import InvalidPushDevice, PushEnvironment
 from app.push.service import PushService
 
@@ -54,6 +58,71 @@ class SaleStatResponse(BaseModel):
     #: **총 판매 횟수다.** 알림 목록을 몇 장 불러왔는지와 무관하다.
     sale_count: int = Field(serialization_alias="saleCount")
     price_shards: int = Field(serialization_alias="priceShards")
+
+
+class PreferencesPayload(BaseModel):
+    """알림 설정. **OS 권한과 다른 것이다** — 이건 "무엇을 받을까"다."""
+
+    sales_enabled: bool = Field(serialization_alias="salesEnabled")
+    mirror_digest_frequency: str = Field(serialization_alias="mirrorDigestFrequency")
+    recommendation_enabled: bool = Field(serialization_alias="recommendationEnabled")
+
+
+class PreferencesRequest(BaseModel):
+    """**보낸 값만 바뀐다.** 화면이 토글 하나를 바꿀 때 나머지를 함께 보내지 않아도 되고,
+    오래된 화면이 새 설정을 실수로 되돌리지도 않는다.
+
+    마지막 발송 시각 같은 값은 받지 않는다 — 그건 서버가 쓰는 값이다.
+    """
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    sales_enabled: bool | None = Field(default=None, alias="salesEnabled")
+    mirror_digest_frequency: DigestFrequency | None = Field(
+        default=None, alias="mirrorDigestFrequency"
+    )
+    recommendation_enabled: bool | None = Field(default=None, alias="recommendationEnabled")
+
+
+def _preferences(value) -> PreferencesPayload:
+    return PreferencesPayload(
+        sales_enabled=value.sales_enabled,
+        mirror_digest_frequency=value.digest_frequency.value,
+        recommendation_enabled=value.recommendation_enabled,
+    )
+
+
+@router.get("/notification-preferences")
+def read_preferences(
+    user: CurrentUser,
+    service: Annotated[object, Depends(notification_preferences)],
+) -> PreferencesPayload:
+    """내 알림 설정. **문서가 없으면 기본값이다** — 읽기가 문서를 만들지 않는다."""
+    try:
+        return _preferences(service.preferences(user.id))
+    except StoreUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+
+
+@router.patch("/notification-preferences")
+def update_preferences(
+    request: PreferencesRequest,
+    user: CurrentUser,
+    service: Annotated[object, Depends(notification_preferences)],
+) -> PreferencesPayload:
+    try:
+        updated = service.update(
+            user.id,
+            sales_enabled=request.sales_enabled,
+            digest_frequency=(
+                request.mirror_digest_frequency.value
+                if request.mirror_digest_frequency else None
+            ),
+            recommendation_enabled=request.recommendation_enabled,
+        )
+    except StoreUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "storage unavailable") from error
+    return _preferences(updated)
 
 
 class PushDeviceRequest(BaseModel):
