@@ -147,15 +147,22 @@ def sticker_config(
 
 
 class AIMirrorRequest(BaseModel):
-    """**프롬프트 하나뿐이다.** 모델 · provider · 좌표 · 가격을 받는 자리를 만들지 않는다."""
+    """**프롬프트와 멱등 키뿐이다.** 모델 · provider · 좌표 · 가격을 받는 자리가 없다.
+
+    `requestId`는 client가 만드는 UUID다(스티커와 같은 규칙). 응답을 잃고 같은 값으로
+    다시 보내면 **조각이 다시 빠지지 않는다** — 원장 키가 같기 때문이다.
+    """
 
     prompt: str = Field(min_length=1, max_length=300)
+    request_id: str = Field(alias="requestId", min_length=8, max_length=64)
 
     model_config = {"populate_by_name": True}
 
 
 class AIMirrorConfigPayload(BaseModel):
     available: bool
+    #: 한 장에 몇 조각인가. **화면은 이 값을 그대로 보여 준다** — 앱에 숫자를 적지 않는다.
+    price: int
     daily_limit: int = Field(serialization_alias="dailyLimit")
     remaining: int
 
@@ -171,6 +178,7 @@ def ai_mirror_config(
     now = utcnow()
     return AIMirrorConfigPayload(
         available=service.is_available,
+        price=service.price,
         daily_limit=service.daily_limit,
         remaining=service.remaining(user.id, now) if service.is_available else 0,
     )
@@ -191,7 +199,7 @@ def generate_mirror(
     색을 맡길 수 없어서, **client가 결정적으로 찍은 뒤** Phase C 규격을 지난다.
     """
     try:
-        result = service.generate(user.id, body.prompt, utcnow())
+        result = service.generate(user.id, body.prompt, body.request_id, utcnow())
     except DailyLimitReached as error:
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS, "daily limit reached"

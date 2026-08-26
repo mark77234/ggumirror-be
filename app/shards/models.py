@@ -39,6 +39,8 @@ class ShardReason(StrEnum):
     REWARDED_AD = "rewarded_ad"
     IAP_PURCHASE = "iap_purchase"
     AI_STICKER = "ai_sticker"
+    #: AI 거울 생성. 스티커와 **다른 값**이라 원장만 보고 어디에 썼는지 알 수 있어야 한다.
+    AI_MIRROR = "ai_mirror"
     # 상점 구매/판매. **콘텐츠 종류마다 나눈다** — 등록비(`*_publish_fee`)와 같은 규칙이다.
     # 원장만 보고 거울인지 스티커인지 알 수 있어야 한다.
     #

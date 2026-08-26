@@ -307,8 +307,9 @@ def create_app(
         from app.ai.mirror import AIMirrorQuota, AIMirrorService
         from app.ai.firestore_store import AI_MIRROR_QUOTAS
 
-        # **AI 스티커가 쓰는 provider를 그대로 쓴다** — 두 번째 provider 체계를
-        # 만들지 않는다. 다른 것은 비용 보호 방식뿐이다(조각 대신 하루 횟수).
+        # **AI 스티커가 쓰는 provider와 조각 원장을 그대로 쓴다** —
+        # 두 번째 provider 체계도, 두 번째 경제 체계도 만들지 않는다.
+        # 비용 보호는 둘 다 건다: 조각 값 + 하루 횟수.
         return AIMirrorService(
             image_provider or build_provider(
                 api_key=settings.ai_image_api_key,
@@ -319,6 +320,7 @@ def create_app(
                 _firestore(), AI_MIRROR_QUOTAS, settings.ai_mirror_daily_limit
             ) if settings.ai_image_api_key or generation_store is not None else None,
             settings.ai_image_model,
+            shards=shards(),
         )
 
     app.state.ai_mirror_service = ai_mirrors

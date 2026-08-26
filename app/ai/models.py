@@ -21,6 +21,10 @@ from app.shards.models import utcnow
 # 응답으로 내려보내 client가 그대로 표시하게 한다.
 DEFAULT_STICKER_PRICE = 6
 
+#: AI 거울 한 장. **스티커와 따로 둔다** — 한 값을 공유하면 한쪽을 바꿀 때
+#: 다른 쪽이 조용히 따라 움직인다. 거울은 더 크고 provider 비용도 더 든다.
+DEFAULT_MIRROR_PRICE = 10
+
 # 프롬프트 길이 상한. 길다고 좋은 그림이 나오지 않고, provider 요금만 늘어난다.
 MAX_PROMPT_LENGTH = 200
 

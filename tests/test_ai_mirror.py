@@ -125,15 +125,41 @@ def provider():
 
 
 @pytest.fixture
-def service(db, provider):
-    return AIMirrorService(provider, AIMirrorQuota(db, "quotas"), "test-model")
+def shard_store():
+    from app.shards.store import InMemoryShardStore
+
+    return InMemoryShardStore()
+
+
+@pytest.fixture
+def shards(shard_store):
+    from app.shards.service import ShardLedgerService
+
+    return ShardLedgerService(shard_store)
+
+
+def fund(shards, user_id: str, amount: int) -> None:
+    from app.shards.models import ShardReason
+
+    shards.credit(user_id, amount, ShardReason.ADMIN_ADJUSTMENT,
+                  external_event_id=f"seed:{user_id}:{amount}")
+
+
+@pytest.fixture
+def service(db, provider, shards):
+    # **조각을 넉넉히 채워 둔다** — 값을 보는 test가 아닌 곳에서 잔액 때문에 막히지 않게.
+    fund(shards, ALICE, 1000)
+    fund(shards, BOB, 1000)
+    return AIMirrorService(
+        provider, AIMirrorQuota(db, "quotas"), "test-model", shards=shards
+    )
 
 
 # MARK: - 프롬프트
 
 
 def test_server_owns_the_geometry_instructions(service, provider):
-    service.generate(ALICE, "핑크 리본", MORNING)
+    service.generate(ALICE, "핑크 리본", "req-1", MORNING)
     sent = provider.prompts[0]
     # 사용자 문장만 그대로 보내지 않는다 — 서버 지시문과 함께 간다.
     assert "핑크 리본" in sent
@@ -153,7 +179,7 @@ def test_prompt_template_does_not_promise_exact_geometry():
 
 def test_empty_prompt_never_reaches_the_provider(service, provider, db):
     with pytest.raises(AIStickerError):
-        service.generate(ALICE, "   ", MORNING)
+        service.generate(ALICE, "   ", "req-1", MORNING)
     # 고칠 수 있는 실패다 — 비용도 몫도 쓰지 않는다.
     assert provider.prompts == []
     assert db.data == {}
@@ -161,7 +187,7 @@ def test_empty_prompt_never_reaches_the_provider(service, provider, db):
 
 def test_oversized_prompt_never_reaches_the_provider(service, provider):
     with pytest.raises(AIStickerError):
-        service.generate(ALICE, "가" * 5000, MORNING)
+        service.generate(ALICE, "가" * 5000, "req-1", MORNING)
     assert provider.prompts == []
 
 
@@ -169,7 +195,7 @@ def test_unconfigured_provider_is_refused(db):
     service = AIMirrorService(UnconfiguredProvider(), AIMirrorQuota(db, "quotas"), "m")
     assert service.is_available is False
     with pytest.raises(AIStickerError):
-        service.generate(ALICE, "핑크 리본", MORNING)
+        service.generate(ALICE, "핑크 리본", "req-1", MORNING)
     assert db.data == {}
 
 
@@ -178,25 +204,25 @@ def test_unconfigured_provider_is_refused(db):
 
 def test_generation_succeeds_within_the_limit(service, provider):
     for _ in range(DEFAULT_DAILY_LIMIT):
-        result = service.generate(ALICE, "핑크 리본", MORNING)
+        result = service.generate(ALICE, "핑크 리본", "req-1", MORNING)
         assert result.png == b"PNG-BYTES"
     assert len(provider.prompts) == DEFAULT_DAILY_LIMIT
 
 
 def test_one_more_is_refused(service, provider):
     for _ in range(DEFAULT_DAILY_LIMIT):
-        service.generate(ALICE, "핑크 리본", MORNING)
+        service.generate(ALICE, "핑크 리본", "req-1", MORNING)
     with pytest.raises(DailyLimitReached):
-        service.generate(ALICE, "핑크 리본", MORNING)
+        service.generate(ALICE, "핑크 리본", "req-1", MORNING)
     # **provider에 가지 않는다** — 거절이 곧 비용 절약이다.
     assert len(provider.prompts) == DEFAULT_DAILY_LIMIT
 
 
 def test_the_next_day_starts_over(service, provider):
     for _ in range(DEFAULT_DAILY_LIMIT):
-        service.generate(ALICE, "핑크 리본", MORNING)
+        service.generate(ALICE, "핑크 리본", "req-1", MORNING)
     tomorrow = MORNING + timedelta(days=1)
-    service.generate(ALICE, "핑크 리본", tomorrow)
+    service.generate(ALICE, "핑크 리본", "req-1", tomorrow)
     assert len(provider.prompts) == DEFAULT_DAILY_LIMIT + 1
 
 
@@ -207,23 +233,23 @@ def test_the_day_boundary_is_seoul_not_utc(service):
     # 같은 KST 날의 저녁 (UTC로는 03-02 09:00)
     evening = datetime(2026, 3, 2, 9, 0, tzinfo=timezone.utc)
     for _ in range(DEFAULT_DAILY_LIMIT):
-        service.generate(ALICE, "핑크 리본", late)
+        service.generate(ALICE, "핑크 리본", "req-1", late)
     # UTC로는 날짜가 바뀌었지만 KST로는 같은 날이다 — 여전히 막혀야 한다.
     with pytest.raises(DailyLimitReached):
-        service.generate(ALICE, "핑크 리본", evening)
+        service.generate(ALICE, "핑크 리본", "req-1", evening)
 
 
 def test_users_have_separate_quotas(service, provider):
     for _ in range(DEFAULT_DAILY_LIMIT):
-        service.generate(ALICE, "핑크 리본", MORNING)
+        service.generate(ALICE, "핑크 리본", "req-1", MORNING)
     # BOB은 자기 몫이 그대로 있다.
-    service.generate(BOB, "Y2K", MORNING)
+    service.generate(BOB, "Y2K", "req-1", MORNING)
     assert len(provider.prompts) == DEFAULT_DAILY_LIMIT + 1
 
 
 def test_remaining_counts_down(service):
     assert service.remaining(ALICE, MORNING) == DEFAULT_DAILY_LIMIT
-    service.generate(ALICE, "핑크 리본", MORNING)
+    service.generate(ALICE, "핑크 리본", "req-1", MORNING)
     assert service.remaining(ALICE, MORNING) == DEFAULT_DAILY_LIMIT - 1
 
 
@@ -239,16 +265,16 @@ def test_quota_claim_is_atomic(db):
 def test_limit_is_configurable_by_the_server(db, provider):
     service = AIMirrorService(provider, AIMirrorQuota(db, "quotas", limit=1), "m")
     assert service.daily_limit == 1
-    service.generate(ALICE, "핑크 리본", MORNING)
+    service.generate(ALICE, "핑크 리본", "req-1", MORNING)
     with pytest.raises(DailyLimitReached):
-        service.generate(ALICE, "핑크 리본", MORNING)
+        service.generate(ALICE, "핑크 리본", "req-1", MORNING)
 
 
 # MARK: - 비용
 
 
 def test_provider_is_called_exactly_once_per_generation(service, provider):
-    service.generate(ALICE, "핑크 리본", MORNING)
+    service.generate(ALICE, "핑크 리본", "req-1", MORNING)
     # **자동 재시도가 없다.** 정말 만들어졌는데 응답만 잃었을 수도 있어서,
     # 다시 부르면 비용이 두세 배가 된다.
     assert len(provider.prompts) == 1
@@ -260,24 +286,39 @@ def test_provider_failure_still_consumed_the_attempt(db):
     service = AIMirrorService(provider, AIMirrorQuota(db, "quotas"), "m")
 
     with pytest.raises(AIStickerError):
-        service.generate(ALICE, "핑크 리본", MORNING)
+        service.generate(ALICE, "핑크 리본", "req-1", MORNING)
     assert service.remaining(ALICE, MORNING) == DEFAULT_DAILY_LIMIT - 1
 
 
 def test_nothing_is_stored_about_the_prompt(service, db):
-    service.generate(ALICE, "아주 개인적인 문장", MORNING)
+    service.generate(ALICE, "아주 개인적인 문장", "req-1", MORNING)
     # 프롬프트도 그림도 남기지 않는다 — 남길 이유가 없다.
     assert "아주 개인적인 문장" not in str(db.data)
     assert "PNG-BYTES" not in str(db.data)
 
 
-def test_no_shard_charge(service):
-    """**조각을 받지 않는다.** 값을 정하지 않은 기능에 과금 경로를 먼저 만들지 않는다."""
-    import inspect
+def test_price_is_ten_shards(service):
+    """**한 장에 10조각이다.** 값의 authority는 서버다 — 요청에 실을 자리가 없다."""
+    from app.ai.models import DEFAULT_MIRROR_PRICE
 
-    source = inspect.getsource(AIMirrorService)
-    for forbidden in ["debit", "ShardReason", "shards", "InsufficientShards"]:
-        assert forbidden not in source, forbidden
+    assert DEFAULT_MIRROR_PRICE == 10
+    assert service.price == 10
+
+
+def test_sticker_price_is_untouched():
+    """거울 값을 정하면서 **스티커 값이 따라 움직이면 안 된다.**"""
+    from app.ai.models import DEFAULT_STICKER_PRICE
+
+    assert DEFAULT_STICKER_PRICE == 6
+
+
+def test_mirror_and_sticker_spend_are_distinguishable():
+    """원장만 보고 어디에 썼는지 알 수 있어야 한다."""
+    from app.shards.models import ShardReason
+
+    assert ShardReason.AI_MIRROR.value == "ai_mirror"
+    assert ShardReason.AI_STICKER.value == "ai_sticker"
+    assert ShardReason.AI_MIRROR is not ShardReason.AI_STICKER
 
 
 # MARK: - API
@@ -295,6 +336,120 @@ def test_client_cannot_choose_model_or_geometry():
     from app.api.ai import AIMirrorRequest
 
     fields = set(AIMirrorRequest.model_fields)
-    assert fields == {"prompt"}
+    # 프롬프트와 멱등 키뿐이다. `requestId`는 값을 정하지 않는다 —
+    # 같은 요청인지만 알려주고, 얼마인지는 서버 표가 정한다.
+    assert fields == {"prompt", "request_id"}
     for forbidden in ("model", "provider", "apiKey", "cameraRect", "userId", "price"):
         assert forbidden not in fields
+
+
+# MARK: - 조각 (I-7) — release-critical
+
+
+def balance(shards, user_id: str) -> int:
+    return shards.wallet(user_id).balance
+
+
+def test_success_costs_exactly_ten(service, shards, provider):
+    """성공하면 정확히 10조각. 한 번만."""
+    before = balance(shards, ALICE)
+
+    service.generate(ALICE, "핑크 리본", "req-success", MORNING)
+
+    assert balance(shards, ALICE) == before - 10
+    assert len(provider.prompts) == 1
+
+
+def test_retry_with_the_same_request_id_does_not_charge_twice(service, shards, provider):
+    """**BLOCKER guard.** 응답을 잃고 다시 부른 것은 새 구매가 아니다.
+
+    그림은 다시 만들어야 하므로 provider는 다시 부르지만, **조각은 다시 빠지지 않는다** —
+    원장 멱등 키가 같기 때문이다.
+    """
+    before = balance(shards, ALICE)
+
+    service.generate(ALICE, "핑크 리본", "req-same", MORNING)
+    service.generate(ALICE, "핑크 리본", "req-same", MORNING)
+    service.generate(ALICE, "핑크 리본", "req-same", MORNING)
+
+    assert balance(shards, ALICE) == before - 10
+
+
+def test_different_requests_each_cost_ten(service, shards):
+    """다른 요청은 각각 값을 낸다 — 멱등이 공짜를 뜻하지 않는다."""
+    before = balance(shards, ALICE)
+
+    service.generate(ALICE, "핑크 리본", "req-a", MORNING)
+    service.generate(ALICE, "노란 별", "req-b", MORNING)
+
+    assert balance(shards, ALICE) == before - 20
+
+
+def test_provider_failure_leaves_no_net_loss(service, shards, provider):
+    """**BLOCKER guard.** 만들어 주지 못했으면 조각을 가져가지 않는다."""
+    before = balance(shards, ALICE)
+    provider.failure = RuntimeError("provider exploded")
+
+    with pytest.raises(Exception):
+        service.generate(ALICE, "핑크 리본", "req-boom", MORNING)
+
+    assert balance(shards, ALICE) == before
+
+
+def test_daily_limit_after_debit_also_refunds(service, shards):
+    """하루 몫이 끝나서 실패해도 net 0이다 — 차감 뒤의 어떤 실패든 되돌린다."""
+    for index in range(DEFAULT_DAILY_LIMIT):
+        service.generate(ALICE, "핑크 리본", f"req-{index}", MORNING)
+    before = balance(shards, ALICE)
+
+    with pytest.raises(DailyLimitReached):
+        service.generate(ALICE, "핑크 리본", "req-over", MORNING)
+
+    assert balance(shards, ALICE) == before
+
+
+def test_insufficient_balance_is_refused_before_the_provider(db, provider, shards):
+    """**provider를 부르기 전에** 거절한다. 돈이 없으면 요금이 발생하면 안 된다."""
+    poor = "99999999-8888-4777-8666-000000000000"
+    fund(shards, poor, 9)   # 10보다 하나 모자라다
+    service = AIMirrorService(
+        provider, AIMirrorQuota(db, "quotas"), "test-model", shards=shards
+    )
+
+    with pytest.raises(AIStickerError) as error:
+        service.generate(poor, "핑크 리본", "req-poor", MORNING)
+
+    assert error.value.reason is AIStickerReason.INSUFFICIENT_SHARDS
+    assert provider.prompts == []
+    # 잔액도 하루 몫도 건드리지 않았다.
+    assert balance(shards, poor) == 9
+    assert service.remaining(poor, MORNING) == DEFAULT_DAILY_LIMIT
+
+
+def test_refund_writes_one_ledger_line(service, shards, shard_store, provider):
+    """되돌리기를 여러 번 시도해도 원장에는 한 줄이다."""
+    provider.failure = RuntimeError("boom")
+    for _ in range(3):
+        with pytest.raises(Exception):
+            service.generate(ALICE, "핑크 리본", "req-refund", MORNING)
+
+    refunds = [x for x in shard_store.entries if x.reason.value == "refund"]
+    assert len(refunds) == 1
+
+
+def test_ledger_records_the_mirror_reason(service, shard_store):
+    """원장만 보고 AI 거울에 썼다는 것을 알 수 있다."""
+    service.generate(ALICE, "핑크 리본", "req-reason", MORNING)
+
+    reasons = {x.reason.value for x in shard_store.entries}
+    assert "ai_mirror" in reasons
+    assert "ai_sticker" not in reasons
+
+
+def test_price_is_not_taken_from_the_request(service, shards):
+    """요청이 값을 정하지 못한다 — `generate`에 금액 인자가 없다."""
+    import inspect
+
+    parameters = set(inspect.signature(service.generate).parameters)
+    assert "price" not in parameters
+    assert "amount" not in parameters
