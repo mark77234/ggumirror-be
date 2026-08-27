@@ -25,10 +25,9 @@ from app.ai.models import (
     Generation,
     GenerationStatus,
 )
-from app.ai.mirror import AIMirrorService, DailyLimitReached
+from app.ai.mirror import AIMirrorService
 from app.ai.service import AIStickerService
 from app.api.deps import CurrentUser, ai_mirror_service, ai_sticker_service
-from app.auth.models import utcnow
 
 router = APIRouter(prefix="/ai", tags=["ai"])
 
@@ -163,8 +162,6 @@ class AIMirrorConfigPayload(BaseModel):
     available: bool
     #: 한 장에 몇 조각인가. **화면은 이 값을 그대로 보여 준다** — 앱에 숫자를 적지 않는다.
     price: int
-    daily_limit: int = Field(serialization_alias="dailyLimit")
-    remaining: int
 
     model_config = {"populate_by_name": True}
 
@@ -174,13 +171,10 @@ def ai_mirror_config(
     user: CurrentUser,
     service: Annotated[AIMirrorService, Depends(ai_mirror_service)],
 ) -> AIMirrorConfigPayload:
-    """CTA를 켤지, 오늘 몇 번 남았는지. **client가 상한을 정하지 않는다.**"""
-    now = utcnow()
+    """CTA를 켤지와 값. **하루 횟수 제한이 없다** — 값이 곧 제한이다."""
     return AIMirrorConfigPayload(
         available=service.is_available,
         price=service.price,
-        daily_limit=service.daily_limit,
-        remaining=service.remaining(user.id, now) if service.is_available else 0,
     )
 
 
@@ -199,11 +193,7 @@ def generate_mirror(
     색을 맡길 수 없어서, **client가 결정적으로 찍은 뒤** Phase C 규격을 지난다.
     """
     try:
-        result = service.generate(user.id, body.prompt, body.request_id, utcnow())
-    except DailyLimitReached as error:
-        raise HTTPException(
-            status.HTTP_429_TOO_MANY_REQUESTS, "daily limit reached"
-        ) from error
+        result = service.generate(user.id, body.prompt, body.request_id)
     except AIStickerError as error:
         raise _failure(error) from error
     return Response(content=result.png, media_type="image/png")

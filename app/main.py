@@ -348,21 +348,18 @@ def create_app(
 
     @lru_cache(maxsize=1)
     def ai_mirrors():
-        from app.ai.mirror import AIMirrorQuota, AIMirrorService
-        from app.ai.firestore_store import AI_MIRROR_QUOTAS
+        from app.ai.mirror import AIMirrorService
 
         # **AI 스티커가 쓰는 provider와 조각 원장을 그대로 쓴다** —
         # 두 번째 provider 체계도, 두 번째 경제 체계도 만들지 않는다.
-        # 비용 보호는 둘 다 건다: 조각 값 + 하루 횟수.
+        # 비용 보호는 **조각 값 하나**다. 하루 횟수 제한은 없앴다 —
+        # 값을 낸 사용자를 막는 쪽으로만 일했다.
         return AIMirrorService(
             image_provider or build_provider(
                 api_key=settings.ai_image_api_key,
                 model=settings.ai_image_model,
                 quality=settings.ai_image_quality,
             ),
-            AIMirrorQuota(
-                _firestore(), AI_MIRROR_QUOTAS, settings.ai_mirror_daily_limit
-            ) if settings.ai_image_api_key or generation_store is not None else None,
             settings.ai_image_model,
             shards=shards(),
         )

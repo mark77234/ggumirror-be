@@ -7,8 +7,9 @@
 카메라 자리 표시는 client가 결정적으로 찍은 뒤 Phase C 규격을 지난다.
 여기서 하는 일은 **그림 한 장을 받아 오는 것**까지다.
 
-한 장에 조각을 받는다(I-7). 하루 횟수 제한도 그대로 둔다 — 값은 남용을 막지만
-"실수로 스무 번" 같은 사고까지 막아 주지는 않는다.
+한 장에 조각을 받는다(I-7). **하루 횟수 제한은 없다** — 값이 곧 제한이다.
+조각이 있으면 하루에 몇 번이든 만들 수 있고, 조각이 없으면 한 번도 못 만든다.
+횟수 제한은 값 위에 덧붙은 두 번째 관문이었고, 값을 낸 사용자를 막는 쪽으로만 일했다.
 
 **경제는 AI 스티커가 쓰는 것을 그대로 쓴다.** 새 예약/정산 체계를 만들지 않았다:
 같은 원장, 같은 멱등 키 규칙(`external_event_id`), 같은 환불 방식이다.
@@ -23,7 +24,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
 
 from app.ai.models import (
     DEFAULT_MIRROR_PRICE,
@@ -32,13 +32,9 @@ from app.ai.models import (
     generation_id,
 )
 from app.ai.prompt import normalize_prompt
-from app.shards.attendance import attendance_date
 from app.shards.models import InsufficientShards, ShardReason
 
 logger = logging.getLogger(__name__)
-
-#: 하루에 provider까지 가는 시도 횟수. **서버가 정한다** — client가 못 늘린다.
-DEFAULT_DAILY_LIMIT = 3
 
 #: 사용자 요청을 감싸는 서버 소유 지시문.
 #:
@@ -61,10 +57,6 @@ Style request from the user:
 """
 
 
-class DailyLimitReached(Exception):
-    """오늘 몫을 다 썼다. **실패가 아니라 정상적인 거절이다.**"""
-
-
 @dataclass(frozen=True)
 class GeneratedMirror:
     """만들어진 그림 한 장. **오래 보관하지 않는다** — 응답으로 나가고 끝이다."""
@@ -74,74 +66,24 @@ class GeneratedMirror:
     model: str
 
 
-class AIMirrorQuota:
-    """`(사용자, KST 날짜)`당 시도 횟수.
-
-    조각 원장에 기록하지 않는다 — 돈이 오간 일이 아니라 **비용을 막는 계수기**다.
-    확인과 증가가 한 transaction 안에서 일어나야 동시에 들어온 두 요청이
-    상한을 넘기지 못한다.
-    """
-
-    def __init__(self, db, collection: str, limit: int = DEFAULT_DAILY_LIMIT) -> None:
-        self._db = db
-        self._collection = collection
-        self._limit = limit
-
-    @property
-    def limit(self) -> int:
-        return self._limit
-
-    @staticmethod
-    def key(user_id: str, day: str) -> str:
-        return f"{user_id}:{day}"
-
-    def used(self, user_id: str, now: datetime) -> int:
-        snapshot = self._db.collection(self._collection).document(
-            self.key(user_id, attendance_date(now))
-        ).get()
-        return int((snapshot.to_dict() or {}).get("count") or 0) if snapshot.exists else 0
-
-    def claim(self, user_id: str, now: datetime) -> int:
-        """한 번 쓴다. 상한을 넘으면 `DailyLimitReached`이고 **아무것도 늘지 않는다.**"""
-        from google.cloud import firestore
-
-        day = attendance_date(now)
-        reference = self._db.collection(self._collection).document(self.key(user_id, day))
-
-        @firestore.transactional
-        def run(transaction) -> int:
-            snapshot = reference.get(transaction=transaction)
-            used = int((snapshot.to_dict() or {}).get("count") or 0) if snapshot.exists else 0
-            if used >= self._limit:
-                raise DailyLimitReached()
-            transaction.set(
-                reference, {"userId": user_id, "day": day, "count": used + 1}, merge=True
-            )
-            return used + 1
-
-        return run(self._db.transaction())
-
-
 class AIMirrorService:
     """프롬프트 하나 → 거울 그림 한 장.
 
     **저장하지 않는다.** 스티커와 다르게 결과를 GCS에 두지 않고 그대로 돌려준다 —
     생성 원본을 오래 보관할 제품 요구가 없고, 보관하면 비용과 삭제 의무만 는다.
     응답을 잃으면 사용자가 **같은 `requestId`로** 다시 부른다. 그때 조각은 다시
-    빠지지 않는다(원장 멱등 키가 같다). 다만 그림은 다시 만들어야 하므로
-    하루 몫은 한 번 더 쓴다 — provider를 실제로 한 번 더 부르기 때문이다.
+    빠지지 않는다(원장 멱등 키가 같다). 그림은 다시 만들어야 하므로 provider는
+    한 번 더 부른다.
     """
 
     def __init__(
         self,
         provider,
-        quota: AIMirrorQuota | None,
         model: str,
         shards=None,
         price: int = DEFAULT_MIRROR_PRICE,
     ) -> None:
         self._provider = provider
-        self._quota = quota
         self._model = model
         # 조각 원장. **AI 스티커가 쓰는 것과 같은 service다.**
         self._shards = shards
@@ -154,21 +96,10 @@ class AIMirrorService:
 
     @property
     def is_available(self) -> bool:
-        return getattr(self._provider, "is_configured", False) and self._quota is not None
+        return getattr(self._provider, "is_configured", False)
 
-    @property
-    def daily_limit(self) -> int:
-        return self._quota.limit if self._quota else 0
-
-    def remaining(self, user_id: str, now: datetime) -> int:
-        if self._quota is None:
-            return 0
-        return max(0, self._quota.limit - self._quota.used(user_id, now))
-
-    def generate(
-        self, user_id: str, raw_prompt: str, request_id: str, now: datetime
-    ) -> GeneratedMirror:
-        """- 고칠 수 있는 실패는 **돈도 몫도 쓰기 전에** 전부 거른다.
+    def generate(self, user_id: str, raw_prompt: str, request_id: str) -> GeneratedMirror:
+        """- 고칠 수 있는 실패는 **돈을 쓰기 전에** 전부 거른다.
         - 잔액이 모자라면 **provider를 부르기 전에** 거절한다.
         - provider는 **한 번만** 부른다. 자동 재시도는 비용을 두세 배로 만든다 —
           정말 만들어졌는데 응답만 잃었을 수도 있기 때문이다.
@@ -190,22 +121,18 @@ class AIMirrorService:
         self._debit(user_id, operation_id)
 
         try:
-            # 몫도 비용이다. **provider에 가는 시도만** 센다.
-            assert self._quota is not None
-            used = self._quota.claim(user_id, now)
-
             composed = MIRROR_PROMPT_TEMPLATE.format(user_prompt=prompt)
             png = self._provider.generate(composed)
         except BaseException:
-            # 차감한 뒤 실패했다. 되돌린다 — 하루 몫 소진도, provider 실패도,
-            # 그 밖의 무엇이든 사용자가 조각을 잃을 이유가 되지 않는다.
+            # 차감한 뒤 실패했다. 되돌린다 — provider 실패든 그 밖의 무엇이든
+            # 사용자가 조각을 잃을 이유가 되지 않는다.
             self._refund(user_id, operation_id)
             raise
 
         # **프롬프트 원문도 그림도 남기지 않는다.** 남길 이유가 없다.
         logger.info(
-            "ai_mirror_generated model=%s prompt_length=%d used=%d/%d bytes=%d price=%d",
-            self._model, len(prompt), used, self._quota.limit, len(png), self._price,
+            "ai_mirror_generated model=%s prompt_length=%d bytes=%d price=%d",
+            self._model, len(prompt), len(png), self._price,
         )
         return GeneratedMirror(operation_id=operation_id, png=png, model=self._model)
 
