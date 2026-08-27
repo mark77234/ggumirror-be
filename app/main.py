@@ -62,6 +62,7 @@ def create_app(
     notification_store=None,
     preference_store=None,
     delivery_store=None,
+    id_token_verifier=None,
 ) -> FastAPI:
     """store를 주면 그것을 쓴다 — test는 in-memory fake와 test key를 넣는다."""
     settings = settings or load_settings()
@@ -382,6 +383,15 @@ def create_app(
     app.state.notification_service = notifications_center
     app.state.notification_preferences = preferences
     app.state.mirror_digest_service = mirror_digests
+
+    @lru_cache(maxsize=1)
+    def scheduler_verifier():
+        """Google ID token 검증기. **test는 여기에 fake를 끼운다.**"""
+        from app.api.scheduler_identity import GoogleIDTokenVerifier
+
+        return id_token_verifier or GoogleIDTokenVerifier()
+
+    app.state.scheduler_verifier = scheduler_verifier
 
     app.include_router(health.router)
     app.include_router(auth.router)

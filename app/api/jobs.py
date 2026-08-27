@@ -1,16 +1,18 @@
 """Scheduler가 부르는 자리 (I-14).
 
 **아무나 부를 수 있으면 안 된다.** 이 경로는 사용자에게 알림을 보내므로,
-열려 있으면 누구나 우리 사용자에게 push를 쏘게 하는 버튼이 된다.
+열려 있으면 누구나 우리 사용자 전체에게 push를 쏘는 버튼이 된다.
 
-인증은 Cloud Run의 것을 그대로 쓴다 — Cloud Scheduler가 OIDC token을 달고
-호출하고, Cloud Run이 `roles/run.invoker`를 확인한 뒤에야 여기 코드가 돈다.
-앱이 두 번째 인증 체계를 만들지 않는다.
+⚠️ 예전에 여기 "Cloud Run invoker IAM 뒤에 있다"고 적혀 있었다. **틀렸다.**
+`ggumirror-api`는 `allUsers`에게 `roles/run.invoker`가 열린 공개 service다 —
+로그인 없이 상점을 볼 수 있어야 하기 때문이다. 그래서 IAM은 이 경로에 아무런
+문이 되지 못했고, `JOBS_TOKEN`도 설정돼 있지 않으면 그냥 통과였다.
 
-그 위에 **한 겹 더** 둔다: `JOBS_TOKEN`이 설정돼 있으면 header로 확인한다.
-Cloud Run이 잘못 열려 있어도(`allUsers` invoker) 그것만으로는 돌지 않는다.
+이제 **앱이 직접** 부른 쪽을 확인한다(`scheduler_identity`):
+Google 서명 · issuer · audience · exp에 더해 **우리가 정한 그 scheduler 계정인지**
+까지 본다. 서명만 보면 Google 계정을 가진 누구나 통과한다.
 
-이번 phase에서 실제 Cloud Scheduler job은 만들지 않는다 — 코드만 준비한다.
+설정이 없으면 **막는다.** 공개 service에서 "설정 안 했으니 통과"는 문을 여는 것이다.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
+from app.api.scheduler_identity import SchedulerIdentityError, verify_scheduler
 from app.auth.store import StoreUnavailable
 
 logger = logging.getLogger(__name__)
@@ -37,14 +40,30 @@ class JobResult(BaseModel):
     skipped_empty: int = Field(serialization_alias="skippedEmpty")
 
 
-def _authorized(request: Request, token: str | None) -> None:
-    """설정돼 있으면 확인한다. **값을 로그에 남기지 않는다.**"""
-    expected = getattr(request.app.state.settings, "jobs_token", "")
-    if not expected:
-        # 설정하지 않았다면 Cloud Run invoker IAM 하나에 기댄다.
-        return
-    if token != expected:
-        logger.warning("job_rejected")
+def _authorized(
+    request: Request, authorization: str | None, job_token: str | None
+) -> None:
+    """부른 쪽이 우리 scheduler인가. **아니면 아무것도 하지 않는다.**
+
+    실패 이유를 응답에 담지 않는다 — 무엇이 틀렸는지 알려 주면 맞출 때까지
+    시도하게 된다.
+    """
+    settings = request.app.state.settings
+    scheme, _, token = (authorization or "").partition(" ")
+    try:
+        verify_scheduler(
+            token.strip() if scheme.lower() == "bearer" else None,
+            expected_service_account=getattr(settings, "scheduler_service_account", ""),
+            expected_audience=getattr(settings, "scheduler_audience", ""),
+            verifier=request.app.state.scheduler_verifier(),
+        )
+    except SchedulerIdentityError as error:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "forbidden") from error
+
+    # 2차 자물쇠(선택). 설정돼 있을 때만 본다.
+    expected = getattr(settings, "jobs_token", "")
+    if expected and job_token != expected:
+        logger.warning("job_rejected reason=token")
         raise HTTPException(status.HTTP_403_FORBIDDEN, "forbidden")
 
 
@@ -68,10 +87,11 @@ def _result(outcome) -> JobResult:
 @router.post("/mirror-digest/daily")
 def run_daily_digest(
     request: Request,
+    authorization: Annotated[str | None, Header()] = None,
     x_ggumirror_job_token: Annotated[str | None, Header()] = None,
 ) -> JobResult:
     """매일 받겠다고 한 사람에게. **같은 날 두 번 불러도 한 번만 간다.**"""
-    _authorized(request, x_ggumirror_job_token)
+    _authorized(request, authorization, x_ggumirror_job_token)
     service = _digest(request)
     try:
         return _result(service.run_daily(service.subscriber_ids()))
@@ -82,9 +102,10 @@ def run_daily_digest(
 @router.post("/mirror-digest/weekly")
 def run_weekly_digest(
     request: Request,
+    authorization: Annotated[str | None, Header()] = None,
     x_ggumirror_job_token: Annotated[str | None, Header()] = None,
 ) -> JobResult:
-    _authorized(request, x_ggumirror_job_token)
+    _authorized(request, authorization, x_ggumirror_job_token)
     service = _digest(request)
     try:
         return _result(service.run_weekly(service.subscriber_ids()))
@@ -95,10 +116,11 @@ def run_weekly_digest(
 @router.post("/recommendation/weekly")
 def run_recommendation(
     request: Request,
+    authorization: Annotated[str | None, Header()] = None,
     x_ggumirror_job_token: Annotated[str | None, Header()] = None,
 ) -> JobResult:
     """다시 둘러보라는 소식. **켠 사람에게만, 주 1회.**"""
-    _authorized(request, x_ggumirror_job_token)
+    _authorized(request, authorization, x_ggumirror_job_token)
     service = _digest(request)
     try:
         return _result(service.run_recommendation(service.subscriber_ids()))

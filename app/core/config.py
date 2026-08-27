@@ -72,9 +72,16 @@ class Settings:
     apns_private_key: str = ""
     apns_bundle_id: str = ""
 
-    #: 정기 발송 endpoint의 추가 자물쇠. **비어 있으면 Cloud Run invoker IAM 하나에
-    #: 기댄다.** 설정해 두면 그것이 잘못 열려도 이 header 없이는 돌지 않는다.
+    #: 정기 발송 endpoint의 추가 자물쇠(선택). OIDC 검증이 1차 방어이고 이건 2차다.
     jobs_token: str = ""
+
+    # MARK: - 정기 발송 호출자 (Phase J)
+    #
+    # **Cloud Run IAM이 이 경로를 지켜 주지 않는다** — 이 service는 `allUsers`에게
+    # 열려 있다(로그인 없이 상점을 봐야 한다). 그래서 앱이 직접 확인한다.
+    # 둘 중 하나라도 비어 있으면 `/jobs/*`는 **전부 막힌다.**
+    scheduler_service_account: str = ""
+    scheduler_audience: str = ""
     ai_image_quality: str = "low"
     # 생성 결과를 잠시 두는 꾸미러 전용 private bucket. **DailyOPIc bucket을 쓰지 않는다.**
     #
@@ -188,6 +195,8 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         apns_private_key=env.get("APNS_PRIVATE_KEY") or "",
         apns_bundle_id=(env.get("APNS_BUNDLE_ID") or "").strip(),
         jobs_token=(env.get("JOBS_TOKEN") or "").strip(),
+        scheduler_service_account=(env.get("SCHEDULER_SERVICE_ACCOUNT") or "").strip(),
+        scheduler_audience=(env.get("SCHEDULER_AUDIENCE") or "").strip(),
     )
 
 
