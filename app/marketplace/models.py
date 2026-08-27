@@ -108,9 +108,12 @@ class MarketplacePublishPolicy:
     "파는 값"이 아니기 때문이다.
     """
 
+    #: **AI 생성 값과 다른 축이다.** 생성은 "만드는 값"(`AI_GENERATION_PRICE`)이고
+    #: 이것은 "상점에 내놓는 값"이다. 숫자가 겹쳐 보여도 한 상수로 묶지 않는다 —
+    #: 묶으면 한쪽 정책을 바꿀 때 다른 쪽이 조용히 따라 움직인다.
     FEES: dict[ContentType, int] = {
         ContentType.MIRROR: 10,
-        ContentType.STICKER: 5,
+        ContentType.STICKER: 10,
     }
 
     #: 비용 원장의 이유. 콘텐츠 종류마다 다르다 — 원장만 보고 무엇이었는지 알 수 있어야 한다.

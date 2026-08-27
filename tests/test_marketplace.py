@@ -96,9 +96,21 @@ def fee_entries(shard_store, kind: ContentType):
 
 def test_server_owns_the_fee():
     assert MarketplacePublishPolicy.fee(ContentType.MIRROR) == 10
-    assert MarketplacePublishPolicy.fee(ContentType.STICKER) == 5
+    assert MarketplacePublishPolicy.fee(ContentType.STICKER) == 10
     # 옛 20조각 정책은 없다.
     assert 20 not in MarketplacePublishPolicy.FEES.values()
+
+
+def test_publish_fee_is_not_the_generation_price():
+    """**등록비와 AI 생성값은 다른 축이다.**
+
+    숫자가 겹쳐 보여도 한 상수로 묶으면 한쪽 정책을 바꿀 때 다른 쪽이 조용히 따라간다.
+    """
+    from app.ai.models import AI_GENERATION_PRICE
+
+    assert AI_GENERATION_PRICE == 5
+    for fee in MarketplacePublishPolicy.FEES.values():
+        assert fee != AI_GENERATION_PRICE
 
 
 def test_fee_reasons_are_distinct():
@@ -195,7 +207,7 @@ def test_draft_validates_input(store, service, field, value):
 
 @pytest.mark.parametrize(
     ("kind", "fee", "start", "left"),
-    [(ContentType.MIRROR, 10, 100, 90), (ContentType.STICKER, 5, 100, 95)],
+    [(ContentType.MIRROR, 10, 100, 90), (ContentType.STICKER, 10, 100, 90)],
 )
 def test_first_publish_charges_the_server_fee(
     store, shards, service, shard_store, kind, fee, start, left
@@ -322,7 +334,7 @@ def test_publish_idempotency_is_scoped_to_the_listing(store, shards, service, sh
 
 
 @pytest.mark.parametrize(
-    ("kind", "left"), [(ContentType.MIRROR, 90), (ContentType.STICKER, 95)]
+    ("kind", "left"), [(ContentType.MIRROR, 90), (ContentType.STICKER, 90)]
 )
 def test_concurrent_publish_charges_once(store, shards, service, shard_store, kind, left):
     seed(shards, 100)

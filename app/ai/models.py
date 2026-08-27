@@ -17,13 +17,20 @@ from enum import StrEnum
 
 from app.shards.models import utcnow
 
-# 한 장에 6 조각. **client가 정하지 않는다** — 값은 여기 한 곳에만 있고
-# 응답으로 내려보내 client가 그대로 표시하게 한다.
-DEFAULT_STICKER_PRICE = 6
+#: AI가 만들어 주는 그림 한 장의 값. **client가 정하지 않는다** — 값은 여기 한 곳에만
+#: 있고, 응답으로 내려보내 client가 그대로 표시하게 한다.
+#:
+#: 거울과 스티커가 **같은 값**이다. 예전에는 거울 10 · 스티커 6이었는데, 사용자에게
+#: "AI에게 한 장 부탁하는 값"은 하나여야 고르기 쉽다. 그래도 상수는 둘로 둔다 —
+#: 한쪽만 바꿀 날이 오면 그때 갈라놓는 것이 아니라, 지금 갈라져 있는 채로 같은 값을
+#: 가리키는 편이 그 변경을 안전하게 만든다.
+AI_GENERATION_PRICE = 5
 
-#: AI 거울 한 장. **스티커와 따로 둔다** — 한 값을 공유하면 한쪽을 바꿀 때
-#: 다른 쪽이 조용히 따라 움직인다. 거울은 더 크고 provider 비용도 더 든다.
-DEFAULT_MIRROR_PRICE = 10
+DEFAULT_STICKER_PRICE = AI_GENERATION_PRICE
+
+#: AI 거울 한 장. **등록비(`MarketplacePublishPolicy`)와 다른 값이다** —
+#: 만드는 값과 파는 값을 한 상수로 묶지 않는다.
+DEFAULT_MIRROR_PRICE = AI_GENERATION_PRICE
 
 # 프롬프트 길이 상한. 길다고 좋은 그림이 나오지 않고, provider 요금만 늘어난다.
 MAX_PROMPT_LENGTH = 200

@@ -207,9 +207,9 @@ def test_repeated_generation_is_never_blocked_by_a_daily_quota(service, provider
         result = service.generate(ALICE, "핑크 리본", f"req-{index}")
         assert result.png == b"PNG-BYTES"
 
-    # 다섯 번 전부 provider까지 갔고, 각각 정확히 10조각이다.
+    # 다섯 번 전부 provider까지 갔고, 각각 정확히 5조각이다.
     assert len(provider.prompts) == 5
-    assert balance(shards, ALICE) == before - 50
+    assert balance(shards, ALICE) == before - 25
 
 
 def test_no_quota_state_is_written_anywhere(service, db):
@@ -287,19 +287,33 @@ def test_nothing_is_stored_about_the_prompt(service, db):
     assert "PNG-BYTES" not in str(db.data)
 
 
-def test_price_is_ten_shards(service):
-    """**한 장에 10조각이다.** 값의 authority는 서버다 — 요청에 실을 자리가 없다."""
+def test_price_is_five_shards(service):
+    """**한 장에 5조각이다.** 값의 authority는 서버다 — 요청에 실을 자리가 없다."""
     from app.ai.models import DEFAULT_MIRROR_PRICE
 
-    assert DEFAULT_MIRROR_PRICE == 10
-    assert service.price == 10
+    assert DEFAULT_MIRROR_PRICE == 5
+    assert service.price == 5
 
 
-def test_sticker_price_is_untouched():
-    """거울 값을 정하면서 **스티커 값이 따라 움직이면 안 된다.**"""
-    from app.ai.models import DEFAULT_STICKER_PRICE
+def test_generation_prices_are_unified():
+    """**AI에게 한 장 부탁하는 값은 하나다** — 거울도 스티커도 5조각."""
+    from app.ai.models import (
+        AI_GENERATION_PRICE,
+        DEFAULT_MIRROR_PRICE,
+        DEFAULT_STICKER_PRICE,
+    )
 
-    assert DEFAULT_STICKER_PRICE == 6
+    assert AI_GENERATION_PRICE == 5
+    assert DEFAULT_MIRROR_PRICE == 5
+    assert DEFAULT_STICKER_PRICE == 5
+
+
+def test_publish_fees_did_not_follow():
+    """생성값을 바꾸면서 **등록비가 따라 움직이면 안 된다** — 다른 축이다."""
+    from app.marketplace.models import ContentType, MarketplacePublishPolicy
+
+    assert MarketplacePublishPolicy.fee(ContentType.MIRROR) == 10
+    assert MarketplacePublishPolicy.fee(ContentType.STICKER) == 10
 
 
 def test_mirror_and_sticker_spend_are_distinguishable():
@@ -340,13 +354,13 @@ def balance(shards, user_id: str) -> int:
     return shards.wallet(user_id).balance
 
 
-def test_success_costs_exactly_ten(service, shards, provider):
-    """성공하면 정확히 10조각. 한 번만."""
+def test_success_costs_exactly_five(service, shards, provider):
+    """성공하면 정확히 5조각. 한 번만."""
     before = balance(shards, ALICE)
 
     service.generate(ALICE, "핑크 리본", "req-success")
 
-    assert balance(shards, ALICE) == before - 10
+    assert balance(shards, ALICE) == before - 5
     assert len(provider.prompts) == 1
 
 
@@ -362,17 +376,17 @@ def test_retry_with_the_same_request_id_does_not_charge_twice(service, shards, p
     service.generate(ALICE, "핑크 리본", "req-same")
     service.generate(ALICE, "핑크 리본", "req-same")
 
-    assert balance(shards, ALICE) == before - 10
+    assert balance(shards, ALICE) == before - 5
 
 
-def test_different_requests_each_cost_ten(service, shards):
+def test_different_requests_each_cost_five(service, shards):
     """다른 요청은 각각 값을 낸다 — 멱등이 공짜를 뜻하지 않는다."""
     before = balance(shards, ALICE)
 
     service.generate(ALICE, "핑크 리본", "req-a")
     service.generate(ALICE, "노란 별", "req-b")
 
-    assert balance(shards, ALICE) == before - 20
+    assert balance(shards, ALICE) == before - 10
 
 
 def test_provider_failure_leaves_no_net_loss(service, shards, provider):
@@ -402,7 +416,7 @@ def test_any_failure_after_the_debit_refunds(service, shards, provider):
 def test_insufficient_balance_is_refused_before_the_provider(db, provider, shards):
     """**provider를 부르기 전에** 거절한다. 돈이 없으면 요금이 발생하면 안 된다."""
     poor = "99999999-8888-4777-8666-000000000000"
-    fund(shards, poor, 9)   # 10보다 하나 모자라다
+    fund(shards, poor, 4)   # 5보다 하나 모자라다
     service = AIMirrorService(provider, "test-model", shards=shards)
 
     with pytest.raises(AIStickerError) as error:
@@ -410,7 +424,7 @@ def test_insufficient_balance_is_refused_before_the_provider(db, provider, shard
 
     assert error.value.reason is AIStickerReason.INSUFFICIENT_SHARDS
     assert provider.prompts == []
-    assert balance(shards, poor) == 9
+    assert balance(shards, poor) == 4
 
 
 def test_refund_writes_one_ledger_line(service, shards, shard_store, provider):
