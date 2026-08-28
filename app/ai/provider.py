@@ -157,12 +157,22 @@ class OpenAIImageProvider:
         return self._decode(payload)
 
     def _http_failure(self, error: urllib.error.HTTPError) -> AIStickerError:
-        """상태 코드만 남긴다. **응답 본문을 로그에 넣지 않는다** — 프롬프트가 그대로 되돌아온다.
+        """상태 코드와 **provider가 붙인 분류**를 남긴다.
+
+        본문 전체는 넣지 않는다 — 프롬프트가 그대로 되돌아오고 요청 id도 들어 있다.
+        남기는 것은 `type`/`code` 두 값뿐이고, 그것은 provider가 정한 고정 어휘라
+        사용자 데이터가 아니다.
+
+        **이 두 값이 없으면 400을 구분할 수 없다.** `moderation_blocked`(사용자가
+        고칠 수 있는 것)와 잘못된 요청 모양(우리가 고쳐야 하는 것)이 똑같이
+        "그 설명으로는 만들 수 없어요"로 보인다 — 실기기 QA에서 실제로 그랬다.
 
         400 / 422는 프롬프트 문제(정책 거절 · 형식)이고 재시도해도 같다.
         429와 5xx는 잠시 뒤 되는 것이라 사용자에게 다르게 말해야 한다.
         """
-        logger.warning("ai_provider_http_error status=%d", error.code)
+        logger.warning(
+            "ai_provider_http_error status=%d %s", error.code, _error_labels(error)
+        )
         if error.code in (400, 422):
             return AIStickerError(AIStickerReason.PROVIDER_REJECTED)
         # 401 / 403은 우리 key 문제다. 사용자에게 "다시 해보라"고 하면 안 된다.
@@ -200,3 +210,18 @@ def build_provider(api_key: str, model: str, quality: str = "low") -> ImageProvi
         logger.error("ai_provider_model_unsupported observed_model=%s", model)
         return UnconfiguredProvider()
     return OpenAIImageProvider(api_key=api_key, model=model, quality=quality)
+
+
+def _error_labels(error: urllib.error.HTTPError) -> str:
+    """provider 오류의 **분류만** 꺼낸다. `message`도 요청 id도 꺼내지 않는다.
+
+    OpenAI는 `{"error": {"type": ..., "code": ..., "message": ...}}`를 준다.
+    `message`에는 사람이 읽는 문장과 요청 id가 들어 있어 로그에 넣지 않는다.
+    본문을 못 읽어도 **원래 오류를 덮지 않는다** — 진단이 실패의 이유가 되면 안 된다.
+    """
+    try:
+        payload = json.loads(error.read().decode())
+        found = payload.get("error") or {}
+        return f"provider_type={found.get('type')} provider_code={found.get('code')}"
+    except Exception:  # noqa: BLE001 — 진단은 절대 실패를 바꾸지 않는다
+        return "provider_type=? provider_code=?"

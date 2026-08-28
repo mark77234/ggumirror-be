@@ -135,6 +135,13 @@ class MarketplacePublishPolicy:
     #: **AI 생성 값과 다른 축이다.** 생성은 "만드는 값"(`AI_GENERATION_PRICE`)이고
     #: 이것은 "상점에 내놓는 값"이다. 숫자가 겹쳐 보여도 한 상수로 묶지 않는다 —
     #: 묶으면 한쪽 정책을 바꿀 때 다른 쪽이 조용히 따라 움직인다.
+    #: 운영자가 내렸을 때 판매자에게 주는 보상. **거울·스티커가 같다** —
+    #: 어느 쪽이 내려가든 판매자가 잃은 것은 같은 등록 기회다.
+    #:
+    #: 등록비(10)를 그대로 되돌리지 않는다. 되돌리면 "올렸다 내려가면 손해가 없다"가
+    #: 되어 아무거나 올려 보는 쪽이 이득이고, 심사 비용은 우리가 진다.
+    MODERATION_COMPENSATION: int = 5
+
     FEES: dict[ContentType, int] = {
         ContentType.MIRROR: 10,
         ContentType.STICKER: 10,
@@ -472,6 +479,9 @@ class ModerationResult:
 
     listing: Listing
     changed: bool
+    #: 이번 조치로 판매자에게 실제로 지급된 조각. **요청한 값이 아니라 지급된 값이다** —
+    #: 재시도로 `changed=False`면 0이고, 알림 문구도 이 값을 보고 정한다.
+    compensation: int = 0
 
 
 class ModeratedListing(MarketplaceError):

@@ -428,16 +428,21 @@ class MarketplaceService:
     def admin_takedown(
         self, actor: User, listing_id: str, *, reason: ModerationReason, note: str = ""
     ) -> ModerationResult:
-        """상점에서 내린다. **경제 mutation 0.**
+        """상점에서 내린다. **판매자에게 보상 조각을 준다.**
 
-        지갑도 원장도 소유권도 `downloadCount`도 건드리지 않는다 — 이 경로에
-        `ShardLedgerService`가 들어오지 않는다. 새 유통을 막는 것이지
+        소유권도 `downloadCount`도 건드리지 않는다 — 새 유통을 막는 것이지
         이미 산 사람의 파일을 부수는 것이 아니다.
+
+        보상은 **운영자 조치에만** 붙는다. 판매자가 스스로 내리거나(unpublish)
+        삭제하거나 운영자가 되살리는 경로에는 조각이 없다 — 판매자가 상태를
+        오가며 조각을 만들 수 있으면 그것이 곧 발행 통로다.
         """
-        result = self._store.takedown(listing_id, actor.id, reason, checked_note(note))
+        result = self._store.takedown(
+            listing_id, actor.id, reason, checked_note(note), self._shards
+        )
         logger.info(
-            "marketplace_takedown type=%s reason=%s changed=%s",
-            result.listing.content_type.value, reason.value, result.changed,
+            "marketplace_takedown type=%s reason=%s changed=%s compensation=%d",
+            result.listing.content_type.value, reason.value, result.changed, result.compensation,
         )
         return result
 

@@ -201,3 +201,66 @@ def test_provider_error_log_has_no_prompt_or_key(monkeypatch, caplog):
 
     assert "sk-secret-key" not in caplog.text
     assert "비밀 프롬프트" not in caplog.text
+
+
+# MARK: - provider 오류 분류 (Device QA)
+#
+# 실기기에서 `스파이더맨`이 거절됐는데 로그에 `status=400`만 있어서, 그것이
+# 안전 정책인지 우리 요청 모양이 틀린 것인지 알 수 없었다. 이제 provider가
+# 붙인 분류를 남긴다 — 프롬프트도 요청 id도 남기지 않는다.
+
+
+def _labels(body: bytes | str, status: int = 400) -> str:
+    import io
+    import urllib.error
+    from app.ai.provider import _error_labels
+
+    payload = body.encode() if isinstance(body, str) else body
+    return _error_labels(
+        urllib.error.HTTPError("https://x", status, "Bad Request", {}, io.BytesIO(payload))
+    )
+
+
+def test_provider_error_labels_capture_the_classification():
+    """production이 실제로 돌려준 모양이다(안전 정책 거절)."""
+    found = _labels(
+        '{"error":{"type":"image_generation_user_error","code":"moderation_blocked",'
+        '"message":"Your request was rejected by the safety system. ... req_abc123"}}'
+    )
+    assert found == "provider_type=image_generation_user_error provider_code=moderation_blocked"
+
+
+def test_provider_error_labels_never_leak_the_message():
+    """`message`에는 사람이 읽는 문장과 **요청 id**가 들어 있다. 로그에 넣지 않는다."""
+    found = _labels(
+        '{"error":{"type":"invalid_request_error","code":null,'
+        '"message":"핑크 리본 거울 ... req_secret"}}'
+    )
+    assert "req_secret" not in found
+    assert "핑크" not in found
+    assert found == "provider_type=invalid_request_error provider_code=None"
+
+
+def test_unreadable_provider_body_does_not_break_the_failure():
+    """진단이 실패의 이유가 되면 안 된다 — 본문을 못 읽어도 조용히 넘어간다."""
+    assert _labels("not json") == "provider_type=? provider_code=?"
+    assert _labels("") == "provider_type=? provider_code=?"
+
+
+def test_the_status_still_decides_the_reason():
+    """분류를 남기는 것이 **매핑을 바꾸지 않는다.** 400/422는 여전히 프롬프트 문제다."""
+    import io
+    import urllib.error
+    from app.ai.models import AIStickerReason
+    from app.ai.provider import OpenAIImageProvider
+
+    provider = OpenAIImageProvider(api_key="k", model="gpt-image-2")
+    for status, expected in (
+        (400, AIStickerReason.PROVIDER_REJECTED),
+        (422, AIStickerReason.PROVIDER_REJECTED),
+        (401, AIStickerReason.NOT_CONFIGURED),
+        (500, AIStickerReason.PROVIDER_UNAVAILABLE),
+        (429, AIStickerReason.PROVIDER_UNAVAILABLE),
+    ):
+        error = urllib.error.HTTPError("https://x", status, "", {}, io.BytesIO(b"{}"))
+        assert provider._http_failure(error).reason is expected

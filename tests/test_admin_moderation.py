@@ -36,7 +36,7 @@ from app.marketplace.models import (
     TerminalListing,
 )
 from app.marketplace.service import MarketplaceService
-from app.marketplace.store import InMemoryMarketplaceStore
+from app.marketplace.store import InMemoryMarketplaceStore, _takedown_event
 from app.shards.models import ShardReason
 from app.shards.service import ShardLedgerService
 from app.shards.store import InMemoryShardStore
@@ -107,11 +107,18 @@ def published(
     return service.publish(user(SELLER), draft.id).listing
 
 
-def economy(shard_store, store) -> dict:
-    """조치 전후를 통째로 비교하는 스냅샷."""
+def economy(shard_store, store, *, exclude: set[str] = frozenset()) -> dict:
+    """조치 전후를 통째로 비교하는 스냅샷.
+
+    `exclude`는 **움직여도 되는 지갑**이다. 조치 보상이 생긴 뒤에도 "구매자와
+    counter는 한 자리도 안 움직인다"를 그대로 시험하기 위한 것이고, 판매자 지갑은
+    따로 정확한 값으로 확인한다 — 통째 비교에서 빼는 것으로 끝내지 않는다.
+    """
     return {
-        "wallets": {x: shard_store.wallets[x].balance for x in shard_store.wallets},
-        "ledger": len(shard_store.entries),
+        "wallets": {
+            x: shard_store.wallets[x].balance
+            for x in shard_store.wallets if x not in exclude
+        },
         "ownership": sorted(store.ownership_records),
         "downloads": {k: v.download_count for k, v in store.listings.items()},
         "likes": {k: v.like_count for k, v in store.listings.items()},
@@ -219,7 +226,8 @@ def test_existing_buyer_keeps_everything(service, store, shards, shard_store, ki
     listing = published(service, store, shards, kind=kind, price=5)
     seed(shards, BUYER, 50)
     service.purchase(user(BUYER), listing.id)
-    before = economy(shard_store, store)
+    before = economy(shard_store, store, exclude={SELLER})
+    seller_before = shards.wallet(SELLER).balance
 
     service.admin_takedown(user(OPERATOR), listing.id, reason=ModerationReason.INAPPROPRIATE)
 
@@ -228,8 +236,11 @@ def test_existing_buyer_keeps_everything(service, store, shards, shard_store, ki
     assert [o.listing_id for o, _ in service.purchases(user(BUYER))] == [listing.id]
     # snapshot 문서도 GCS object도 지우지 않는다.
     assert store.snapshots[listing.snapshot_id].is_complete
-    # 경제가 한 자리도 움직이지 않았다.
-    assert economy(shard_store, store) == before
+    # **구매자 쪽은 한 자리도 움직이지 않는다.** 되돌리는 것은 구매가 아니다 —
+    # 산 사람은 낸 것도 받은 것도 그대로다.
+    assert economy(shard_store, store, exclude={SELLER}) == before
+    # 판매자에게만 보상이 얹힌다.
+    assert shards.wallet(SELLER).balance == seller_before + 5
 
 
 def test_moderated_listing_still_reaches_its_buyer(service, store, shards):
@@ -244,18 +255,24 @@ def test_moderated_listing_still_reaches_its_buyer(service, store, shards):
     assert store.ownership(listing.id, BUYER) is not None
 
 
-def test_takedown_does_not_touch_the_economy(service, store, shards, shard_store):
-    """지갑 · 원장 · counter가 그대로다. **이 경로에 조각 service가 들어오지 않는다.**"""
+def test_takedown_only_moves_the_seller_wallet(service, store, shards, shard_store):
+    """소유권 · `downloadCount` · `likeCount` · 구매자 지갑이 그대로다.
+
+    조치가 건드리는 경제는 **판매자 보상 하나**뿐이고, 되살려도 그것을 회수하지 않는다.
+    """
     listing = published(service, store, shards, price=5)
     seed(shards, BUYER, 50)
     service.purchase(user(BUYER), listing.id)
     service.like(user(BUYER), listing.id)
-    before = economy(shard_store, store)
+    before = economy(shard_store, store, exclude={SELLER})
+    seller_before = shards.wallet(SELLER).balance
 
     service.admin_takedown(user(OPERATOR), listing.id, reason=ModerationReason.SPAM)
     service.admin_restore(user(OPERATOR), listing.id)
 
-    assert economy(shard_store, store) == before
+    assert economy(shard_store, store, exclude={SELLER}) == before
+    # 되살리기는 **회수하지 않는다.** 내려가 있던 동안은 실제로 팔리지 않았다.
+    assert shards.wallet(SELLER).balance == seller_before + 5
 
 
 def test_unlike_does_not_clear_a_takedown(service, store, shards):
@@ -467,11 +484,20 @@ def test_note_is_bounded(service, store, shards):
 
 
 def test_moderation_events_are_not_the_shard_ledger(shard_store, service, store, shards):
-    """조치 기록이 **조각 원장에 섞이지 않는다.** 섞이면 잔액 감사에서 잡음이 된다."""
+    """조치 기록이 **조각 원장에 섞이지 않는다.** 섞이면 잔액 감사에서 잡음이 된다.
+
+    보상 조각은 원장에 한 줄로 들어가지만, 그것은 **조각이 움직였다는 사실**이고
+    조치 기록(사유 · 운영자 · 메모)은 여전히 `moderation_event_log`에만 있다.
+    """
     listing = published(service, store, shards)
     before = len(shard_store.entries)
     service.admin_takedown(user(OPERATOR), listing.id, reason=ModerationReason.SPAM)
-    assert len(shard_store.entries) == before
+
+    added = shard_store.entries[before:]
+    assert [x.reason for x in added] == [ShardReason.MARKETPLACE_MODERATION_COMPENSATION]
+    # 사유 · 운영자 · 메모는 원장으로 새지 않는다 — 원장에는 그런 자리가 없다.
+    assert not hasattr(added[0], "reason_label")
+    assert len(store.moderation_event_log) == 1
 
 
 # MARK: - 목록 (§13 · §14 · §39)
@@ -1109,3 +1135,185 @@ def test_firestore_document_round_trips_moderation(fs):
     assert again.moderation_status is ModerationStatus.REMOVED
     assert again.moderation_reason is ModerationReason.COPYRIGHT
     assert again.moderated_by == OPERATOR
+
+
+# MARK: - 조치 보상 (Device QA)
+#
+# 운영자가 내리면 판매자에게 **5조각**을 준다. 구매 환불이 아니다 —
+# 산 사람은 그대로 갖고 있고, 판매자가 잃은 것은 등록 기회다.
+#
+# **운영자 조치에만 붙는다.** 판매자가 스스로 내리거나 삭제해서 조각을 만들 수
+# 있으면 그것이 곧 발행 통로다.
+
+
+COMPENSATION = 5
+
+
+@pytest.mark.parametrize("kind", [ContentType.MIRROR, ContentType.STICKER])
+def test_takedown_pays_the_seller(service, store, shards, kind):
+    """거울도 스티커도 **같은 값**이다 — 어느 쪽이든 잃은 것은 같은 등록 기회다."""
+    listing = published(service, store, shards, kind=kind)
+    before = shards.wallet(SELLER).balance
+
+    result = service.admin_takedown(user(OPERATOR), listing.id, reason=ModerationReason.SPAM)
+
+    assert result.compensation == COMPENSATION
+    assert shards.wallet(SELLER).balance == before + COMPENSATION
+
+
+def test_compensation_has_its_own_ledger_reason(service, store, shards, shard_store):
+    """원장만 보고 무엇이었는지 알 수 있어야 한다 — `refund`와 섞지 않는다."""
+    listing = published(service, store, shards)
+    service.admin_takedown(user(OPERATOR), listing.id, reason=ModerationReason.OTHER)
+
+    paid = [x for x in shard_store.entries if x.user_id == SELLER][-1]
+    assert paid.reason is ShardReason.MARKETPLACE_MODERATION_COMPENSATION
+    assert paid.delta == COMPENSATION
+
+
+def test_retrying_the_same_takedown_pays_once(service, store, shards):
+    """연타·재시도. **`changed=False`이고 조각은 그대로다.**"""
+    listing = published(service, store, shards)
+    before = shards.wallet(SELLER).balance
+
+    first = service.admin_takedown(user(OPERATOR), listing.id, reason=ModerationReason.SPAM)
+    again = service.admin_takedown(user(OPERATOR), listing.id, reason=ModerationReason.SPAM)
+
+    assert (first.compensation, again.compensation) == (COMPENSATION, 0)
+    assert shards.wallet(SELLER).balance == before + COMPENSATION
+    # 조치 기록도 하나뿐이다.
+    assert len(store.moderation_event_log) == 1
+
+
+def test_toggling_takedown_and_restore_cannot_mint_shards(service, store, shards):
+    """**가장 중요한 test다.** 내렸다 되살렸다를 반복해도 보상은 한 번뿐이다.
+
+    열쇠가 listing id 하나라서 원장이 두 번째부터 막는다. 조치 기록은 그대로
+    쌓이므로 몇 번 내려갔는지는 여전히 알 수 있다 — 감사와 지급을 분리한다.
+    """
+    listing = published(service, store, shards)
+    before = shards.wallet(SELLER).balance
+
+    for _ in range(5):
+        service.admin_takedown(user(OPERATOR), listing.id, reason=ModerationReason.SPAM)
+        service.admin_restore(user(OPERATOR), listing.id)
+
+    assert shards.wallet(SELLER).balance == before + COMPENSATION
+    assert len(store.moderation_event_log) == 10  # 조치 기록은 전부 남는다
+
+
+def test_the_notice_mentions_the_shards_only_when_they_were_paid(service, store, shards):
+    listing = published(service, store, shards)
+    service.admin_takedown(user(OPERATOR), listing.id, reason=ModerationReason.SPAM)
+
+    notice = _takedown_event(store.any_listing(listing.id), ModerationReason.SPAM, COMPENSATION)
+    assert f"{COMPENSATION}조각이 지급됐어요." in notice.body
+    # 지급되지 않았으면 그 말을 하지 않는다.
+    assert "조각" not in _takedown_event(
+        store.any_listing(listing.id), ModerationReason.SPAM, 0
+    ).body
+
+
+def test_only_the_seller_is_paid(service, store, shards):
+    """엉뚱한 지갑이 늘지 않는다."""
+    listing = published(service, store, shards, price=5)
+    seed(shards, BUYER, 50)
+    service.purchase(user(BUYER), listing.id)
+    buyer_before = shards.wallet(BUYER).balance
+    operator_before = shards.wallet(OPERATOR).balance
+
+    service.admin_takedown(user(OPERATOR), listing.id, reason=ModerationReason.SPAM)
+
+    assert shards.wallet(BUYER).balance == buyer_before
+    assert shards.wallet(OPERATOR).balance == operator_before
+
+
+def test_seller_unpublish_pays_nothing(service, store, shards):
+    """판매자가 스스로 내린 것은 보상 대상이 아니다."""
+    listing = published(service, store, shards)
+    before = shards.wallet(SELLER).balance
+
+    service.unpublish(user(SELLER), listing.id)
+
+    assert shards.wallet(SELLER).balance == before
+
+
+def test_seller_delete_pays_nothing(service, store, shards):
+    listing = published(service, store, shards)
+    before = shards.wallet(SELLER).balance
+
+    service.delete_listing(user(SELLER), listing.id)
+
+    assert shards.wallet(SELLER).balance == before
+
+
+def test_restore_pays_nothing_on_its_own(service, store, shards):
+    listing = published(service, store, shards)
+    service.admin_takedown(user(OPERATOR), listing.id, reason=ModerationReason.SPAM)
+    before = shards.wallet(SELLER).balance
+
+    service.admin_restore(user(OPERATOR), listing.id)
+
+    assert shards.wallet(SELLER).balance == before
+
+
+def test_a_failed_takedown_pays_nothing(service, store, shards):
+    """없는 상품을 내리려 하면 아무 지갑도 움직이지 않는다."""
+    published(service, store, shards)
+    before = {x: shards.wallet(x).balance for x in (SELLER, BUYER, OPERATOR)}
+
+    with pytest.raises(ListingNotFound):
+        service.admin_takedown(user(OPERATOR), "없는-id", reason=ModerationReason.SPAM)
+
+    assert {x: shards.wallet(x).balance for x in before} == before
+
+
+def test_firestore_takedown_reads_the_wallet_before_it_writes():
+    """Firestore transaction은 **쓰기 뒤 읽기를 허용하지 않는다.**
+
+    보상은 원장과 지갑을 읽으므로 `transaction.update`보다 앞이어야 한다.
+    한 줄만 옮겨도 production에서 조치가 통째로 실패하는데, 그때는 상품이
+    내려가지도 않는다 — 그래서 순서를 소스에서 고정한다.
+    """
+    import io
+    import tokenize
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parent.parent / "app/marketplace/firestore_store.py"
+    ).read_text()
+    start = source.index("def takedown(")
+    body = source[start:source.index("\n    def ", 1 + start)]
+    code = "".join(
+        t.string
+        for t in tokenize.generate_tokens(io.StringIO(body).readline)
+        if t.type not in (tokenize.COMMENT, tokenize.STRING)
+    )
+
+    assert code.index("self._compensate(") < code.index("transaction.update(")
+    # 보상 값은 알림보다 먼저 정해진다 — 알림 문구가 그 값을 쓴다.
+    assert code.index("self._compensate(") < code.index("_takedown_event(")
+
+
+def test_compensation_is_not_a_public_mutation_endpoint():
+    """운영자 조치 말고는 이 이유로 조각을 움직일 통로가 없다."""
+    import io
+    import tokenize
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    reason = "MARKETPLACE_MODERATION_COMPENSATION"
+    callers = []
+    for path in ["app/api/marketplace.py", "app/api/admin.py", "app/api/users.py",
+                 "app/marketplace/service.py", "app/marketplace/store.py",
+                 "app/marketplace/firestore_store.py"]:
+        code = "".join(
+            t.string
+            for t in tokenize.generate_tokens(io.StringIO((root / path).read_text()).readline)
+            if t.type not in (tokenize.COMMENT, tokenize.STRING)
+        )
+        if reason in code:
+            callers.append(path)
+
+    # 두 저장소 구현뿐이다. API도 service도 이 이유를 직접 쓰지 않는다.
+    assert callers == ["app/marketplace/store.py", "app/marketplace/firestore_store.py"]

@@ -52,7 +52,7 @@ from app.notifications.models import (
     sale_event_id,
     takedown_event_id,
 )
-from app.shards.models import utcnow
+from app.shards.models import ShardReason, utcnow
 from app.shards.service import ShardLedgerService
 
 LISTINGS = "ggumirror_marketplace_listings"
@@ -204,12 +204,14 @@ class MarketplaceStore(Protocol):
 
     def takedown(
         self, listing_id: str, actor_user_id: str,
-        reason: ModerationReason, note: str,
+        reason: ModerationReason, note: str, shards=None,
     ) -> ModerationResult:
-        """운영자가 내린다. **상태 변경 · 재등록 차단 · 기록이 한 commit이다.**
+        """운영자가 내린다. **상태 · 차단 · 기록 · 알림 · 보상이 한 commit이다.**
 
-        경제를 건드리지 않는다 — 지갑 · 원장 · 소유권 · `downloadCount`가 그대로다.
-        이미 내려가 있으면 아무것도 쓰지 않고 `changed=False`다(기록도 안 남긴다).
+        소유권 · `downloadCount`는 그대로다 — 이미 산 사람의 권리는 운영 조치와
+        무관하다. 판매자 지갑에는 보상 조각이 얹힌다(`shards`가 있을 때만).
+
+        이미 내려가 있으면 아무것도 쓰지 않고 `changed=False`다(기록도 보상도 없다).
         """
 
     def restore(self, listing_id: str, actor_user_id: str) -> ModerationResult:
@@ -570,13 +572,13 @@ class InMemoryMarketplaceStore:
 
     def takedown(
         self, listing_id: str, actor_user_id: str,
-        reason: ModerationReason, note: str,
+        reason: ModerationReason, note: str, shards=None,
     ) -> ModerationResult:
         with self._lock:
             listing = self.any_listing(listing_id)
             if listing.is_moderated:
                 # 이미 내려가 있다. **기록을 남기지 않는다** — 연타가 감사 기록을 채우면
-                # 진짜 조치가 언제였는지 알 수 없게 된다.
+                # 진짜 조치가 언제였는지 알 수 없게 된다. 보상도 여기서 끝난다.
                 return ModerationResult(listing=listing, changed=False)
 
             now = utcnow()
@@ -588,14 +590,36 @@ class InMemoryMarketplaceStore:
                 moderated_by=actor_user_id,
                 updated_at=now,
             )
-            self.listings[listing_id] = removed
-            self._block_source(removed)
-            self._record(removed, ModerationAction.TAKEDOWN, actor_user_id, reason, note, now)
-            # **판매자가 이유를 알아야 한다.** 상태만 바꾸고 말하지 않으면
-            # 판매자는 자기 상품이 왜 사라졌는지 알 방법이 없다.
-            if self._notifications is not None:
-                self._notifications.create(_takedown_event(removed, reason))
-            return ModerationResult(listing=removed, changed=True)
+            with self._shard_store.transaction() as tx:
+                paid = self._compensate(tx, removed, shards)
+                self.listings[listing_id] = removed
+                self._block_source(removed)
+                self._record(removed, ModerationAction.TAKEDOWN, actor_user_id, reason, note, now)
+                # **판매자가 이유를 알아야 한다.** 상태만 바꾸고 말하지 않으면
+                # 판매자는 자기 상품이 왜 사라졌는지 알 방법이 없다.
+                if self._notifications is not None:
+                    self._notifications.create(_takedown_event(removed, reason, paid))
+            return ModerationResult(listing=removed, changed=True, compensation=paid)
+
+    def _compensate(self, tx, listing: Listing, shards) -> int:
+        """판매자에게 보상 조각을 얹는다. **열쇠는 listing id 하나다.**
+
+        `changed=False`가 이미 연타를 막지만, 그것만으로는 부족하다 —
+        운영자가 내렸다 되살렸다를 반복하면 그때마다 새 조치이고, 열쇠가 조치마다
+        다르면 조각이 그만큼 발행된다. **한 상품이 내려간 것에 대한 보상은 한 번**이라
+        정하면 그 통로가 아예 없다. 조치 기록(`moderation_event_log`)은 그대로
+        전부 남으므로 몇 번 내려갔는지는 여전히 알 수 있다.
+        """
+        if shards is None or MarketplacePublishPolicy.MODERATION_COMPENSATION <= 0:
+            return 0
+        result = shards.apply_in_transaction(
+            shards.context(tx),
+            listing.seller_user_id,
+            MarketplacePublishPolicy.MODERATION_COMPENSATION,
+            ShardReason.MARKETPLACE_MODERATION_COMPENSATION,
+            listing.id,
+        )
+        return MarketplacePublishPolicy.MODERATION_COMPENSATION if result.applied else 0
 
     def restore(self, listing_id: str, actor_user_id: str) -> ModerationResult:
         with self._lock:
@@ -707,17 +731,24 @@ TAKEDOWN_REASON_LABELS: dict[ModerationReason, str] = {
 }
 
 
-def _takedown_event(listing: Listing, reason: ModerationReason) -> NotificationEvent:
+def _takedown_event(
+    listing: Listing, reason: ModerationReason, compensation: int = 0
+) -> NotificationEvent:
     """조치 알림 하나. **판매자에게만** 간다.
 
     제목은 **내려간 그때의 값**을 복사한다(판매 알림과 같은 규칙) — 나중에 제목이
     바뀌어도 기록은 그때 내려간 것을 가리켜야 한다.
+
+    조각 이야기는 **실제로 지급됐을 때만** 적는다(`compensation > 0`). 지급되지
+    않았는데 "지급됐어요"라고 하면 지갑을 열어 본 판매자가 우리를 못 믿게 된다.
     """
     noun = "스티커" if listing.content_type is ContentType.STICKER else "거울"
     label = TAKEDOWN_REASON_LABELS.get(reason)
     body = f"상점 운영 정책에 따라 등록한 {noun}이 내려갔어요."
     if label:
         body = f"{body}\n사유: {label}"
+    if compensation > 0:
+        body = f"{body}\n{compensation}조각이 지급됐어요."
     return NotificationEvent(
         id=takedown_event_id(listing.id),
         user_id=listing.seller_user_id,

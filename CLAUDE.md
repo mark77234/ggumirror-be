@@ -694,6 +694,39 @@ create 경로만 claim을 만들면 그 index는 과거를 모른다.
   실제 collision이 없어서, 새 규칙을 넣으면서 migration을 돌릴 필요가 없었다.
   `seed_display_name`은 이미 쓰이는 이름이면 조용히 넘어간다
 
+### 운영자가 내리면 판매자에게 5조각을 준다 (Device QA)
+
+**구매 환불이 아니다.** 산 사람은 그대로 갖고 있고, 판매자가 잃은 것은 등록 기회다.
+그래서 이유도 따로 둔다 — `marketplace_moderation_compensation`.
+`refund`(AI 복구) · `iap_refund`(Apple 환불)와 섞으면 원장에서 셋을 구분할 수 없다.
+
+| | |
+|---|---|
+| 값 | **5조각.** 거울·스티커가 같다 |
+| 권한 | **운영자 조치에만** 붙는다 |
+| 열쇠 | `listing_id` 하나 — **한 상품에 한 번** |
+| commit | 상태 · 차단 · 기록 · 알림 · 보상이 **하나의 transaction** |
+
+등록비(10)를 그대로 되돌리지 않는다. 되돌리면 "올렸다 내려가도 손해가 없다"가 되어
+아무거나 올려 보는 쪽이 이득이고 심사 비용은 우리가 진다.
+
+**조각이 붙지 않는 경로**: 판매자 unpublish · 판매자 delete · admin restore ·
+publish 실패 · 이미 내려간 것 재요청(`changed=False`).
+
+#### 왜 열쇠가 moderation event가 아니라 listing인가
+
+`changed=False`가 연타를 막지만 그것만으로는 부족하다 — 운영자가 내렸다 되살렸다를
+반복하면 **그때마다 새 조치**이고, 열쇠가 조치마다 다르면 조각이 그만큼 발행된다.
+"한 상품이 내려간 것에 대한 보상은 한 번"으로 정하면 그 통로가 아예 없다.
+
+조치 기록(`ggumirror_marketplace_moderation_events`)은 **전부 그대로 쌓인다** —
+몇 번 내려갔는지는 여전히 알 수 있다. **감사와 지급을 분리한다.**
+
+⚠️ Firestore transaction은 쓰기 뒤 읽기를 허용하지 않는다. 보상은 원장·지갑을
+읽으므로 `transaction.update`보다 **앞**이어야 하고, 한 줄만 옮겨도 조치가 통째로
+실패한다(그때는 상품이 내려가지도 않는다). `test_firestore_takedown_reads_the_wallet_before_it_writes`가
+소스에서 그 순서를 고정한다.
+
 ### 상품이 내려가면 판매자에게 알린다 (Device QA)
 
 운영자가 `takedown`하면 **같은 transaction에서** 알림을 쌓는다
@@ -705,6 +738,8 @@ create 경로만 claim을 만들면 그 index는 과거를 모른다.
   하는지 알 수 없다
 - **판매자에게만** 간다. 구매자·다른 사용자에게 가지 않는다
 - event id가 listing 기준이라 재시도해도 **한 번**이다
+- **조각 이야기는 실제로 지급됐을 때만** 적는다(`compensation > 0`).
+  지급되지 않았는데 "지급됐어요"라고 하면 지갑을 열어 본 판매자가 우리를 못 믿는다
 
 ### Marketplace 등록 (B-7C)
 
@@ -1457,6 +1492,30 @@ capability probe로 확인한 사실:
 
 `SUPPORTED_MODELS` 기준도 "투명을 지원하는가"에서 "우리 요청 모양으로 PNG를 주는 것이
 확인됐는가"로 바뀌었다. 모르는 model이면 여전히 fail closed다.
+
+#### provider 오류는 **분류까지** 남긴다 (Device QA)
+
+`status=400`만 남기면 400을 구분할 수 없다 — 안전 정책 거절(사용자가 고칠 수 있다)과
+잘못된 요청 모양(우리가 고쳐야 한다)이 똑같이 "만들 수 없어요"로 보인다.
+실기기 QA에서 실제로 그랬다.
+
+이제 `provider_type` · `provider_code`를 함께 남긴다. provider가 정한 **고정 어휘**라
+사용자 데이터가 아니다. **`message`는 넣지 않는다** — 사람이 읽는 문장과 요청 id가
+들어 있고, 프롬프트가 되돌아올 수도 있다. 본문을 못 읽어도 원래 오류를 덮지 않는다.
+
+확인된 실제 응답(2026-08-28, `gpt-image-2`):
+
+```
+HTTP 400
+type=image_generation_user_error  code=moderation_blocked
+message="Your request was rejected by the safety system. ... req_..."
+```
+
+**저작권/IP라고 말하지 않는다.** provider는 이유를 나누지 않으므로
+우리도 단정하지 않는다 — 문구는 중립적으로
+`이 요청은 이미지 생성 정책에 따라 처리하기 어려워요.`이고,
+무엇을 바꾸면 되는지(색상 · 분위기 · 패턴)만 덧붙인다.
+**프롬프트를 몰래 바꿔 필터를 우회하지 않는다.**
 
 #### provider — 추측하지 않고 확인한 것만
 

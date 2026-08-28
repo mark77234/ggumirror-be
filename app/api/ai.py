@@ -37,7 +37,13 @@ MESSAGES = {
     AIStickerReason.EMPTY_PROMPT: "만들고 싶은 스티커를 적어 주세요.",
     AIStickerReason.PROMPT_TOO_LONG: f"설명은 {MAX_PROMPT_LENGTH}자까지 쓸 수 있어요.",
     AIStickerReason.INVALID_REQUEST_ID: "요청을 만들지 못했어요. 다시 시도해 주세요.",
-    AIStickerReason.PROVIDER_REJECTED: "그 설명으로는 만들 수 없어요. 다르게 적어 주세요.",
+    # provider가 **입력 단계에서** 거절했다(OpenAI `moderation_blocked`).
+    # provider는 이유를 나누지 않는다 — 저작권인지 안전인지 알려주지 않으므로
+    # **우리도 단정하지 않는다.** 대신 무엇을 바꾸면 되는지만 말한다.
+    AIStickerReason.PROVIDER_REJECTED: (
+        "이 요청은 이미지 생성 정책에 따라 처리하기 어려워요. "
+        "특정 캐릭터나 브랜드 이름 대신 원하는 색상, 분위기, 패턴을 적어 주세요."
+    ),
     AIStickerReason.PROVIDER_UNAVAILABLE: "지금은 만들지 못했어요. 잠시 뒤 다시 시도해 주세요.",
     AIStickerReason.INSUFFICIENT_SHARDS: "거울조각이 모자라요.",
     AIStickerReason.STORAGE_FAILED: "만든 그림을 저장하지 못했어요. 조각은 돌려드렸어요.",

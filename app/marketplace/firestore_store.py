@@ -55,7 +55,7 @@ from app.marketplace.store import (
 )
 from app.notifications.firestore_store import _document as _notification_document
 from app.notifications.store import NOTIFICATIONS
-from app.shards.models import utcnow
+from app.shards.models import ShardReason, utcnow
 from app.shards.service import ShardLedgerService
 
 logger = logging.getLogger(__name__)
@@ -601,12 +601,15 @@ class FirestoreMarketplaceStore:
 
     def takedown(
         self, listing_id: str, actor_user_id: str,
-        reason: ModerationReason, note: str,
+        reason: ModerationReason, note: str, shards=None,
     ) -> ModerationResult:
-        """**상태 · 재등록 차단 · 기록이 하나의 commit이다.**
+        """**상태 · 재등록 차단 · 기록 · 알림 · 보상이 하나의 commit이다.**
 
-        지갑 · 원장 · 소유권 · counter를 건드리지 않는다 — 이 경로에
-        `ShardLedgerService`가 아예 들어오지 않는다.
+        판매자 보상(+5)이 여기에 들어왔다. 밖에서 주면 "상품은 내려갔는데 보상은
+        안 온" 상태가 생기고, 그것을 나중에 메울 방법이 없다.
+
+        소유권 · `downloadCount`는 여전히 건드리지 않는다 — 이미 산 사람의 권리는
+        운영 조치와 무관하다.
         """
         listing_ref = self._db.collection(LISTINGS).document(listing_id)
 
@@ -620,6 +623,11 @@ class FirestoreMarketplaceStore:
 
             # 읽기를 전부 먼저. 차단 열쇠를 만들려면 원본 id가 필요하다.
             source = self._source_content_id(listing, transaction)
+
+            # **조각도 읽기 단계에서 얹는다** — `apply_in_transaction`이 원장과 지갑을
+            # 읽고 쓰기를 예약하므로, marketplace 문서 쓰기보다 앞이어야 한다.
+            # attempt마다 새 context다(B-7B.1: ABORTED 재시도가 같은 객체를 다시 쓴다).
+            paid = self._compensate(transaction, listing, shards)
 
             now = utcnow()
             transaction.update(
@@ -648,7 +656,7 @@ class FirestoreMarketplaceStore:
             # **판매자 알림도 같은 commit이다.** 상태만 바꾸고 말하지 않으면
             # 판매자는 자기 상품이 왜 사라졌는지 알 방법이 없다.
             # 문서 자리가 listing id에서 나오므로 재시도가 알림을 두 번 만들지 않는다.
-            notice = _takedown_event(listing, reason)
+            notice = _takedown_event(listing, reason, paid)
             transaction.set(
                 self._db.collection(NOTIFICATIONS).document(notice.id),
                 _notification_document(notice),
@@ -663,12 +671,31 @@ class FirestoreMarketplaceStore:
                     updated_at=now,
                 ),
                 changed=True,
+                compensation=paid,
             )
 
         try:
             return run(self._db.transaction())
         except gcp_exceptions.GoogleAPIError as error:
             raise self._unavailable("listing_takedown", error) from error
+
+    def _compensate(self, transaction, listing: Listing, shards) -> int:
+        """판매자 보상. **열쇠는 listing id 하나다** — 한 상품에 한 번.
+
+        운영자가 내렸다 되살렸다를 반복해도 조각이 그만큼 발행되지 않는다.
+        조치 기록은 그대로 전부 남으므로 몇 번 내려갔는지는 여전히 알 수 있다.
+        (in-memory 저장소와 **같은 규칙**이다 — 두 벌로 갈라지면 안 된다.)
+        """
+        if shards is None or MarketplacePublishPolicy.MODERATION_COMPENSATION <= 0:
+            return 0
+        result = shards.apply_in_transaction(
+            shards.context(transaction),
+            listing.seller_user_id,
+            MarketplacePublishPolicy.MODERATION_COMPENSATION,
+            ShardReason.MARKETPLACE_MODERATION_COMPENSATION,
+            listing.id,
+        )
+        return MarketplacePublishPolicy.MODERATION_COMPENSATION if result.applied else 0
 
     def restore(self, listing_id: str, actor_user_id: str) -> ModerationResult:
         listing_ref = self._db.collection(LISTINGS).document(listing_id)

@@ -55,6 +55,10 @@ class ShardReason(StrEnum):
     #
     # `mirror_publish_fee`라는 이름은 **바꾸지 않는다.** 값을 rename하면 과거 원장을
     # 읽는 코드가 조용히 깨진다. (production 원장에 아직 0건이지만 규칙은 규칙이다.)
+    #: 운영자가 상품을 내렸을 때 판매자에게 주는 보상. **구매 환불이 아니다** —
+    #: 산 사람은 그대로 갖고 있고, 되돌리는 것은 등록비 쪽이다. 그래서
+    #: `refund` · `iap_refund`와 섞지 않는다(원장에서 셋을 구분할 수 있어야 한다).
+    MARKETPLACE_MODERATION_COMPENSATION = "marketplace_moderation_compensation"
     MIRROR_PUBLISH_FEE = "mirror_publish_fee"
     STICKER_PUBLISH_FEE = "sticker_publish_fee"
     # AI 생성 실패 복구(A-1B). **Apple 환불에 재사용하지 않는다** — 다른 사건이다.
