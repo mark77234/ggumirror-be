@@ -666,6 +666,30 @@ Firestore의 all-or-nothing을 흉내 내야 "구매자만 차감된 상태가 �
 - **이름 namespace는 거울과 스티커가 공유한다.** 같은 상점에 같은 이름이 둘 있으면
   사는 사람이 구분할 수 없다
 - 겹치면 **409**이고 client가 사용자 말로 옮긴다. 자동 rename하지 않는다
+
+#### ⚠️ claim collection이 **유일한** authority다 — 그래서 backfill이 필요했다
+
+`set_display_name`도 `publish`도 사용자 문서나 listing을 다시 훑지 않는다.
+빠르고 동시성이 정확하고 composite index가 필요 없지만, 대가가 하나 있다:
+**규칙보다 먼저 만들어진 이름은 자리를 잡고 있지 않다.**
+
+그대로 출시했으면 기존 `byeongchan`이 있는데도 새 사용자가 `byeongchan`을,
+기존 `풍경 거울`이 있는데도 새 상품이 `풍경 거울`을 그대로 가져갔다.
+`tests/test_name_claim_backfill.py`의 `..._is_unprotected_without_a_claim` 두 개가
+그 구멍을 재현해 놓았다 — **그 테스트가 실패하기 시작하면** 다른 방어가 생겼다는
+뜻이므로 backfill 전제를 다시 판단한다.
+
+`scripts/backfill_name_claims.py`가 **기존 값을 그대로** index에 넣는다.
+이름 변경 · 제목 변경 · 삭제 · 승자 선택을 하지 않고, 겹치는 것이 하나라도 보이면
+**아무것도 쓰지 않고 멈춘다** — 누구의 이름인지는 사람이 정할 문제다.
+`create()`로 하나씩 쓰므로 두 번 돌려도 결과가 같고, 그 사이에 실제 사용자가
+자리를 잡았으면 그쪽이 이긴다.
+
+2026-08-28 production 실행: username claim 1개 · listing title claim 6개 생성,
+conflict 0 · owner mismatch 0 · **user/listing 문서 write 0**.
+
+**앞으로 uniqueness claim을 새로 도입할 때는 기존 데이터 backfill을 같은 단계에서 한다.**
+create 경로만 claim을 만들면 그 index는 과거를 모른다.
 - **기존 데이터를 고치지 않았다.** production audit 결과 published 상품과 사용자 이름에
   실제 collision이 없어서, 새 규칙을 넣으면서 migration을 돌릴 필요가 없었다.
   `seed_display_name`은 이미 쓰이는 이름이면 조용히 넘어간다
