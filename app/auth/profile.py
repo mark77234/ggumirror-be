@@ -25,6 +25,14 @@ class InvalidDisplayName(ValueError):
     """비었거나, 줄바꿈/제어문자가 있거나, 너무 길다."""
 
 
+class DisplayNameTaken(Exception):
+    """다른 사람이 이미 쓰고 있는 이름이다.
+
+    판단은 **서버 transaction**이 한다 — client가 "검색해 보니 없더라"로 정하면
+    동시에 같은 이름을 적은 두 사람이 둘 다 통과한다.
+    """
+
+
 class DisplayNameCooldown(Exception):
     """아직 바꿀 수 없다. 언제부터 되는지 함께 들고 있다."""
 
@@ -54,6 +62,19 @@ def normalize_display_name(raw: str) -> str:
     if len(text) < MIN_DISPLAY_NAME_LENGTH or len(text) > MAX_DISPLAY_NAME_LENGTH:
         raise InvalidDisplayName("display name length is out of range")
     return text
+
+
+def display_name_key(raw: str) -> str:
+    """**같은 이름인지 판단하는 열쇠.** 표시용 이름을 바꾸지 않는다.
+
+    `찬찡` · ` 찬찡 `은 같은 이름이고, `Mark` · `mark` · `MARK`도 같은 이름이다.
+    한글은 자모가 분리돼 들어와도(NFD) 같은 이름으로 센다 —
+    눈에 같아 보이는 두 이름이 서로 다른 사람의 것이 되면 안 된다.
+
+    `casefold()`를 쓴다. `lower()`보다 넓게 접어서 독일어 `ß`/`ss` 같은 경우까지 같다.
+    """
+    text = unicodedata.normalize("NFC", raw).strip()
+    return text.casefold()
 
 
 def next_change_at(changed_at: datetime | None) -> datetime | None:

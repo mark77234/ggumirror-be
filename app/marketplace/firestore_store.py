@@ -45,10 +45,13 @@ from app.marketplace.models import (
     SnapshotNotFound,
     like_id,
     ownership_id,
+    TitleTaken,
+    listing_title_key,
 )
 from app.marketplace.store import (
     LIKES, LISTINGS, MODERATION_BLOCKS, MODERATION_EVENTS, OWNERSHIP, SNAPSHOTS,
-    _is_public, _sale_event,
+    LISTING_TITLE_CLAIMS,
+    _is_public, _sale_event, _takedown_event,
 )
 from app.notifications.firestore_store import _document as _notification_document
 from app.notifications.store import NOTIFICATIONS
@@ -133,6 +136,9 @@ class FirestoreMarketplaceStore:
             transaction.update(
                 listing_ref, {"status": ListingStatus.DELETED.value, "updatedAt": now}
             )
+            # **이름을 놓아 준다.** 삭제한 상품이 이름을 계속 쥐고 있으면
+            # 아무도 그 이름을 다시 쓸 수 없다.
+            self._release_title(transaction, listing)
             return replace(listing, status=ListingStatus.DELETED, updated_at=now)
 
         try:
@@ -141,6 +147,19 @@ class FirestoreMarketplaceStore:
             raise
         except gcp_exceptions.GoogleAPIError as error:
             raise self._unavailable("listing_delete", error) from error
+
+    def _release_title(self, transaction, listing: Listing) -> None:
+        """이 상품이 쥐고 있던 이름 자리를 놓는다.
+
+        **자기 자리인지 확인하지 않고 지우지 않는다** — 같은 이름을 나중에 다른
+        상품이 잡았을 수 있고, 그것까지 지우면 남의 자리를 빼앗는다.
+        읽기가 끝난 뒤라 여기서 다시 읽을 수 없으므로, 문서에 담긴 `listingId`를
+        조건으로 거는 대신 **이름을 잡을 때 그 자리를 이 상품이 가졌다는 사실**에
+        기댄다: 이름이 바뀌지 않는 한(제목은 게시 뒤 바뀌지 않는다) 자리 주인은 그대로다.
+        """
+        transaction.delete(
+            self._db.collection(LISTING_TITLE_CLAIMS).document(listing_title_key(listing.title))
+        )
 
     def list_for_seller(self, seller_user_id: str) -> list[Listing]:
         """`sellerUserId == seller_user_id` **하나로만** 질의한다.
@@ -230,6 +249,14 @@ class FirestoreMarketplaceStore:
                 if block_ref.get(transaction=transaction).exists:
                     raise ModeratedListing(listing_id)
 
+            # **이름을 먼저 확인한다.** 읽기는 쓰기보다 앞서야 하고(Firestore 규칙),
+            # 조각을 빼기 전에 걸러야 이름이 겹쳤을 때 등록비만 잃지 않는다.
+            title_key = listing_title_key(listing.title)
+            title_ref = self._db.collection(LISTING_TITLE_CLAIMS).document(title_key)
+            claim = title_ref.get(transaction=transaction)
+            if claim.exists and (claim.to_dict() or {}).get("listingId") != listing.id:
+                raise TitleTaken(listing.title)
+
             balance = shards.wallet(seller_user_id).balance
             charged = False
             if not listing.publish_fee_paid:
@@ -249,6 +276,14 @@ class FirestoreMarketplaceStore:
             scoped.flush()
 
             now = utcnow()
+            transaction.set(
+                title_ref,
+                {
+                    "listingId": listing.id,
+                    "sellerUserId": listing.seller_user_id,
+                    "createdAt": now,
+                },
+            )
             transaction.update(
                 listing_ref,
                 {
@@ -293,6 +328,8 @@ class FirestoreMarketplaceStore:
             transaction.update(
                 listing_ref, {"status": ListingStatus.UNLISTED.value, "updatedAt": now}
             )
+            # 상점에서 내려갔으므로 이름도 놓아 준다. 다시 올릴 때 다시 잡는다.
+            self._release_title(transaction, listing)
             return replace(listing, status=ListingStatus.UNLISTED, updated_at=now)
 
         try:
@@ -607,6 +644,14 @@ class FirestoreMarketplaceStore:
                 )
             self._write_event(
                 transaction, listing, ModerationAction.TAKEDOWN, actor_user_id, reason, note, now
+            )
+            # **판매자 알림도 같은 commit이다.** 상태만 바꾸고 말하지 않으면
+            # 판매자는 자기 상품이 왜 사라졌는지 알 방법이 없다.
+            # 문서 자리가 listing id에서 나오므로 재시도가 알림을 두 번 만들지 않는다.
+            notice = _takedown_event(listing, reason)
+            transaction.set(
+                self._db.collection(NOTIFICATIONS).document(notice.id),
+                _notification_document(notice),
             )
             return ModerationResult(
                 listing=replace(

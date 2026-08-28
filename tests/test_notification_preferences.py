@@ -233,7 +233,9 @@ def marketplace():
     return MarketplaceService(store, shards), store, shards
 
 
-def publish_mirror(bundle, *, title="새 거울", kind=ContentType.MIRROR, source="a"):
+def publish_mirror(bundle, *, title=None, kind=ContentType.MIRROR, source="a"):
+    # 상품 이름은 상점 전체에서 하나뿐이다 — 원본이 다르면 이름도 달라야 한다.
+    title = title or f"새 거울 {source}"
     service, store, shards = bundle
     shards.credit(SELLER, 100, ShardReason.ADMIN_ADJUSTMENT, external_event_id=f"seed:{source}")
     snapshot = Snapshot(

@@ -28,6 +28,7 @@ from app.marketplace.models import (
     InvalidTransition,
     ListingNotFound,
     SnapshotNotFound,
+    TitleTaken,
 )
 from app.marketplace.assets import (
     MAX_ASSETS,
@@ -426,6 +427,12 @@ def publish_listing(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "listing not found") from error
     except InsufficientShards as error:
         raise HTTPException(status.HTTP_409_CONFLICT, "not enough shards") from error
+    except TitleTaken as error:
+        # **generic 오류로 숨기지 않는다.** 다음에 무엇을 할지(다른 이름) 알아야 한다.
+        # 등록비는 빠지지 않았다 — 이름 확인이 차감보다 먼저다.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "listing title is already taken"
+        ) from error
     except ModeratedListing as error:
         # **조용히 성공시키지 않는다.** 성공했다고 답하면 판매자는 올라간 줄 알고,
         # 실제로는 목록에 없다 — 그게 더 나쁜 거짓말이다.

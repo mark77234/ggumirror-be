@@ -560,12 +560,19 @@ def test_existing_buyer_redownload_creates_nothing(
 
 
 def test_admin_takedown_creates_no_sale_notification(service, store, shards, notification_store):
+    """조치는 **판매가 아니다.** 판매 알림이 생기면 안 된다.
+
+    대신 판매자에게 **조치 알림**이 간다 — 상품이 왜 사라졌는지 알아야 한다.
+    """
     from app.marketplace.models import ModerationReason
+    from app.notifications.models import NotificationType
 
     listing = published(service, store, shards)
     service.admin_takedown(user(OTHER), listing.id, reason=ModerationReason.SPAM)
 
-    assert notification_store.events == {}
+    kinds = [event.type for event in notification_store.events.values()]
+    assert NotificationType.MARKETPLACE_SALE not in kinds
+    assert kinds == [NotificationType.MARKETPLACE_TAKEDOWN]
 
 
 def test_moderated_listing_produces_no_new_sales(service, store, shards, notification_store):
@@ -577,7 +584,11 @@ def test_moderated_listing_produces_no_new_sales(service, store, shards, notific
 
     with pytest.raises(ListingNotFound):
         service.purchase(user(BUYER), listing.id)
-    assert notification_store.events == {}
+    # 조치 알림 하나뿐이다 — 팔리지 않았으므로 판매 알림은 없다.
+    from app.notifications.models import NotificationType
+
+    kinds = [event.type for event in notification_store.events.values()]
+    assert kinds == [NotificationType.MARKETPLACE_TAKEDOWN]
 
 
 def test_builtin_template_purchase_has_no_seller_notification():

@@ -16,7 +16,13 @@ from uuid import uuid4
 from google.api_core import exceptions as gcp_exceptions
 from google.cloud import firestore
 
-from app.auth.profile import DisplayNameCooldown, can_change, next_change_at
+from app.auth.profile import (
+    DisplayNameCooldown,
+    DisplayNameTaken,
+    can_change,
+    display_name_key,
+    next_change_at,
+)
 from app.auth.models import Session, User, identity_key, utcnow
 from app.auth.store import StoreUnavailable
 
@@ -27,6 +33,9 @@ IDENTITIES = "ggumirror_auth_identities"
 SESSIONS = "ggumirror_sessions"
 #: 운영자 allowlist. **client가 쓸 수 있는 경로가 없다** — 사람이 직접 만든다.
 ADMIN_USERS = "ggumirror_admin_users"
+#: 사용자 이름 자리. 문서 id가 `display_name_key(이름)`이라 **이름 하나에 문서 하나**다.
+#: 그 자체가 uniqueness 보증이고, transaction 안에서 읽고 쓴다.
+USERNAME_CLAIMS = "ggumirror_username_claims"
 
 
 class FirestoreAuthStore:
@@ -143,6 +152,14 @@ class FirestoreAuthStore:
             data = snapshot.to_dict() or {}
             if data.get("displayName"):
                 return _user_with_profile(user_id, data)
+            # **이미 쓰이는 이름이면 채우지 않는다.** Apple이 준 이름 때문에
+            # 로그인이 실패하면 안 되므로 조용히 비워 둔다 —
+            # 상점에 올릴 때 사용자가 직접 고른다.
+            claim_ref = self._db.collection(USERNAME_CLAIMS).document(display_name_key(name))
+            claim = claim_ref.get(transaction=transaction)
+            if claim.exists and (claim.to_dict() or {}).get("userId") != user_id:
+                return _user_with_profile(user_id, data)
+            transaction.set(claim_ref, {"userId": user_id, "createdAt": utcnow()})
             transaction.update(user_ref, {"displayName": name, "updatedAt": utcnow()})
             return _user_with_profile(user_id, {**data, "displayName": name})
 
@@ -172,6 +189,24 @@ class FirestoreAuthStore:
             )
             if not can_change(changed_at, now):
                 raise DisplayNameCooldown(next_change_at(changed_at))
+
+            # **이름 하나에 사람 하나다.** 읽기·검사·쓰기가 이 transaction 안에 있어
+            # 같은 이름을 동시에 적은 두 사람 중 한 명만 통과한다.
+            key = display_name_key(name)
+            claim_ref = self._db.collection(USERNAME_CLAIMS).document(key)
+            claim = claim_ref.get(transaction=transaction)
+            if claim.exists and (claim.to_dict() or {}).get("userId") != user_id:
+                raise DisplayNameTaken(name)
+
+            # 예전 이름의 자리는 **새 자리를 잡은 뒤에** 놓는다. 순서가 반대면
+            # 중간에 실패했을 때 예전 이름도 잃고 새 이름도 못 얻는다.
+            previous = data.get("displayName")
+            transaction.set(claim_ref, {"userId": user_id, "createdAt": now})
+            if previous and display_name_key(previous) != key:
+                transaction.delete(
+                    self._db.collection(USERNAME_CLAIMS).document(display_name_key(previous))
+                )
+
             transaction.update(
                 user_ref,
                 {"displayName": name, "displayNameChangedAt": now, "updatedAt": now},

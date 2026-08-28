@@ -91,12 +91,15 @@ def snapshot(store, kind: ContentType, owner: str = SELLER, source: str = "local
 def published(
     service, store, shards, *,
     kind: ContentType = ContentType.MIRROR, price: int = 0, source: str = "local-1",
+    title: str | None = None,
 ) -> Listing:
     seed(shards, SELLER, 100)
     draft = service.create_draft(
         user(SELLER),
         content_type=kind.value,
-        title="내 거울",
+        # **상품 이름은 상점 전체에서 하나뿐이다.** 원본이 다르면 이름도 달라야 한다 —
+        # 기본값을 `source`에서 끌어와 fixture가 서로 부딪히지 않게 한다.
+        title=title or f"내 거울 {source}",
         description="설명",
         price_shards=price,
         snapshot_id=snapshot(store, kind, SELLER, source),

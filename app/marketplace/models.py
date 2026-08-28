@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+import unicodedata
+
 import hashlib
 import uuid
 from dataclasses import dataclass, field
@@ -90,6 +92,28 @@ class ModerationReason(StrEnum):
     SPAM = "spam"
     COPYRIGHT = "copyright"
     OTHER = "other"
+
+
+class TitleTaken(Exception):
+    """상점에 이미 같은 이름의 상품이 있다.
+
+    판단은 **서버 transaction**이 한다 — client가 "찾아보니 없더라"로 정하면
+    동시에 같은 이름을 올린 두 사람이 둘 다 통과한다.
+    """
+
+
+def listing_title_key(raw: str) -> str:
+    """**같은 상품 이름인지 판단하는 열쇠.** 표시용 제목은 바꾸지 않는다.
+
+    사용자 이름(`display_name_key`)과 같은 규칙이다 — 앞뒤 공백을 다듬고, 한글
+    자모 조합을 하나로 모으고(NFC), Latin 대소문자를 접는다.
+    `핑크 리본` · ` 핑크 리본 `은 같은 이름이고 `Pink` · `PINK`도 같은 이름이다.
+
+    **거울과 스티커가 같은 이름 공간을 쓴다.** 상점에서 사용자가 보는 것은 "상품"
+    하나이고, 종류가 다르다고 같은 이름이 둘 있으면 어느 것을 말하는지 알 수 없다.
+    그래서 열쇠에 `contentType`을 넣지 않는다.
+    """
+    return unicodedata.normalize("NFC", raw).strip().casefold()
 
 
 class ModerationAction(StrEnum):

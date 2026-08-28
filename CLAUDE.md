@@ -94,7 +94,7 @@ API는 health / auth / users / admob / ai / iap / app-store뿐이다. store · l
 |---|---|---|
 | `POST /users/me/attendance` | Bearer session (body 없음) | +1 |
 | `GET /admob/rewarded/ssv` | **Google ECDSA 서명** (Bearer 없음) | +1 |
-| `POST /ai/stickers` | Bearer session (body는 프롬프트뿐) | **−6** |
+| `POST /ai/stickers` | Bearer session (body는 프롬프트뿐) | **−5** |
 | `POST /users/me/iap/shards` | Bearer session + **Apple 서명 JWS** | +10 / +50 / +100 |
 | `POST /app-store/notifications/v2` | **Apple 서명 알림** (Bearer 없음) | **환불 회수만** (−, `REFUND` 한정) |
 
@@ -646,6 +646,42 @@ Firestore의 all-or-nothing을 흉내 내야 "구매자만 차감된 상태가 �
 
 `tests/test_shard_transactions.py`가 위 전부를 고정한다.
 
+### 이름은 전역에서 겹치지 않는다 (Device QA)
+
+사용자 이름과 상품 이름 둘 다 **document id를 claim으로 쓰는** 같은 패턴이다 —
+"조회해서 없으면 쓴다"가 아니라 transaction 안의 `create()`가 승자를 정한다.
+
+| | collection | 열쇠 |
+|---|---|---|
+| 사용자 이름 | `ggumirror_username_claims` | `display_name_key(name)` |
+| 상품 이름 | `ggumirror_listing_title_claims` | `listing_title_key(title)` |
+
+정규화는 **NFC → strip → casefold**다. `Pink` · ` pink ` · `PINK`가 같은 이름이고,
+자모가 풀린 한글도 같은 이름이다. 두 domain이 각자 함수를 갖지만 규칙은 같다.
+
+- **이름 바꾸기는 새 열쇠를 먼저 잡고 옛 열쇠를 놓는다.** 순서가 반대면 그 사이에
+  남이 옛 이름을 가져갈 수 있고, 실패했을 때 이름을 잃는다
+- 상품 이름 claim은 **등록비 차감보다 먼저** 확인한다 — 이름이 겹쳐 실패할 등록에서
+  조각을 빼지 않는다. 삭제 · 내리기는 열쇠를 놓는다(`_release_title`)
+- **이름 namespace는 거울과 스티커가 공유한다.** 같은 상점에 같은 이름이 둘 있으면
+  사는 사람이 구분할 수 없다
+- 겹치면 **409**이고 client가 사용자 말로 옮긴다. 자동 rename하지 않는다
+- **기존 데이터를 고치지 않았다.** production audit 결과 published 상품과 사용자 이름에
+  실제 collision이 없어서, 새 규칙을 넣으면서 migration을 돌릴 필요가 없었다.
+  `seed_display_name`은 이미 쓰이는 이름이면 조용히 넘어간다
+
+### 상품이 내려가면 판매자에게 알린다 (Device QA)
+
+운영자가 `takedown`하면 **같은 transaction에서** 알림을 쌓는다
+(`NotificationType.MARKETPLACE_TAKEDOWN` · `takedown_event_id(listing_id)`).
+
+- 기존 알림 infra를 그대로 쓴다 — 새 전송 경로를 만들지 않았다
+- **실제 사유를 담는다.** `TAKEDOWN_REASON_LABELS`가 운영자가 고른 사유를
+  그대로 옮긴다. "부적절한 내용" 하나로 납작하게 만들면 판매자가 무엇을 고쳐야
+  하는지 알 수 없다
+- **판매자에게만** 간다. 구매자·다른 사용자에게 가지 않는다
+- event id가 listing 기준이라 재시도해도 **한 번**이다
+
 ### Marketplace 등록 (B-7C)
 
 거울/스티커를 상점에 올린다. **등록비 차감과 게시가 한 Firestore commit**이다.
@@ -653,7 +689,7 @@ Firestore의 all-or-nothing을 흉내 내야 "구매자만 차감된 상태가 �
 | | 등록비 | 원장 reason |
 |---|---|---|
 | 거울 | **10 조각** | `mirror_publish_fee` |
-| 스티커 | **5 조각** | `sticker_publish_fee` |
+| 스티커 | **10 조각** | `sticker_publish_fee` |
 
 - **서버가 비용의 authority다.** client에도 같은 숫자가 있지만 화면용이고,
   요청 body에 비용 · 판매자 · 상태 · counter를 실을 자리가 **없다**

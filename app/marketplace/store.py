@@ -24,6 +24,8 @@ from app.marketplace.models import (
     ModerationStatus,
     NotModerated,
     TerminalListing,
+    TitleTaken,
+    listing_title_key,
     moderation_block_id,
     Like,
     LikeCountInconsistent,
@@ -44,7 +46,12 @@ from app.marketplace.models import (
 )
 from dataclasses import replace
 
-from app.notifications.models import NotificationEvent, NotificationType, sale_event_id
+from app.notifications.models import (
+    NotificationEvent,
+    NotificationType,
+    sale_event_id,
+    takedown_event_id,
+)
 from app.shards.models import utcnow
 from app.shards.service import ShardLedgerService
 
@@ -58,6 +65,10 @@ LIKES = "ggumirror_marketplace_likes"
 MODERATION_EVENTS = "ggumirror_marketplace_moderation_events"
 #: 조치된 원본의 재등록 차단. 문서 자리가 곧 열쇠다.
 MODERATION_BLOCKS = "ggumirror_marketplace_moderation_blocks"
+#: 상품 이름 자리. 문서 id가 `listing_title_key(제목)`이라 **이름 하나에 문서 하나**다.
+#: 그 자체가 uniqueness 보증이고, 게시 transaction 안에서 읽고 쓴다.
+#: 거울과 스티커가 **같은 공간**을 쓴다 — 사용자에게는 둘 다 "상품"이다.
+LISTING_TITLE_CLAIMS = "ggumirror_listing_title_claims"
 
 
 def _is_public(listing: Listing) -> bool:
@@ -230,6 +241,8 @@ class InMemoryMarketplaceStore:
         self.ownership_records: dict[str, Ownership] = {}
         self.likes_by_id: dict[str, Like] = {}
         self.moderation_event_log: list[ModerationEvent] = []
+        #: `listing_title_key` → listing id. **상품 이름 하나에 상품 하나다.**
+        self.title_claims: dict[str, str] = {}
         #: block id → 그 차단을 만든 listing id. 복구할 때 주인을 확인한다.
         self.moderation_blocks: dict[str, str] = {}
         self._shard_store = shard_store
@@ -276,7 +289,15 @@ class InMemoryMarketplaceStore:
             return found
         updated = replace(found, status=ListingStatus.DELETED, updated_at=utcnow())
         self.listings[listing_id] = updated
+        # **이름을 놓아 준다.** 삭제한 상품이 이름을 계속 쥐고 있으면
+        # 아무도 그 이름을 다시 쓸 수 없다.
+        self._release_title(found)
         return updated
+
+    def _release_title(self, listing: Listing) -> None:
+        key = listing_title_key(listing.title)
+        if self.title_claims.get(key) == listing.id:
+            self.title_claims.pop(key, None)
 
     # MARK: - 쓰기
 
@@ -312,6 +333,13 @@ class InMemoryMarketplaceStore:
             ) in self.moderation_blocks:
                 raise ModeratedListing(listing_id)
 
+            # **이름을 먼저 잡는다.** 조각을 빼기 전에 확인해야, 이름이 겹쳐
+            # 실패했을 때 사용자가 등록비만 잃는 일이 없다.
+            key = listing_title_key(listing.title)
+            owner = self.title_claims.get(key)
+            if owner is not None and owner != listing.id:
+                raise TitleTaken(listing.title)
+
             now = utcnow()
             charged = not listing.publish_fee_paid
 
@@ -341,7 +369,12 @@ class InMemoryMarketplaceStore:
                     self.listings[listing.id] = published
                     return lambda: self.listings.__setitem__(listing.id, previous)
 
+                def claim_title():
+                    self.title_claims[key] = listing.id
+                    return lambda: self.title_claims.pop(key, None)
+
                 tx.add(write_listing)
+                tx.add(claim_title)
 
             return PublishResult(
                 listing=published, published=True, fee_charged=charged,
@@ -357,6 +390,8 @@ class InMemoryMarketplaceStore:
             # 나머지는 **그대로 둔다** — 내렸다고 낸 돈도 counter도 돌아오지 않는다.
             unlisted = replace(listing, status=ListingStatus.UNLISTED, updated_at=utcnow())
             self.listings[listing.id] = unlisted
+            # 상점에서 내려갔으므로 이름도 놓아 준다. 다시 올릴 때 다시 잡는다.
+            self._release_title(listing)
             return unlisted
 
     # MARK: - 획득 (한 transaction)
@@ -556,6 +591,10 @@ class InMemoryMarketplaceStore:
             self.listings[listing_id] = removed
             self._block_source(removed)
             self._record(removed, ModerationAction.TAKEDOWN, actor_user_id, reason, note, now)
+            # **판매자가 이유를 알아야 한다.** 상태만 바꾸고 말하지 않으면
+            # 판매자는 자기 상품이 왜 사라졌는지 알 방법이 없다.
+            if self._notifications is not None:
+                self._notifications.create(_takedown_event(removed, reason))
             return ModerationResult(listing=removed, changed=True)
 
     def restore(self, listing_id: str, actor_user_id: str) -> ModerationResult:
@@ -653,6 +692,41 @@ def _sale_event(listing: Listing, ownership_key: str, price: int) -> Notificatio
         content_type=listing.content_type.value,
         title_snapshot=listing.title,
         shard_amount=price,
+    )
+
+
+#: 사용자에게 보여 줄 조치 사유. **운영자 내부 메모(`note`)는 나가지 않는다.**
+#:
+#: 모든 사유를 "부적절한 내용" 하나로 덮지 않는다 — 판매자가 무엇을 고쳐야 하는지
+#: 알 수 없게 된다. 서버가 아는 사유를 그대로 말한다.
+TAKEDOWN_REASON_LABELS: dict[ModerationReason, str] = {
+    ModerationReason.INAPPROPRIATE: "부적절한 내용",
+    ModerationReason.SPAM: "스팸/도배",
+    ModerationReason.COPYRIGHT: "권리 침해",
+    ModerationReason.OTHER: "상점 운영 정책",
+}
+
+
+def _takedown_event(listing: Listing, reason: ModerationReason) -> NotificationEvent:
+    """조치 알림 하나. **판매자에게만** 간다.
+
+    제목은 **내려간 그때의 값**을 복사한다(판매 알림과 같은 규칙) — 나중에 제목이
+    바뀌어도 기록은 그때 내려간 것을 가리켜야 한다.
+    """
+    noun = "스티커" if listing.content_type is ContentType.STICKER else "거울"
+    label = TAKEDOWN_REASON_LABELS.get(reason)
+    body = f"상점 운영 정책에 따라 등록한 {noun}이 내려갔어요."
+    if label:
+        body = f"{body}\n사유: {label}"
+    return NotificationEvent(
+        id=takedown_event_id(listing.id),
+        user_id=listing.seller_user_id,
+        type=NotificationType.MARKETPLACE_TAKEDOWN,
+        listing_id=listing.id,
+        content_type=listing.content_type.value,
+        title_snapshot=listing.title,
+        headline="등록한 상품이 상점에서 내려갔어요",
+        body=body,
     )
 
 

@@ -30,6 +30,7 @@ from app.auth.deletion import AccountDeleting
 from app.auth.models import issue_session_token, utcnow
 from app.auth.profile import (
     DisplayNameCooldown,
+    DisplayNameTaken,
     InvalidDisplayName,
     ProfileView,
     normalize_display_name,
@@ -189,6 +190,11 @@ def update_profile(
 
     try:
         updated = auth_store.set_display_name(user.id, name, utcnow())
+    except DisplayNameTaken as error:
+        # **generic 오류로 숨기지 않는다.** 사용자가 다음에 무엇을 할지 알아야 한다.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "이미 사용 중인 이름이에요."
+        ) from error
     except DisplayNameCooldown as error:
         # 재시도해도 같은 답이라 4xx다. 언제부터 되는지 함께 알려 준다.
         raise HTTPException(

@@ -11,7 +11,13 @@ from datetime import datetime
 from typing import Protocol
 
 from app.auth.models import Session, User, identity_key, utcnow
-from app.auth.profile import DisplayNameCooldown, can_change, next_change_at
+from app.auth.profile import (
+    DisplayNameCooldown,
+    DisplayNameTaken,
+    can_change,
+    display_name_key,
+    next_change_at,
+)
 
 
 class StoreUnavailable(Exception):
@@ -72,21 +78,43 @@ class InMemoryAuthStore:
         self.sessions: dict[str, Session] = {}
         #: 운영자 allowlist. test에서 직접 채운다 — API로 쓰는 경로가 없다.
         self.admins: dict[str, bool] = {}
+        #: `display_name_key` → user id. **이름 하나에 사람 하나다.**
+        self.name_claims: dict[str, str] = {}
 
     def seed_display_name(self, user_id: str, name: str) -> User:
         user = self.users[user_id]
         if user.display_name is None:
-            user = replace(user, display_name=name)
-            self.users[user_id] = user
+            # **이미 쓰이는 이름이면 채우지 않는다.** Apple이 준 이름 때문에
+            # 로그인이 실패하면 안 되므로, 조용히 비워 둔다 —
+            # 상점에 올릴 때 사용자가 직접 고른다.
+            key = display_name_key(name)
+            if self._name_owner(key) is None:
+                self.name_claims[key] = user_id
+                user = replace(user, display_name=name)
+                self.users[user_id] = user
         return user
 
     def set_display_name(self, user_id: str, name: str, now: datetime) -> User:
         user = self.users[user_id]
         if not can_change(user.display_name_changed_at, now):
             raise DisplayNameCooldown(next_change_at(user.display_name_changed_at))
+        key = display_name_key(name)
+        owner = self._name_owner(key)
+        if owner is not None and owner != user_id:
+            raise DisplayNameTaken(name)
+        # **먼저 잡고 나중에 놓는다.** 순서가 반대면 중간에 실패했을 때
+        # 예전 이름도 잃고 새 이름도 못 얻는다.
+        self.name_claims[key] = user_id
+        if user.display_name is not None:
+            previous = display_name_key(user.display_name)
+            if previous != key:
+                self.name_claims.pop(previous, None)
         user = replace(user, display_name=name, display_name_changed_at=now)
         self.users[user_id] = user
         return user
+
+    def _name_owner(self, key: str) -> str | None:
+        return self.name_claims.get(key)
 
     def user_for_identity(self, provider: str, subject: str) -> tuple[User, bool]:
         key = identity_key(provider, subject)

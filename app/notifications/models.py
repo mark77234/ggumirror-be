@@ -33,6 +33,8 @@ class NotificationType(StrEnum):
     """
 
     MARKETPLACE_SALE = "marketplace_sale"
+    #: 운영자가 내 상품을 내렸다. **판매자에게만** 간다.
+    MARKETPLACE_TAKEDOWN = "marketplace_takedown"
     #: 새로 올라온 거울 모아 보기. 특정 상품 하나에 매이지 않는다.
     MIRROR_DIGEST = "mirror_digest"
     #: 다시 둘러보라는 소식. **알림센터에 쌓지 않는다**(push 전용).
@@ -101,6 +103,20 @@ class NotificationEvent:
     @staticmethod
     def new_id() -> str:
         return str(uuid.uuid4())
+
+
+def takedown_event_id(listing_id_value: str) -> str:
+    """조치 알림 문서 ID. **상품 하나에 알림 하나다.**
+
+    listing id에서 끌어오므로 같은 상품을 다시 내려도(이미 내려가 있으면 애초에
+    아무것도 쓰지 않지만) 알림이 두 번 생길 수 없다. 판매 알림과 같은 규칙이고,
+    "조회해서 없으면 만든다"로 바꾸지 않는다 — 그 사이에 틈이 생긴다.
+    """
+    canonical = "|".join(
+        f"{len(part.encode())}:{part}"
+        for part in ("notification_takedown", listing_id_value)
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def sale_event_id(ownership_id_value: str) -> str:
