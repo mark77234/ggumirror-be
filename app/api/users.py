@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from app.ads.service import RewardedAdService
 from app.api.deps import (
+    AccountUser,
     CurrentUser,
     account_deletion,
     rewarded_ad_service,
@@ -179,7 +180,8 @@ def delete_account(
 @router.patch("/me/profile", response_model=ProfilePayload, response_model_by_alias=True)
 def update_profile(
     body: DisplayNameRequest,
-    user: CurrentUser,
+    # 이름은 **판매자 신원**이다 — 상점에 이름으로 서는 일이라 계정이 필요하다.
+    user: AccountUser,
     auth_store: Annotated[AuthStore, Depends(auth_store_dep)],
 ) -> ProfilePayload:
     """이름을 바꾼다. **30일 규칙은 서버가 강제한다** — 기기 시계를 믿지 않는다."""
@@ -248,10 +250,15 @@ def my_attendance(
     response_model_by_alias=True,
 )
 def claim_attendance(
-    user: CurrentUser,
+    user: AccountUser,
     shards: Annotated[ShardLedgerService, Depends(shard_service)],
 ) -> AttendanceClaimPayload:
-    """오늘 출석 조각 +1.
+    """오늘 출석 조각 +1. **계정이 필요하다**(guest는 403).
+
+    조각을 **공짜로 주는** 통로라서 guest에게 열지 않는다. guest 신원은 요청 한 번으로
+    무한히 만들 수 있고, 그 지갑은 로그인할 때 계정으로 넘어간다 — 열어 두면
+    "새 guest → 출석 → 로그인해서 넘기기"를 반복해 조각을 찍어낼 수 있다.
+    **조각을 사는 길(IAP)과 쓰는 길은 guest에게 그대로 열려 있다.**
 
     **body를 읽지 않는다.** `userId` · `date` · `amount` · `reason`을 보내도 아무 영향이 없다 —
     받을 자리 자체가 없다. 하루 한 번이라는 규칙은 원장의 idempotency가 지킨다
@@ -293,13 +300,16 @@ def my_rewarded_ads(
     response_model_by_alias=True,
 )
 def create_reward_context(
-    user: CurrentUser,
+    user: AccountUser,
     ads: Annotated[RewardedAdService, Depends(rewarded_ad_service)],
 ) -> RewardContextPayload:
     """광고에 실어 보낼 **short-lived opaque context**를 발급한다.
 
     **조각을 지급하는 endpoint가 아니다.** 여기서는 아무 잔액도 움직이지 않는다.
     지급은 Google이 서명한 SSV callback이 도착했을 때만 일어난다.
+
+    **계정이 필요하다**(guest는 403) — 출석과 같은 이유로, 공짜 조각 통로를
+    무한히 만들 수 있는 신원에 열지 않는다.
 
     client는 이 값을 `ServerSideVerificationOptions.customData`에 넣는다.
     session token · Apple token · 내부 user UUID는 **절대 넣지 않는다** —

@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 
 from app.auth.models import User
+from app.auth.store import AuthStore, StoreUnavailable
 from app.iap.models import (
     CONSUMABLE_TYPE,
     AccountTokenMismatch,
@@ -48,11 +49,14 @@ class IAPService:
         *,
         bundle_id: str,
         allowed_environments: frozenset[str],
+        users: AuthStore | None = None,
     ) -> None:
         self._verifier = verifier
         self._shards = shards
         self._bundle_id = bundle_id
         self._allowed_environments = allowed_environments
+        # guest 지갑을 넘겨받은 계정인지 확인할 때만 읽는다(_check_owner의 실패 갈래).
+        self._users = users
 
     @property
     def is_available(self) -> bool:
@@ -122,12 +126,35 @@ class IAPService:
         없으면 거절한다 — "없으면 현재 사용자로 본다"로 두면 남의 결제 JWS로
         자기 지갑을 채울 수 있고, 그게 정확히 막으려는 것이다.
         """
-        if not same_account_token(transaction.app_account_token, user.id):
-            logger.warning(
-                "iap_rejected reason=account_token_mismatch present=%s transaction=%s",
-                transaction.app_account_token is not None, short,
-            )
-            raise AccountTokenMismatch("appAccountToken does not match the signed-in user")
+        if same_account_token(transaction.app_account_token, user.id):
+            return
+
+        # 로그인 전에 산 결제가 늦게 도착할 수 있다 — guest로 결제하고, 서버 지급이
+        # 실패한 채로 로그인하면 token은 그 guest를 가리킨다. **그 guest 지갑을
+        # 넘겨받은 계정이 지금 이 사람일 때만** 받아 준다(서버가 적어 둔 값이 근거다).
+        if self._claimed_guest_of(transaction.app_account_token, user):
+            logger.info("iap_owner_via_claimed_guest transaction=%s", short)
+            return
+
+        logger.warning(
+            "iap_rejected reason=account_token_mismatch present=%s transaction=%s",
+            transaction.app_account_token is not None, short,
+        )
+        raise AccountTokenMismatch("appAccountToken does not match the signed-in user")
+
+    def _claimed_guest_of(self, token: str | None, user: User) -> bool:
+        if not token or self._users is None:
+            return False
+        try:
+            owner = self._users.user(str(token))
+        except StoreUnavailable:
+            # 읽지 못한 것을 "주인이 아니다"로 단정하지 않는다 — 원래 오류 그대로 간다.
+            return False
+        return (
+            owner is not None
+            and owner.is_guest
+            and same_account_token(owner.claimed_by_user_id, user.id)
+        )
 
     # MARK: - 지급
 

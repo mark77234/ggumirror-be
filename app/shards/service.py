@@ -221,6 +221,21 @@ class ShardLedgerService:
         )
         return ShardMutationResult(wallet=wallet, applied=applied, entry_id=entry.id)
 
+    # MARK: - guest 지갑 인계
+
+    def claim_guest_wallet(self, guest_user_id: str, owner_user_id: str) -> int:
+        """로그인한 계정이 자기 guest 지갑을 넘겨받는다. **옮긴 양**을 돌려준다.
+
+        조각이 새로 생기지 않는다 — 원장에 `guest_claim` 두 줄(−/+)이 한 transaction에
+        쌓이고 총량은 그대로다. 누가 누구에게 넘기는지를 client가 정할 수 없다:
+        guest는 bearer token이, 계정은 **검증된 Apple identity**가 정한다.
+
+        재시도 · 동시 요청은 원장 열쇠 한 쌍이 막는다(두 번째부터 `0`).
+        """
+        moved = self._store.claim_guest_wallet(guest_user_id, owner_user_id)
+        logger.info("shard_guest_claim moved=%d", moved)
+        return moved
+
     @staticmethod
     def _moved(delta: int) -> int:
         """0은 이동이 아니다. 크기 검사는 `_checked`와 같은 규칙을 쓴다."""

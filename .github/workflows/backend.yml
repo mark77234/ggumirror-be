@@ -1,0 +1,287 @@
+name: backend
+
+# feature/* → PR dev → CI만.   dev → PR main → CI만.   merge to main → CI + production deploy.
+#
+# **deploy는 `push` to `main` 하나에서만 일어난다.** pull_request event에서는
+# 절대 배포하지 않는다 — fork PR이 workflow를 고쳐 production에 닿는 길을 만들지 않는다.
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+
+# 기본은 읽기뿐이다. OIDC token(`id-token: write`)은 deploy job에서만 켠다.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------- test
+  # 모든 PR · dev push · main push에서 돈다. main deploy의 전제 조건이다.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      # runner에는 Google ADC가 없다. store 주입을 빠뜨린 test는
+      # `tests/conftest.py`의 guard가 잡는다 — 조용한 503으로 흐르지 않는다.
+      - run: pytest
+
+  # ------------------------------------------------- release source guard
+  # main으로 들어오는 PR의 출처를 제한한다. 일반 feature는 dev를 거친다.
+  #
+  # branch protection의 required check로 걸어야 실제로 막힌다 — 이 job 혼자서는
+  # 실패한 PR을 merge하지 못하게 만들지 못한다(docs/deployment.md 참고).
+  release-source:
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Only dev or hotfix/* may release to main
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          case "$HEAD_REF" in
+            dev|hotfix/*)
+              echo "OK: '$HEAD_REF' -> main" ;;
+            *)
+              echo "::error::'$HEAD_REF' -> main is not allowed."
+              echo "::error::release는 dev -> main, 긴급 수정은 hotfix/* -> main이다."
+              echo "::error::feature branch는 dev로 먼저 보낸다."
+              exit 1 ;;
+          esac
+
+  # -------------------------------------------------------------- deploy
+  # **main push 전용.** test가 초록일 때만 돈다.
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    # production 배포는 한 번에 하나만. 도중에 취소되면 새 revision을 만들어 둔 채
+    # traffic·smoke·rollback이 끊긴 상태로 남는다 — 그래서 cancel하지 않는다.
+    concurrency:
+      group: ggumirror-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write   # WIF. long-lived JSON key를 쓰지 않는다.
+    env:
+      # **project·region·service·repo는 여기 박아 둔다.** repository variable로 빼면
+      # variable 한 줄을 고쳐 다른 production project로 배포할 수 있다.
+      # 이 값을 바꾸는 것은 review를 지나는 code change여야 한다.
+      GCP_PROJECT_ID: ggumirror-prod
+      GCP_REGION: asia-northeast3
+      CLOUD_RUN_SERVICE: ggumirror-api
+      ARTIFACT_REGISTRY_REPO: ggumirror
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Guard the deploy target
+        env:
+          # variable을 두더라도 **권위가 아니다.** 다르면 배포하지 않는다.
+          VAR_PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          VAR_REGION: ${{ vars.GCP_REGION }}
+          VAR_SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            if [ -n "$2" ] && [ "$2" != "$3" ]; then
+              echo "::error::$1 variable is '$2' but this workflow deploys '$3'."
+              fail=1
+            fi
+          }
+          check GCP_PROJECT_ID     "$VAR_PROJECT" "$GCP_PROJECT_ID"
+          check GCP_REGION         "$VAR_REGION"  "$GCP_REGION"
+          check CLOUD_RUN_SERVICE  "$VAR_SERVICE" "$CLOUD_RUN_SERVICE"
+          [ "$fail" -eq 0 ] || exit 1
+          echo "target: $GCP_PROJECT_ID / $GCP_REGION / $CLOUD_RUN_SERVICE"
+
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      # 인증된 신원이 정말 이 project를 향하는지 확인한다. gcloud의 기본 project를
+      # 믿지 않는다 — 모든 명령에 `--project`를 명시하는 것과 같은 이유다.
+      - name: Verify the authenticated project
+        run: |
+          set -euo pipefail
+          gcloud projects describe "$GCP_PROJECT_ID" \
+            --project="$GCP_PROJECT_ID" --format='value(projectId)' > /tmp/pid
+          test "$(cat /tmp/pid)" = "$GCP_PROJECT_ID"
+          echo "authenticated against $GCP_PROJECT_ID"
+
+      # rollback 대상. **배포 전에** 읽어야 의미가 있다.
+      - id: current
+        name: Record the revision serving traffic now
+        run: |
+          set -euo pipefail
+          previous=$(gcloud run services describe "$CLOUD_RUN_SERVICE" \
+            --project="$GCP_PROJECT_ID" --region="$GCP_REGION" \
+            --format='value(status.traffic[0].revisionName)')
+          test -n "$previous"
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+          echo "currently serving: $previous"
+
+      # image 말고는 아무것도 바뀌지 않아야 한다. 그 판단의 기준선.
+      - name: Snapshot service config (before)
+        run: |
+          set -euo pipefail
+          gcloud run services describe "$CLOUD_RUN_SERVICE" \
+            --project="$GCP_PROJECT_ID" --region="$GCP_REGION" \
+            --format=json > /tmp/run-before.json
+
+      - name: Build and push the image
+        id: image
+        run: |
+          set -euo pipefail
+          host="${GCP_REGION}-docker.pkg.dev"
+          image="${host}/${GCP_PROJECT_ID}/${ARTIFACT_REGISTRY_REPO}/${CLOUD_RUN_SERVICE}:${GITHUB_SHA}"
+          gcloud auth configure-docker "$host" --project="$GCP_PROJECT_ID" --quiet
+          # commit SHA tag만 만든다. `latest`를 production authority로 쓰지 않는다 —
+          # 어떤 revision이 어떤 commit인지 나중에 알 수 없게 된다.
+          docker build -t "$image" .
+          docker push "$image"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+      # **`--set-env-vars` · `--set-secrets`를 쓰지 않는다.** 이 service에는 env var
+      # 17개와 secret reference 2개가 이미 붙어 있고, 그 flag는 선언하지 않은 것을
+      # 지운다. 여기서 하는 일은 새 image를 올리는 것 하나다.
+      - name: Deploy the new image
+        id: deploy
+        run: |
+          set -euo pipefail
+          gcloud run deploy "$CLOUD_RUN_SERVICE" \
+            --project="$GCP_PROJECT_ID" \
+            --region="$GCP_REGION" \
+            --image="${{ steps.image.outputs.image }}" \
+            --quiet
+          created=$(gcloud run services describe "$CLOUD_RUN_SERVICE" \
+            --project="$GCP_PROJECT_ID" --region="$GCP_REGION" \
+            --format='value(status.latestCreatedRevisionName)')
+          echo "created=$created" >> "$GITHUB_OUTPUT"
+          echo "new revision: $created"
+
+      # rollback으로 traffic이 특정 revision에 고정돼 있었다면 새 revision은 0%다.
+      # 그대로 smoke를 돌리면 **옛 revision을 시험해 초록**이 된다. 확인하고 고친다.
+      - name: Make sure the new revision serves the traffic
+        run: |
+          set -euo pipefail
+          created="${{ steps.deploy.outputs.created }}"
+          serving=$(gcloud run services describe "$CLOUD_RUN_SERVICE" \
+            --project="$GCP_PROJECT_ID" --region="$GCP_REGION" \
+            --format='value(status.traffic[0].revisionName)')
+          if [ "$serving" != "$created" ]; then
+            echo "::warning::traffic is pinned to $serving — routing to $created"
+            gcloud run services update-traffic "$CLOUD_RUN_SERVICE" \
+              --project="$GCP_PROJECT_ID" --region="$GCP_REGION" \
+              --to-latest --quiet
+            serving=$(gcloud run services describe "$CLOUD_RUN_SERVICE" \
+              --project="$GCP_PROJECT_ID" --region="$GCP_REGION" \
+              --format='value(status.traffic[0].revisionName)')
+          fi
+          test "$serving" = "$created"
+          echo "serving: $serving"
+
+      # env · secret · runtime SA · scaling · timeout · concurrency · ingress가
+      # 그대로인지 본다. **값은 출력하지 않는다** — 어떤 field가 달라졌는지만 말한다.
+      - name: Verify only the image changed
+        run: |
+          set -euo pipefail
+          gcloud run services describe "$CLOUD_RUN_SERVICE" \
+            --project="$GCP_PROJECT_ID" --region="$GCP_REGION" \
+            --format=json > /tmp/run-after.json
+          python3 - <<'PY'
+          import json, sys
+
+          def shape(path):
+              d = json.load(open(path))
+              template = d["spec"]["template"]
+              annotations = template.get("metadata", {}).get("annotations", {})
+              spec = template["spec"]
+              container = spec["containers"][0]
+              env = container.get("env", [])
+              return {
+                  "serviceAccountName": spec.get("serviceAccountName"),
+                  "timeoutSeconds": spec.get("timeoutSeconds"),
+                  "containerConcurrency": spec.get("containerConcurrency"),
+                  "minScale": annotations.get("autoscaling.knative.dev/minScale"),
+                  "maxScale": annotations.get("autoscaling.knative.dev/maxScale"),
+                  "vpcConnector": annotations.get("run.googleapis.com/vpc-access-connector"),
+                  "vpcEgress": annotations.get("run.googleapis.com/vpc-access-egress"),
+                  "ingress": d["metadata"]["annotations"].get("run.googleapis.com/ingress"),
+                  "resources": container.get("resources"),
+                  "command": container.get("command"),
+                  "args": container.get("args"),
+                  "ports": container.get("ports"),
+                  # env는 이름 → 출처만 본다. 값을 로그에 흘리지 않는다.
+                  "env": sorted(
+                      (e["name"], "secret" if "valueFrom" in e else "plain") for e in env
+                  ),
+              }
+
+          before, after = shape("/tmp/run-before.json"), shape("/tmp/run-after.json")
+          drift = sorted(k for k in before if before[k] != after[k])
+          if drift:
+              print("::error::deploy changed operational config: " + ", ".join(drift))
+              print("::error::이 workflow는 image만 바꿔야 한다.")
+              sys.exit(1)
+          print(f"config preserved: {len(before['env'])} env entries, "
+                f"SA/scaling/timeout/concurrency/ingress unchanged")
+          PY
+
+      - name: Health smoke test
+        id: smoke
+        run: |
+          set -euo pipefail
+          # URL을 workflow에 적지 않는다 — Cloud Run에게 묻는다.
+          url=$(gcloud run services describe "$CLOUD_RUN_SERVICE" \
+            --project="$GCP_PROJECT_ID" --region="$GCP_REGION" \
+            --format='value(status.url)')
+          test -n "$url"
+          echo "probing $url/health"
+          for attempt in $(seq 1 30); do
+            code=$(curl -sS -m 10 -o /tmp/health.json -w '%{http_code}' "$url/health" || echo 000)
+            if [ "$code" = "200" ] && grep -q '"status":"ok"' /tmp/health.json; then
+              echo "healthy after ${attempt} attempt(s)"
+              exit 0
+            fi
+            echo "attempt ${attempt}: status=${code}"
+            sleep 3
+          done
+          echo "::error::/health never returned a healthy 200 within 90s"
+          exit 1
+
+      # smoke(또는 traffic·config 검증)가 실패하면 **traffic만** 되돌린다.
+      # production data는 건드리지 않는다 — 이 단계에 Firestore가 없다.
+      - name: Roll back traffic on failure
+        if: failure() && steps.current.outputs.previous != ''
+        run: |
+          set -uo pipefail
+          previous="${{ steps.current.outputs.previous }}"
+          echo "::error::deploy failed — rolling traffic back to ${previous}"
+          if gcloud run services update-traffic "$CLOUD_RUN_SERVICE" \
+               --project="$GCP_PROJECT_ID" \
+               --region="$GCP_REGION" \
+               --to-revisions="${previous}=100" \
+               --quiet; then
+            echo "::error::ROLLED BACK to ${previous}. production is serving the previous revision."
+            echo "::error::traffic은 이제 그 revision에 **고정**돼 있다 — 다음 배포가 자동으로 푼다."
+          else
+            echo "::error::################################################################"
+            echo "::error::ROLLBACK FAILED. production may be serving a broken revision."
+            echo "::error::수동 조치: gcloud run services update-traffic $CLOUD_RUN_SERVICE \\"
+            echo "::error::  --project=$GCP_PROJECT_ID --region=$GCP_REGION \\"
+            echo "::error::  --to-revisions=${previous}=100"
+            echo "::error::################################################################"
+          fi
+          exit 1

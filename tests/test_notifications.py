@@ -32,6 +32,8 @@ from app.notifications.models import (
     sale_event_id,
 )
 from app.notifications.service import NotificationService
+from app.notifications.delivery import InMemoryDeliveryStore
+from app.notifications.preferences import InMemoryPreferenceStore
 from app.notifications.store import InMemoryNotificationStore
 from app.push.models import (
     InvalidPushDevice,
@@ -683,6 +685,8 @@ def client(
     document = jwks_of(apple_key)
     monkeypatch.setattr(jwks_module, "http_jwks_fetch", lambda *a, **k: lambda: document)
 
+    # 판매 알림은 **설정 · 발송 기록**도 본다. 주지 않으면 Firestore로 fallback한다 —
+    # 개발 기기에서는 ADC가 있어 조용히 통하고, CI에서는 credential이 없어 503이 된다.
     app = create_app(
         Settings(app_env="local", apple_client_id=CLIENT_ID),
         auth_store=InMemoryAuthStore(),
@@ -690,6 +694,8 @@ def client(
         marketplace_store=store,
         push_store=push_store,
         notification_store=notification_store,
+        preference_store=InMemoryPreferenceStore(),
+        delivery_store=InMemoryDeliveryStore(),
     )
     return TestClient(app, raise_server_exceptions=False)
 

@@ -73,6 +73,10 @@ class ShardReason(StrEnum):
     #: 내장 템플릿 구매. **판매자가 없다** — 파는 사람 없이 사라지는 값이라
     #: Marketplace의 `mirror_purchase`/`mirror_sale` 짝과 섞지 않는다.
     CATALOG_TEMPLATE_PURCHASE = "catalog_template_purchase"
+    #: guest 지갑을 로그인한 계정으로 넘길 때 쓰는 **한 쌍**의 이유
+    #: (guest 쪽 −, 계정 쪽 +). 조각이 새로 발행되지 않고 자리만 옮긴다 —
+    #: 그래서 `admin_adjustment`나 구매 이유와 섞지 않는다.
+    GUEST_CLAIM = "guest_claim"
     ADMIN_ADJUSTMENT = "admin_adjustment"
 
 
@@ -385,6 +389,14 @@ class WalletAlreadyChanged(ShardError):
 
     marketplace 자기거래(`buyer == seller`)가 정확히 이 모양이라 여기서 막는다 —
     상위 service의 검사에만 기대지 않는다.
+    """
+
+
+class GuestClaimBroken(ShardError):
+    """guest 인계의 두 줄(−/+) 짝이 맞지 않는다. **아무것도 기록되지 않는다.**
+
+    있을 수 없는 상태다 — 두 열쇠는 언제나 함께 쓰인다. 그래도 조용히 넘기지 않는다:
+    한쪽만 반영되면 조각이 사라지거나 복제된다.
     """
 
 

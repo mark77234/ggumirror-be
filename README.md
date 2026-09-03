@@ -947,6 +947,13 @@ docker push asia-northeast3-docker.pkg.dev/ggumirror-prod/ggumirror/ggumirror-ap
 gcloud run deploy ggumirror-api --project=ggumirror-prod --region=asia-northeast3 --image=asia-northeast3-docker.pkg.dev/ggumirror-prod/ggumirror/ggumirror-api:$(git rev-parse --short HEAD) --service-account=ggumirror-api-runtime@ggumirror-prod.iam.gserviceaccount.com --allow-unauthenticated --min-instances=0 --max-instances=3 --cpu=1 --memory=512Mi --concurrency=80 --timeout=30s --set-env-vars="APP_ENV=production,LOG_LEVEL=INFO,APPLE_CLIENT_ID=com.mark77234.ggumirror,GCP_PROJECT_ID=ggumirror-prod,FIRESTORE_DATABASE=(default)"
 ```
 
+> ⚠️ **위 `--set-env-vars`는 지금 production과 맞지 않는다.** 그 사이에 env var가
+> 17개로 늘고 Secret Manager reference 2개(`AI_IMAGE_API_KEY` · `APNS_PRIVATE_KEY`)가
+> 붙었다. `--set-env-vars` · `--set-secrets`는 **선언하지 않은 것을 지운다** —
+> 위 명령을 그대로 실행하면 env var 12개와 secret reference 2개가 사라진다.
+> 수동 배포가 필요하면 **`--image`만** 바꾼다. 자동 배포도 그렇게 한다
+> ([`docs/deployment.md`](docs/deployment.md)).
+
 `latest` tag를 쓰지 않는다 — 어떤 commit이 떠 있는지 revision에서 바로 보여야 한다.
 
 Cloud Run endpoint는 인터넷에서 도달 가능하다(`--allow-unauthenticated`).
@@ -955,16 +962,28 @@ Cloud Run IAM 인증을 사용자에게 요구하지 않는다.
 
 Secret Manager는 만들지 않았다. 지금 필요한 secret이 하나도 없다(ADC + Apple private key 불필요).
 
-### 자동 배포 (아직 안 함)
+### 자동 배포 — `dev` → `main` merge
 
-첫 배포는 수동으로 했다. GitHub Actions 배포를 붙일 때 필요한 것:
+`.github/workflows/backend.yml`. 자세한 것은 **[`docs/deployment.md`](docs/deployment.md)**.
 
-1. Workload Identity Pool + provider (repo 한정 조건) — **새 project에**
-2. 배포용 service account — `roles/run.developer` · `roles/artifactregistry.writer` ·
-   `roles/iam.serviceAccountUser`
-3. `.github/workflows/deploy.yml` — `google-github-actions/auth`(WIF) → build/push → deploy
+```
+feature/* ──PR──▶ dev ──PR──▶ main ──merge──▶ production
+                  CI만        CI만            CI ▶ build ▶ deploy ▶ health smoke
+```
 
-**service account JSON key를 쓰지 않는다.**
+- **배포는 `push` to `main` 하나에서만** 일어난다. PR event에서는 절대 배포하지 않고,
+  `dev`는 개발 통합 branch라 production에 닿지 않는다
+- image tag는 **commit SHA**다. `latest`를 production authority로 쓰지 않는다
+- **Workload Identity Federation + GitHub OIDC.** service account JSON key를 만들지 않고
+  GitHub Secret도 하나도 쓰지 않는다. runtime SA와 배포 SA를 나눈다
+- project · region · service · Artifact Registry repo는 **workflow에 박혀 있다** —
+  variable 한 줄을 고쳐 다른 production project로 배포할 수 없다(fail closed)
+- `main`으로 오는 PR의 출처는 `dev` 또는 `hotfix/*`뿐이다(`release-source` job)
+- `/health` smoke가 실패하면 **traffic을 이전 revision으로 되돌린다.**
+  production data는 되돌리지 않는다
+
+**일회성 GCP/GitHub 설정이 아직 남아 있다** (WIF pool · 배포 SA · repo variable).
+명령은 [`docs/deployment.md`](docs/deployment.md)에 있다.
 
 ### Firestore location
 
