@@ -232,7 +232,6 @@ def create_app(
         )
 
     @lru_cache(maxsize=1)
-    @lru_cache(maxsize=1)
     def push_provider():
         """자격 증명이 다 있으면 진짜 APNs, 아니면 아무것도 보내지 않는 것.
 

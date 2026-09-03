@@ -14,6 +14,7 @@ import threading
 import pytest
 
 from app.auth.models import User
+from app.auth.store import InMemoryAuthStore
 from app.marketplace.models import (
     ContentType,
     InvalidListing,
@@ -724,8 +725,12 @@ def client(store, shard_store):
     from app.core.config import Settings
     from app.main import create_app
 
+    # 판매자 이름을 붙이려 auth store도 본다 — 주지 않으면 Firestore로 fallback한다.
     app = create_app(
-        Settings(app_env="local"), shard_store=shard_store, marketplace_store=store
+        Settings(app_env="local"),
+        auth_store=InMemoryAuthStore(),
+        shard_store=shard_store,
+        marketplace_store=store,
     )
     return TestClient(app, raise_server_exceptions=False)
 
@@ -2597,6 +2602,7 @@ def asset_client(store, shard_store, storage):
 
     app = create_app(
         Settings(app_env="local"),
+        auth_store=InMemoryAuthStore(),
         shard_store=shard_store,
         marketplace_store=store,
         marketplace_assets=storage,
@@ -2740,6 +2746,7 @@ def test_missing_bucket_fails_closed(store, shards, shard_store):
     # HTTP에서는 503 — 200에 빈 이미지를 주지 않는다.
     app = create_app(
         Settings(app_env="local", marketplace_asset_bucket=""),
+        auth_store=InMemoryAuthStore(),
         shard_store=shard_store,
         marketplace_store=store,
     )

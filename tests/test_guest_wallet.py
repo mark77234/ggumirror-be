@@ -27,6 +27,10 @@ from app.iap.models import (
 from app.iap.service import IAPService
 from app.main import create_app
 from app.marketplace.store import InMemoryMarketplaceStore
+from app.notifications.delivery import InMemoryDeliveryStore
+from app.notifications.preferences import InMemoryPreferenceStore
+from app.notifications.store import InMemoryNotificationStore
+from app.push.store import InMemoryPushStore
 from app.shards.models import ShardReason
 from app.shards.service import ShardLedgerService
 from app.shards.store import InMemoryShardStore
@@ -103,6 +107,12 @@ def client(auth_store, shard_store, marketplace, verifier, apple_key, jwks_of, m
         shard_store=shard_store,
         transaction_verifier=verifier,
         marketplace_store=marketplace,
+        # 상점 구매는 판매자에게 알림을 남긴다 — 이 store들을 주지 않으면
+        # Firestore로 fallback해서 credential이 없는 CI에서 503이 된다.
+        push_store=InMemoryPushStore(),
+        notification_store=InMemoryNotificationStore(),
+        preference_store=InMemoryPreferenceStore(),
+        delivery_store=InMemoryDeliveryStore(),
     )
     return TestClient(app)
 

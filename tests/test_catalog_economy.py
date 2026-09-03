@@ -333,8 +333,14 @@ def _authenticated(catalog_store):
         created_at=datetime.now(UTC),
         expires_at=datetime.now(UTC) + timedelta(days=1),
     )
+    # 유료 템플릿은 지갑을 읽는다 — 조각 store를 주지 않으면 Firestore로 간다.
+    from app.shards.store import InMemoryShardStore
+
     app = create_app(
-        Settings(app_env="local"), auth_store=auth, catalog_store=catalog_store
+        Settings(app_env="local"),
+        auth_store=auth,
+        shard_store=InMemoryShardStore(),
+        catalog_store=catalog_store,
     )
     return TestClient(app, raise_server_exceptions=False), {
         "Authorization": f"Bearer {token}"

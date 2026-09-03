@@ -354,7 +354,17 @@ def client(store):
     from app.core.config import Settings
     from app.main import create_app
 
-    app = create_app(Settings(app_env="local"), catalog_store=store)
+    # 통계는 공개지만 같은 app이 조각 · auth store도 만든다 —
+    # 주지 않으면 Firestore로 fallback한다(CI에는 credential이 없다).
+    from app.auth.store import InMemoryAuthStore
+    from app.shards.store import InMemoryShardStore
+
+    app = create_app(
+        Settings(app_env="local"),
+        auth_store=InMemoryAuthStore(),
+        shard_store=InMemoryShardStore(),
+        catalog_store=store,
+    )
     return TestClient(app, raise_server_exceptions=False)
 
 

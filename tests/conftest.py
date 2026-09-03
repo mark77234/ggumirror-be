@@ -14,8 +14,27 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from app.auth.apple import APPLE_ISSUER
+from tests.adc_guard import blocked
 
 CLIENT_ID = "com.mark77234.ggumirror"
+
+
+@pytest.fixture(autouse=True)
+def no_google_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """**Google ADC lookup을 금지한다.** store를 주입하지 않은 test를 여기서 잡는다.
+
+    `create_app`은 store를 안 주면 Firestore로 fallback한다(production 기본값이 그래야
+    한다). 개발 기기에는 `gcloud` ADC가 있으니 그 fallback이 **조용히 성공**했고,
+    주입을 빠뜨린 test가 실제 Firestore를 붙잡은 채로 초록이었다. GitHub Actions에는
+    ADC가 없어서 같은 코드가 `DefaultCredentialsError` → 503 연쇄로 무너졌다.
+
+    이제 두 환경이 같은 것을 본다. 이 fixture가 터지면 고칠 곳은 production 코드가
+    아니라 **그 test의 `create_app(...)` 인자**다 — 빠진 store를 in-memory fake로 준다.
+
+    개발 기기의 ADC가 가리키는 project는 꾸미러가 아닐 수도 있다. test가 그쪽
+    Firestore로 나가는 것을 막는 것 자체가 이 guard의 두 번째 이유다.
+    """
+    monkeypatch.setattr("google.auth.default", blocked)
 
 
 @pytest.fixture(autouse=True)
