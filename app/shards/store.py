@@ -33,6 +33,8 @@ from app.shards.models import (
     ShardRefundResult,
     ShardRefundReversalResult,
     ShardWallet,
+    GuestClaimBroken,
+    idempotency_hash,
     utcnow,
 )
 
@@ -164,6 +166,17 @@ class ShardStore(Protocol):
         - 같은 transaction에서 같은 지갑을 두 번 바꾸면 `WalletAlreadyChanged`
 
         quota · 전역 claim은 다루지 않는다. 필요하면 `apply`를 쓴다.
+        """
+
+    def claim_guest_wallet(self, guest_user_id: str, owner_user_id: str) -> int:
+        """guest 지갑 잔액을 계정 지갑으로 **한 transaction에** 옮긴다. 옮긴 양을 돌려준다.
+
+        **범용 이체가 아니다.** 금액을 받는 자리가 없다 — 옮기는 양은 서버가
+        transaction 안에서 읽은 guest 잔액 그 자체이고, 두 사람을 client가 고를 수도
+        없다(guest는 bearer token이, 계정은 검증된 Apple identity가 정한다).
+
+        멱등: 원장 열쇠가 `(guest, guest_claim, 계정)` · `(계정, guest_claim, guest)`
+        **한 쌍**이라 같은 조합은 두 번 반영되지 않는다. 재시도하면 `0`이다.
         """
 
 
@@ -512,3 +525,39 @@ class InMemoryShardStore:
 
         context.transaction.add(write)
         return wallet, entry, True
+
+    # MARK: - guest 지갑 인계
+
+    def claim_guest_wallet(self, guest_user_id: str, owner_user_id: str) -> int:
+        if guest_user_id == owner_user_id:
+            return 0
+        with self.transaction() as tx:
+            context = self.context(tx)
+            amount = self.wallet(guest_user_id).balance
+            if amount <= 0:
+                return 0
+            moved = stage_guest_claim(self, context, guest_user_id, owner_user_id, amount)
+        return moved
+
+
+def stage_guest_claim(store, context, guest_user_id: str, owner_user_id: str, amount: int) -> int:
+    """guest −, 계정 + 를 **같은 transaction에** 얹는다. 두 store가 같은 규칙을 쓴다.
+
+    한쪽만 중복이면(있을 수 없는 상태) 아무것도 남기지 않고 실패시킨다 —
+    조각이 조용히 사라지거나 복제되는 쪽이 훨씬 나쁘다.
+    """
+    _, _, debited = store.apply_in_transaction(
+        context, guest_user_id, -amount, ShardReason.GUEST_CLAIM,
+        idempotency_hash(guest_user_id, ShardReason.GUEST_CLAIM, owner_user_id),
+    )
+    if not debited:
+        # 이미 넘긴 조합이다. 계정 쪽도 이미 반영돼 있다.
+        return 0
+    _, _, credited = store.apply_in_transaction(
+        context, owner_user_id, amount, ShardReason.GUEST_CLAIM,
+        idempotency_hash(owner_user_id, ShardReason.GUEST_CLAIM, guest_user_id),
+    )
+    if not credited:
+        raise GuestClaimBroken("guest ledger pair is out of sync")
+    return amount
+

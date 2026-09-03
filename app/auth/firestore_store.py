@@ -95,6 +95,87 @@ class FirestoreAuthStore:
             raise StoreUnavailable("user document missing for identity")
         return user, False
 
+    # MARK: - guest
+
+    def create_guest_user(self) -> User:
+        """identity 없는 User 문서 하나. **transaction이 필요 없다** — 겨룰 문서가 없다.
+
+        `guest: true`가 이 문서의 유일한 차이다. 지갑 · 원장 · 구매는 계정과 **같은
+        경로**를 쓴다(guest 전용 경제를 따로 만들지 않는다).
+        """
+        user = User(is_guest=True)
+        try:
+            self._db.collection(USERS).document(user.id).set(
+                {"createdAt": user.created_at, "updatedAt": user.updated_at, "guest": True}
+            )
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("guest_create", error) from error
+        logger.info("guest_user_created")
+        return user
+
+    def link_identity(self, provider: str, subject: str, guest_user_id: str) -> tuple[User, bool]:
+        """guest 문서에 identity를 붙인다. **identity 문서가 승자를 정한다.**
+
+        `user_for_identity`와 같은 자리를 겨루므로 규칙도 같다 — 그 문서가 이미 있으면
+        새로 만들지 않고 그쪽 User를 돌려준다. 그때 guest는 그대로 guest로 남고,
+        조각은 호출부가 원장으로 옮긴다.
+        """
+        identity_ref = self._db.collection(IDENTITIES).document(identity_key(provider, subject))
+        user_ref = self._db.collection(USERS).document(guest_user_id)
+
+        @firestore.transactional
+        def run(transaction: firestore.Transaction) -> tuple[str, bool]:
+            snapshot = identity_ref.get(transaction=transaction)
+            guest = user_ref.get(transaction=transaction)
+            if snapshot.exists:
+                user_id = snapshot.get("userId")
+                if isinstance(user_id, str) and user_id:
+                    return user_id, False
+                raise StoreUnavailable("identity document has no userId")
+
+            if not guest.exists or (guest.to_dict() or {}).get("guest") is not True:
+                # 이미 계정인 User에 identity를 하나 더 붙이지 않는다.
+                raise StoreUnavailable("user is not a guest")
+
+            now = utcnow()
+            transaction.update(user_ref, {"guest": False, "updatedAt": now})
+            transaction.set(
+                identity_ref,
+                {"provider": provider, "userId": guest_user_id, "createdAt": now},
+            )
+            return guest_user_id, True
+
+        try:
+            user_id, linked = run(self._db.transaction())
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("identity_link", error) from error
+
+        user = self.user(user_id)
+        if user is None:
+            raise StoreUnavailable("user document missing for identity")
+        logger.info("apple_identity_linked adopted=%s", linked)
+        return user, linked
+
+    def mark_guest_claimed(self, guest_user_id: str, claimed_by: str) -> None:
+        """**한 번만 적힌다.** 이미 적혀 있으면 덮어쓰지 않는다 —
+        먼저 넘겨받은 계정이 주인이고, 나중 요청이 그것을 바꿀 수 없다.
+        """
+        user_ref = self._db.collection(USERS).document(guest_user_id)
+
+        @firestore.transactional
+        def run(transaction: firestore.Transaction) -> None:
+            snapshot = user_ref.get(transaction=transaction)
+            if not snapshot.exists or (snapshot.to_dict() or {}).get("claimedByUserId"):
+                return
+            transaction.update(
+                user_ref, {"claimedByUserId": claimed_by, "updatedAt": utcnow()}
+            )
+
+        try:
+            run(self._db.transaction())
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("guest_claim_mark", error) from error
+
     def user(self, user_id: str) -> User | None:
         try:
             snapshot = self._db.collection(USERS).document(user_id).get()
@@ -103,20 +184,9 @@ class FirestoreAuthStore:
 
         if not snapshot.exists:
             return None
-        data = snapshot.to_dict() or {}
-        return User(
-            id=user_id,
-            created_at=_as_datetime(data.get("createdAt")),
-            updated_at=_as_datetime(data.get("updatedAt")),
-            # 예전 문서에는 이 두 값이 없다. **migration을 돌리지 않는다** —
-            # 없으면 없는 것으로 읽고, 사용자가 이름을 정할 때 비로소 생긴다.
-            display_name=data.get("displayName"),
-            display_name_changed_at=(
-                _as_datetime(data["displayNameChangedAt"])
-                if data.get("displayNameChangedAt") is not None
-                else None
-            ),
-        )
+        # 예전 문서에는 이름 · guest 관련 값이 없다. **migration을 돌리지 않는다** —
+        # 없으면 없는 것으로 읽는다.
+        return _user_with_profile(user_id, snapshot.to_dict() or {})
 
     def is_admin(self, user_id: str) -> bool:
         """문서 하나 읽기. **cache를 만들지 않는다** — 운영자 요청은 극소량이고,
@@ -291,4 +361,6 @@ def _user_with_profile(user_id: str, data: dict) -> User:
             if data.get("displayNameChangedAt") is not None
             else None
         ),
+        is_guest=data.get("guest") is True,
+        claimed_by_user_id=data.get("claimedByUserId") or None,
     )

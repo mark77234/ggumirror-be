@@ -63,6 +63,13 @@ class User:
     #: 마지막으로 **사용자가 직접** 바꾼 시각. Apple이 넣어 준 최초 값은 여기 남기지
     #: 않는다 — 그래야 첫 로그인 직후에도 한 번은 바로 고칠 수 있다(30일 규칙 밖).
     display_name_changed_at: datetime | None = None
+    #: identity가 아직 붙지 않은 사용자. **서버가 발급한다** — client가 만든 UUID는
+    #: 어떤 경우에도 지갑 주인이 되지 않는다. 조각 구매에 로그인을 요구하지 않기
+    #: 위해서만 존재하고(App Store 5.1.1(v)), 판매자 기능은 그대로 계정이 필요하다.
+    is_guest: bool = False
+    #: 이 guest 지갑을 넘겨받은 계정. 로그인 뒤 **늦게 도착한 결제**를 그 계정으로
+    #: 보내는 데만 쓴다. 없으면 없는 것으로 읽는다(옛 문서에 이 field가 없다).
+    claimed_by_user_id: str | None = None
 
 
 @dataclass(frozen=True)

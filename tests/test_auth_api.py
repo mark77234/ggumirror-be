@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from app.auth.errors import AppleTokenError, AppleTokenReason
 from app.auth.models import SESSION_LIFETIME, Session, sha256_hex, utcnow
 from app.auth.store import InMemoryAuthStore, StoreUnavailable
+from app.shards.store import InMemoryShardStore
 from app.core.config import Settings
 from app.main import create_app
 from tests.conftest import CLIENT_ID, apple_claims
@@ -36,9 +37,12 @@ def client(store: InMemoryAuthStore, apple_key, jwks_of, monkeypatch) -> TestCli
     document = jwks_of(apple_key)
     monkeypatch.setattr(jwks_module, "http_jwks_fetch", lambda *a, **k: lambda: document)
 
+    # `POST /auth/apple`은 guest 지갑 인계 때문에 조각 원장도 본다 —
+    # 주지 않으면 Firestore로 fallback한다(개발 기기에서만 조용히 통하고 CI에서 503).
     app = create_app(
         Settings(app_env="local", apple_client_id=CLIENT_ID),
         auth_store=store,
+        shard_store=InMemoryShardStore(),
     )
     return TestClient(app)
 
@@ -298,7 +302,11 @@ def test_jwks_unavailable_returns_503(store, apple_key, monkeypatch):
         raise OSError("apple unreachable")
 
     monkeypatch.setattr(jwks_module, "http_jwks_fetch", lambda *a, **k: boom)
-    app = create_app(Settings(app_env="local", apple_client_id=CLIENT_ID), auth_store=store)
+    app = create_app(
+        Settings(app_env="local", apple_client_id=CLIENT_ID),
+        auth_store=store,
+        shard_store=InMemoryShardStore(),
+    )
     response = TestClient(app).post(
         "/auth/apple", json={"identityToken": token_for(apple_key), "nonce": RAW_NONCE}
     )
@@ -307,7 +315,11 @@ def test_jwks_unavailable_returns_503(store, apple_key, monkeypatch):
 
 def test_missing_apple_client_id_returns_503(store, apple_key):
     """설정이 빠진 것은 client 잘못이 아니다."""
-    app = create_app(Settings(app_env="local", apple_client_id=""), auth_store=store)
+    app = create_app(
+        Settings(app_env="local", apple_client_id=""),
+        auth_store=store,
+        shard_store=InMemoryShardStore(),
+    )
     response = TestClient(app).post(
         "/auth/apple", json={"identityToken": token_for(apple_key), "nonce": RAW_NONCE}
     )
@@ -369,6 +381,7 @@ def test_production_docs_closed(store):
     app = create_app(
         Settings(app_env="production", apple_client_id=CLIENT_ID, gcp_project_id="p"),
         auth_store=store,
+        shard_store=InMemoryShardStore(),
     )
     assert TestClient(app).get("/docs").status_code == 404
 

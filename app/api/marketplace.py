@@ -14,7 +14,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from pydantic import BaseModel, Field
 
-from app.api.deps import current_user, marketplace_service, push_service, store as auth_store_dep
+from app.api.deps import account_user, current_user, marketplace_service, push_service, store as auth_store_dep
 from app.push.service import PushService
 from app.auth.models import User
 from app.auth.store import AuthStore, StoreUnavailable
@@ -210,7 +210,7 @@ async def _read_capped(upload: UploadFile, limit: int, label: str) -> bytes:
 
 @router.post("/snapshots", status_code=status.HTTP_201_CREATED)
 async def create_snapshot(
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(account_user)],
     service: Annotated[MarketplaceService, Depends(marketplace_service)],
     contentType: Annotated[str, Form()],
     manifest: Annotated[UploadFile, File()],
@@ -389,7 +389,7 @@ def listing_detail(
 @router.post("/listings", status_code=status.HTTP_201_CREATED)
 def create_listing(
     request: DraftRequest,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(account_user)],
     service: Annotated[MarketplaceService, Depends(marketplace_service)],
 ) -> ListingResponse:
     try:
@@ -413,7 +413,7 @@ def create_listing(
 @router.post("/listings/{listing_id}/publish")
 def publish_listing(
     listing_id: str,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(account_user)],
     service: Annotated[MarketplaceService, Depends(marketplace_service)],
 ) -> PublishResponse:
     """**등록비와 게시가 한 commit이다.** 잔액이 모자라면 아무것도 바뀌지 않는다.
@@ -593,7 +593,7 @@ def unlike_listing(
 @router.post("/listings/{listing_id}/unpublish")
 def unpublish_listing(
     listing_id: str,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(account_user)],
     service: Annotated[MarketplaceService, Depends(marketplace_service)],
 ) -> ListingResponse:
     """목록에서 내린다. **조각이 움직이지 않는다.**"""
@@ -637,7 +637,7 @@ def my_purchases(
 
 @purchases_router.get("/listings")
 def my_listings(
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(account_user)],
     service: Annotated[MarketplaceService, Depends(marketplace_service)],
 ) -> list[_SellerListingResponse]:
     """**내가 올린 것 전부** — `draft` · `published` · `unlisted`.
@@ -668,7 +668,7 @@ def my_listings(
 @purchases_router.delete("/listings/{listing_id}")
 def delete_my_listing(
     listing_id: str,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(account_user)],
     service: Annotated[MarketplaceService, Depends(marketplace_service)],
 ) -> ListingResponse:
     """상품을 **삭제한다.** 판매자 본인만.
@@ -692,7 +692,7 @@ def delete_my_listing(
 @purchases_router.get("/listings/{listing_id}/preview")
 def my_listing_preview(
     listing_id: str,
-    user: Annotated[User, Depends(current_user)],
+    user: Annotated[User, Depends(account_user)],
     service: Annotated[MarketplaceService, Depends(marketplace_service)],
 ) -> Response:
     """**내가 올린 상품의 미리보기.** `draft` · `published` · `unlisted` 모두.

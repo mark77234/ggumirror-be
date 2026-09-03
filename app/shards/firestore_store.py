@@ -17,6 +17,7 @@ from google.api_core import exceptions as gcp_exceptions
 from google.cloud import firestore
 
 from app.auth.store import StoreUnavailable
+from app.shards.store import stage_guest_claim
 from app.shards.models import (
     ClaimOwnedByAnother,
     DocumentKey,
@@ -545,6 +546,41 @@ class FirestoreShardStore:
 
         context.stage(write)
         return wallet, entry, True
+
+    # MARK: - guest 지갑 인계
+
+    def claim_guest_wallet(self, guest_user_id: str, owner_user_id: str) -> int:
+        """guest 잔액을 계정으로 옮긴다. **읽기도 transaction 안에서 한다.**
+
+        밖에서 읽은 잔액으로 옮기면, 그 사이에 들어온 결제만큼이 guest 지갑에
+        남아 버린다(session은 곧 취소되므로 사실상 잃는다). 여기서 읽으면
+        그 사이의 변경이 commit을 깨고 재시도가 다시 읽는다.
+        """
+        if guest_user_id == owner_user_id:
+            return 0
+        guest_ref = self._db.collection(WALLETS).document(guest_user_id)
+
+        @firestore.transactional
+        def run(transaction: firestore.Transaction) -> int:
+            # ⚠️ context는 attempt마다 새로 만든다(B-7B.1).
+            scoped = self.context(transaction)
+            snapshot = guest_ref.get(transaction=transaction)
+            amount = _wallet(guest_user_id, snapshot.to_dict() or {}).balance if snapshot.exists else 0
+            if amount <= 0:
+                # 옮길 것이 없다. **문서를 만들지 않는다.**
+                return 0
+            moved = stage_guest_claim(self, scoped, guest_user_id, owner_user_id, amount)
+            # 두 지갑을 모두 읽은 뒤에 내려보낸다 — 먼저 쓰면 두 번째 읽기가 죽는다.
+            scoped.flush()
+            return moved
+
+        try:
+            moved = run(self._db.transaction())
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("guest_claim", error) from error
+
+        logger.info("shard_guest_claim moved=%d", moved)
+        return moved
 
     # MARK: - 내부
 

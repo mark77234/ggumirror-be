@@ -189,6 +189,19 @@ def bearer_token(request: Request) -> str:
     return token.strip()
 
 
+def optional_bearer_token(request: Request) -> str | None:
+    """Bearer가 있으면 준다. **없다고 401을 내지 않는다.**
+
+    로그인 전에도 부를 수 있는 경로(`POST /auth/apple`)가 "지금 들고 있는 guest
+    session"을 함께 받기 위한 것뿐이다. 인증 판단은 여전히 `current_user`가 한다.
+    """
+    header = request.headers.get("Authorization", "")
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    return token.strip()
+
+
 def current_user(
     token: Annotated[str, Depends(bearer_token)],
     auth_store: Annotated[AuthStore, Depends(store)],
@@ -224,6 +237,25 @@ def current_user(
 
 
 CurrentUser = Annotated[User, Depends(current_user)]
+
+
+SIGN_IN_REQUIRED = "이 기능은 Apple 로그인이 필요해요."
+
+
+def account_user(user: CurrentUser) -> User:
+    """**Apple 계정이 필요한 기능.** guest session은 여기서 막힌다.
+
+    조각을 사고 쓰는 것은 guest도 할 수 있다(App Store 5.1.1(v)). 계정이 필요한 것은
+    판매자 기능처럼 **사람에게 귀속돼야 하는** 일뿐이다 — 화면이 그것을 숨기는 것은
+    편의일 뿐이고, 실제 경계는 여기다.
+    """
+    if user.is_guest:
+        logger.info("account_required_denied")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, SIGN_IN_REQUIRED)
+    return user
+
+
+AccountUser = Annotated[User, Depends(account_user)]
 
 
 FORBIDDEN = "권한이 없어요."
