@@ -64,6 +64,7 @@ class SessionPayload(BaseModel):
 @router.post("/guest", response_model=SessionPayload, response_model_by_alias=True)
 def start_guest_session(
     auth_store: Annotated[AuthStore, Depends(store)],
+    guest_token: Annotated[str | None, Depends(optional_bearer_token)] = None,
 ) -> SessionPayload:
     """**로그인 없이** 쓰는 서버 신원 하나. 조각 구매에 계정을 요구하지 않기 위해서다.
 
@@ -73,9 +74,14 @@ def start_guest_session(
 
     나가는 것은 다른 로그인과 **같은 opaque session**이라, 이 뒤의 모든 경로는
     guest인지 계정인지 따로 알 필요가 없다.
+
+    **아직 살아 있는 guest session을 들고 오면 같은 사용자에게 새 session을 준다**(연장).
+    session은 30일이고 조각은 실제로 산 것이라, 오래 안 열었다고 지갑을 잃으면 안 된다.
+    옛 session은 **취소하지 않는다** — 응답을 잃은 client가 그 token으로 돌아올 수 있다.
     """
     try:
-        user = auth_store.create_guest_user()
+        # 계정 session으로 부르면 무시하고 새 guest를 만든다(`_guest_for`가 None).
+        user = _guest_for(auth_store, guest_token) or auth_store.create_guest_user()
         token = issue_session_token()
         session = new_session(user.id, token)
         auth_store.create_session(session)
@@ -83,7 +89,7 @@ def start_guest_session(
         # 재시도로 달라지는 실패다 — client는 다음 실행에서 다시 시도한다.
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
 
-    logger.info("guest_session_created")
+    logger.info("guest_session_created renewed=%s", guest_token is not None)
     return SessionPayload(
         access_token=token,
         expires_at=session.expires_at,

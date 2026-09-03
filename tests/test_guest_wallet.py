@@ -465,6 +465,61 @@ def test_seller_paths_still_need_an_apple_account(client, method, path):
     assert "Apple" in response.json()["detail"]
 
 
+def test_a_guest_session_renews_for_the_same_wallet(client, verifier):
+    """30일이 지나 지갑을 잃으면 안 된다 — 같은 사용자에게 새 session을 준다."""
+    user_id, token = guest(client)
+    buy(client, verifier, token, user_id, "tx-renew")
+
+    renewed = client.post("/auth/guest", headers=bearer(token))
+
+    assert renewed.status_code == 200
+    assert renewed.json()["user"]["id"] == user_id
+    fresh = renewed.json()["accessToken"]
+    assert fresh != token
+    assert balance(client, fresh) == 10
+    # 옛 token은 그대로 살아 있다 — 응답을 잃은 client가 돌아올 수 있어야 한다.
+    assert balance(client, token) == 10
+
+
+def test_an_account_session_does_not_become_a_guest(client, apple_key):
+    """계정 token으로 불러도 그 계정이 guest가 되지 않는다 — 새 guest가 나온다."""
+    account = sign_in(client, apple_key).json()
+
+    response = client.post("/auth/guest", headers=bearer(account["accessToken"]))
+
+    assert response.status_code == 200
+    assert response.json()["user"]["id"] != account["user"]["id"]
+
+
+@pytest.mark.parametrize(
+    "path", ["/users/me/attendance", "/users/me/rewarded-ads/context"]
+)
+def test_free_shard_paths_still_need_an_apple_account(client, path):
+    """**공짜 조각은 guest에게 주지 않는다.**
+
+    guest 신원은 요청 하나로 무한히 만들 수 있고 지갑은 로그인할 때 계정으로 넘어간다 —
+    열어 두면 "새 guest → 출석 → 넘기기"로 조각을 찍어낼 수 있다.
+    """
+    _, token = guest(client)
+
+    response = client.post(path, headers=bearer(token))
+
+    assert response.status_code == 403
+    assert "Apple" in response.json()["detail"]
+
+
+def test_an_account_still_claims_attendance(client, apple_key):
+    """막은 것은 guest뿐이다 — 계정의 출석은 그대로 동작한다."""
+    session = sign_in(client, apple_key).json()
+
+    response = client.post(
+        "/users/me/attendance", headers=bearer(session["accessToken"])
+    )
+
+    assert response.status_code == 200
+    assert response.json()["claimed"] is True
+
+
 def test_a_guest_cannot_take_a_display_name(client):
     _, token = guest(client)
 
