@@ -32,6 +32,25 @@ class AuthStore(Protocol):
         반환값의 bool은 "이번에 새로 만들었는지"다.
         """
 
+    def create_guest_user(self) -> User:
+        """identity 없는 User를 만든다. **조각 구매에 로그인을 요구하지 않기 위해서다.**
+
+        client가 만든 UUID를 지갑 주인으로 쓰지 않는다 — 그러면 남의 id를 적어
+        남의 지갑을 조회·충전할 수 있다. id는 서버가 만들고 session으로만 나간다.
+        """
+
+    def link_identity(self, provider: str, subject: str, guest_user_id: str) -> tuple[User, bool]:
+        """guest에 identity를 붙인다.
+
+        - 그 identity가 처음이면 **guest가 곧 그 계정이 된다**(`(guest, True)`).
+          지갑이 그대로 남으므로 옮길 것이 없다.
+        - 이미 다른 User가 그 identity를 갖고 있으면 **아무것도 붙이지 않고**
+          `(그 User, False)`다. 조각은 호출부가 원장으로 옮긴다.
+        """
+
+    def mark_guest_claimed(self, guest_user_id: str, claimed_by: str) -> None:
+        """이 guest 지갑을 누가 넘겨받았는지 적는다. **한 번 적히면 바뀌지 않는다.**"""
+
     def create_session(self, session: Session) -> None: ...
 
     def session_by_token_hash(self, token_hash: str) -> Session | None: ...
@@ -126,6 +145,34 @@ class InMemoryAuthStore:
         self.users[user.id] = user
         self.identities[key] = user.id
         return user, True
+
+    def create_guest_user(self) -> User:
+        user = User(is_guest=True)
+        self.users[user.id] = user
+        return user
+
+    def link_identity(self, provider: str, subject: str, guest_user_id: str) -> tuple[User, bool]:
+        key = identity_key(provider, subject)
+        existing = self.identities.get(key)
+        if existing is not None:
+            return self.users[existing], False
+
+        guest = self.users.get(guest_user_id)
+        if guest is None or not guest.is_guest:
+            # guest가 아닌 User에 identity를 덧붙이지 않는다 — 계정 하나에
+            # identity 둘이 붙는 경로를 만들지 않는다.
+            raise StoreUnavailable("user is not a guest")
+
+        user = replace(guest, is_guest=False, updated_at=utcnow())
+        self.users[user.id] = user
+        self.identities[key] = user.id
+        return user, True
+
+    def mark_guest_claimed(self, guest_user_id: str, claimed_by: str) -> None:
+        guest = self.users.get(guest_user_id)
+        if guest is None or guest.claimed_by_user_id is not None:
+            return
+        self.users[guest_user_id] = replace(guest, claimed_by_user_id=claimed_by)
 
     def create_session(self, session: Session) -> None:
         self.sessions[session.token_hash] = session

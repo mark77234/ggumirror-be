@@ -168,6 +168,9 @@ def create_app(
             shards=shards(),
             bundle_id=settings.apple_client_id,
             allowed_environments=parse_allowed_environments(settings.iap_allowed_environments),
+            # guest로 산 결제가 로그인 뒤에 늦게 도착할 수 있다 — 그 지갑을 넘겨받은
+            # 계정인지 확인하는 데만 쓴다.
+            users=store(),
         )
 
     @lru_cache(maxsize=1)

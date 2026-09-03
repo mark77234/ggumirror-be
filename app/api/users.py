@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from app.ads.service import RewardedAdService
 from app.api.deps import (
+    AccountUser,
     CurrentUser,
     account_deletion,
     rewarded_ad_service,
@@ -179,7 +180,8 @@ def delete_account(
 @router.patch("/me/profile", response_model=ProfilePayload, response_model_by_alias=True)
 def update_profile(
     body: DisplayNameRequest,
-    user: CurrentUser,
+    # 이름은 **판매자 신원**이다 — 상점에 이름으로 서는 일이라 계정이 필요하다.
+    user: AccountUser,
     auth_store: Annotated[AuthStore, Depends(auth_store_dep)],
 ) -> ProfilePayload:
     """이름을 바꾼다. **30일 규칙은 서버가 강제한다** — 기기 시계를 믿지 않는다."""

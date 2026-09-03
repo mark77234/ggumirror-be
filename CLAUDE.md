@@ -600,6 +600,56 @@ production 알림은 전송되지 않아, 검증되지 않은 코드가 실제 �
 
 `Transaction.currentEntitlements`는 **consumable 복구에 쓰지 않는다** — 소모품은 거기에 남지 않는다.
 
+### guest 지갑 (5.1.1(v)) — 조각은 로그인 없이 산다
+
+App Review 5.1.1(v): 소모품 조각은 계정 기반 기능이 아니므로 **구매에 회원가입을 요구하지 않는다.**
+그렇다고 client가 만든 UUID를 지갑 주인으로 믿지 않는다 — **익명 신원도 서버가 발급한다.**
+
+```
+POST /auth/guest      body 없음 · 인증 없음 → 기존 SessionPayload
+```
+
+- 이름 · 이메일 · 전화번호 · Apple 계정 · 어떤 개인정보도 받지 않는다.
+  **body를 받는 자리가 없다** — client가 userId를 실어 보내도 무시하고 서버가 UUID v4를 만든다
+- guest도 **같은 session 메커니즘**(opaque token · sha256 저장)이다.
+  새 인증 경로를 만들지 않았으므로 모든 기존 endpoint가 그대로 동작한다
+- user 문서에 `guest: true`가 붙는 것이 유일한 차이다. **지갑 · 원장 · IAP 검증은 완전히 같은 코드**다 —
+  `appAccountToken`은 여전히 필수이고, 전역 claim도 그대로다
+- rate limit이 없다(이 service에 rate limiter 자체가 없다). 정상 client는 설치당 한 번 부른다
+
+#### 로그인은 두 갈래다 — 지갑을 잃지 않는다
+
+`POST /auth/apple`에 guest bearer가 실려 오면:
+
+| Apple 신원이 | 처리 | 조각 이동 |
+|---|---|---|
+| **처음이다** | guest user가 **그대로 계정이 된다**(`guest: false`) | **없다** — 지갑이 그 자리에 있다 |
+| **이미 있다** | 기존 계정으로 로그인하고 guest 지갑을 **넘긴다** | 원장 **한 쌍**(guest −, 계정 +) |
+
+- 넘기는 것은 `ShardStore.claim_guest_wallet`이고 **범용 이체가 아니다** — 금액을 받는 자리가 없다.
+  금액은 transaction 안에서 읽은 guest 잔액이다(로그인 도중 들어온 지급도 함께 간다)
+- 멱등 열쇠는 기존 `idempotency_hash`다: `(guest, guest_claim, account)` · `(account, guest_claim, guest)`.
+  재시도 · 동시 요청 · 두 번째 계정 어느 쪽도 잔액을 복제할 수 없다 —
+  **새 collection을 만들지 않았다**
+- 성공하면 guest session을 **폐기한다.** 그 신원으로 다시 조회 · 구매할 수 없다
+- 이관 뒤 계정이 바뀌므로, `guest: true` 문서에 `claimedByUserId`를 **잔액이 0이어도** 적는다.
+  로그인 직전에 산 결제가 늦게 도착하면 `IAPService._check_owner`가 그 값을 보고
+  **넘겨받은 계정에게만** 지급한다. 서버가 적은 값이 근거이고 client가 고를 수 없다
+- **Apple 환불은 원본 claim의 주인(=guest 지갑)에서 회수한다.** 이관 뒤라면 그 지갑이 비어 있어
+  `recovered=0 · unrecovered=전액`이다 — 조각을 쓴 뒤 환불과 같은 결과이고,
+  `unrecovered`는 빚이 아니다(B-6F-B). **엉뚱한 지갑에서 빼지 않는다**
+
+#### 계정이 필요한 것은 그대로다
+
+판매자 · 신원에 묶인 기능만 Apple 로그인을 요구한다(`Depends(account_user)` → **403**):
+snapshot 업로드 · listing 생성/게시/내리기/삭제 · 내 판매 목록 · 판매자 미리보기 · 표시 이름.
+
+**사는 쪽은 전부 guest도 된다**: 상점 조회 · 구매 · 좋아요 · 내 구매 목록 ·
+template/asset 내려받기 · 출석 · 광고 · AI 스티커 · 조각 IAP.
+
+`tests/test_guest_wallet.py`가 위 전부를 고정한다.
+
+
 ### 호출자가 소유하는 transaction (B-7B) — Marketplace의 토대
 
 `credit` / `debit` / `refund_iap` / `reverse_iap_refund`는 **각자 transaction을 열고 닫는다.**
