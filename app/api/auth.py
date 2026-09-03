@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from app.api.deps import bearer_token, store, verifier
 from app.auth.apple import AppleTokenVerifier
 from app.auth.errors import AppleTokenError
+from app.auth.profile import InvalidDisplayName, normalize_display_name
 from app.auth.models import APPLE_PROVIDER, issue_session_token, new_session, sha256_hex
 from app.auth.store import AuthStore, StoreUnavailable
 
@@ -31,11 +32,17 @@ STORE_FAILED = "로그인 정보를 저장하지 못했어요. 잠시 뒤 다시
 
 
 class AppleSignInRequest(BaseModel):
-    """client가 보내는 것은 이 둘뿐이다. authorizationCode는 받지 않는다."""
+    """client가 보내는 것은 token · nonce, 그리고 **선택적인 이름**뿐이다.
+
+    `displayName`은 **optional이다** — 1.0.7 client는 보내지 않고 그래도 정상이다.
+    Apple은 보통 최초 authorization에서만 이름을 주므로 이후 로그인에는 없다.
+    """
 
     identity_token: str = Field(alias="identityToken", min_length=1, max_length=8192)
     # client가 만든 raw nonce. server가 SHA-256으로 바꿔 token claim과 비교한다.
     nonce: str = Field(min_length=1, max_length=256)
+    # **서명된 값이 아니다.** 신원·권한 판단에 쓰지 않고 첫 이름을 채우는 데만 쓴다.
+    display_name: str | None = Field(default=None, alias="displayName", max_length=128)
 
     model_config = {"populate_by_name": True}
 
@@ -73,6 +80,15 @@ def sign_in_with_apple(
     # 2. identity → internal User (없으면 생성). 같은 subject면 항상 같은 User다.
     try:
         user, created = auth_store.user_for_identity(APPLE_PROVIDER, identity.subject)
+        # 3. Apple이 이름을 줬고 **아직 이름이 없을 때만** 채운다.
+        #    이미 사용자가 정한 이름이 있으면 건드리지 않는다 — 로그인할 때마다
+        #    Apple 이름으로 되돌아가면 사용자가 바꾼 의미가 사라진다.
+        #    이름 하나 때문에 로그인이 실패하면 안 되므로 검증 실패는 조용히 넘긴다.
+        if body.display_name is not None and user.display_name is None:
+            try:
+                user = auth_store.seed_display_name(user.id, normalize_display_name(body.display_name))
+            except InvalidDisplayName:
+                logger.info("apple_sign_in_display_name_rejected")
         token = issue_session_token()
         session = new_session(user.id, token)
         auth_store.create_session(session)

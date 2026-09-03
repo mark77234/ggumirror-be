@@ -45,6 +45,66 @@ class Settings:
     # 추측한 값을 넣지 않는다.
     admob_ssv_expected_ad_unit: str = ""
     admob_reward_item: str = ""
+    # AI 스티커 provider. **key는 서버에만 있다** — client bundle에 넣지 않는다.
+    #
+    # 비어 있으면 fail closed다: 서비스는 뜨고 다른 기능은 그대로이며,
+    # `GET /ai/stickers/config`가 `available=false`를 돌려줘 client가 CTA를 감춘다.
+    # 앱을 다시 빌드하지 않고 이 값만 채우면 기능이 열린다.
+    #
+    # model은 아무거나 넣을 수 없다 — 우리 요청 모양으로 PNG를 주는 것이 확인된 것만
+    # 통과한다(`app/ai/provider.py`의 `SUPPORTED_MODELS`). production 기본값은 `gpt-image-2`다.
+    # **투명 배경은 요구하지 않는다** — 배경제거는 기기가 한다(A-1B.2).
+    # production에서는 **Secret Manager reference로 주입한다** — plain env value로 넣지 않는다.
+    # (`gcloud run deploy --set-secrets=AI_IMAGE_API_KEY=ggumirror-openai-api-key:latest`)
+    # 값은 로그에 남기지 않는다. 이 필드를 print / repr에 싣는 코드를 만들지 않는다.
+    ai_image_api_key: str = ""
+    ai_image_model: str = ""
+
+    # MARK: - 판매 알림 (Phase F)
+    #
+    # **넷이 모두 있어야 보낸다.** 하나라도 없으면 아무것도 보내지 않는다 —
+    # 반쯤 설정된 상태로 시도하다 실패하는 것보다 안 보내는 것이 낫다.
+    # private key는 **Secret Manager에서만** 온다. repo에도 client에도 없다.
+    apns_key_id: str = ""
+    apns_team_id: str = ""
+    apns_private_key: str = ""
+    apns_bundle_id: str = ""
+
+    #: 정기 발송 endpoint의 추가 자물쇠(선택). OIDC 검증이 1차 방어이고 이건 2차다.
+    jobs_token: str = ""
+
+    # MARK: - 정기 발송 호출자 (Phase J)
+    #
+    # **Cloud Run IAM이 이 경로를 지켜 주지 않는다** — 이 service는 `allUsers`에게
+    # 열려 있다(로그인 없이 상점을 봐야 한다). 그래서 앱이 직접 확인한다.
+    # 둘 중 하나라도 비어 있으면 `/jobs/*`는 **전부 막힌다.**
+    scheduler_service_account: str = ""
+    scheduler_audience: str = ""
+    ai_image_quality: str = "low"
+    # 생성 결과를 잠시 두는 꾸미러 전용 private bucket. **DailyOPIc bucket을 쓰지 않는다.**
+    #
+    # 비어 있으면 fail closed다 — 결과를 durable하게 두지 못하면 응답이 유실됐을 때
+    # 복구할 방법이 없고, 그건 A-1A의 구멍 그대로다.
+    ai_result_bucket: str = ""
+    #: Marketplace snapshot asset bucket. **AI 결과 bucket과 다른 것**이다 —
+    #: 그쪽은 7일 lifecycle, 이쪽은 영구 보존이다. 비어 있으면 업로드/전달이 fail closed.
+    marketplace_asset_bucket: str = ""
+    # 조각 IAP가 받아들일 Apple 환경. 쉼표로 나눈다 — 예: `Production,Sandbox`.
+    #
+    # **비어 있으면 아무것도 허용하지 않는다(fail closed).** 지금이 그 상태다.
+    # Sandbox는 TestFlight · App Review · sandbox E2E에 필요하지만, Debug 빌드도
+    # production API를 쓰기 때문에 켜 두면 sandbox 결제가 production 경제에 들어온다.
+    # 그래서 **명시적으로 켤 때만** 허용한다.
+    #
+    # `Xcode`는 값에 적어도 무시된다(`parse_allowed_environments`) —
+    # 로컬 서명이라 신뢰 사슬이 없고, 받아 주면 누구나 조각을 만들 수 있다.
+    iap_allowed_environments: str = ""
+    # App Store의 **numeric Apple ID**(adamId). Production verifier에 필수다 —
+    # Apple 공식 library가 `Environment.PRODUCTION`에서 이 값 없이는 verifier를
+    # 만들지도 못한다. 없으면 Production IAP만 조용히 꺼진다(fail closed).
+    # bundle id와 다른 값이고, App Store Connect > App Information에서 확인한다.
+    # secret이 아니다(공개 앱 식별자).
+    iap_app_apple_id: int | None = None
 
     @property
     def is_production(self) -> bool:
@@ -89,6 +149,24 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     admob_ssv_expected_ad_unit = env.get("ADMOB_SSV_EXPECTED_AD_UNIT", "").strip()
     admob_reward_item = env.get("ADMOB_REWARD_ITEM", "").strip()
 
+    # production에서도 필수가 아니다. 없으면 AI 스티커만 조용히 꺼진다.
+    ai_image_api_key = env.get("AI_IMAGE_API_KEY", "").strip()
+    ai_image_model = env.get("AI_IMAGE_MODEL", "").strip()
+    ai_image_quality = env.get("AI_IMAGE_QUALITY", "").strip() or "low"
+    ai_result_bucket = env.get("AI_RESULT_BUCKET", "").strip()
+    marketplace_asset_bucket = env.get("MARKETPLACE_ASSET_BUCKET", "").strip()
+    iap_allowed_environments = env.get("IAP_ALLOWED_ENVIRONMENTS", "").strip()
+
+    raw_app_apple_id = env.get("IAP_APP_APPLE_ID", "").strip()
+    if raw_app_apple_id:
+        try:
+            iap_app_apple_id: int | None = int(raw_app_apple_id)
+        except ValueError as error:
+            # 조용히 무시하면 Production IAP가 이유 없이 꺼진 것처럼 보인다.
+            raise ValueError(f"IAP_APP_APPLE_ID={raw_app_apple_id!r} is not an integer") from error
+    else:
+        iap_app_apple_id = None
+
     return Settings(
         app_env=app_env,
         log_level=log_level,
@@ -98,6 +176,24 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         firestore_database=firestore_database,
         admob_ssv_expected_ad_unit=admob_ssv_expected_ad_unit,
         admob_reward_item=admob_reward_item,
+        ai_image_api_key=ai_image_api_key,
+        ai_image_model=ai_image_model,
+        ai_image_quality=ai_image_quality,
+        ai_result_bucket=ai_result_bucket,
+        marketplace_asset_bucket=marketplace_asset_bucket,
+        iap_allowed_environments=iap_allowed_environments,
+        iap_app_apple_id=iap_app_apple_id,
+        # **값을 여기서 검사하지 않는다.** 없으면 없는 대로 두고 provider가
+        # `is_available=False`가 된다 — 알림 자격 증명이 없다고 앱이 뜨지 않으면
+        # 상점도 로그인도 함께 죽는다.
+        apns_key_id=(env.get("APNS_KEY_ID") or "").strip(),
+        apns_team_id=(env.get("APNS_TEAM_ID") or "").strip(),
+        # 줄바꿈이 들어간 PEM이다. Secret Manager가 원문 그대로 준다.
+        apns_private_key=env.get("APNS_PRIVATE_KEY") or "",
+        apns_bundle_id=(env.get("APNS_BUNDLE_ID") or "").strip(),
+        jobs_token=(env.get("JOBS_TOKEN") or "").strip(),
+        scheduler_service_account=(env.get("SCHEDULER_SERVICE_ACCOUNT") or "").strip(),
+        scheduler_audience=(env.get("SCHEDULER_AUDIENCE") or "").strip(),
     )
 
 

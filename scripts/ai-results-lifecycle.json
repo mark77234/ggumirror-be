@@ -1,0 +1,11 @@
+{
+  "_comment": "AI 생성 결과의 보관 기간. 앱이 지우러 다니지 않고 bucket이 정리한다. app/ai/models.py의 RESULT_RETENTION(7일)과 같은 값이어야 한다 — 서버가 '아직 받을 수 있다'고 답하는데 object가 없으면 사용자는 이유 없이 못 받는다.",
+  "lifecycle": {
+    "rule": [
+      {
+        "action": { "type": "Delete" },
+        "condition": { "age": 7 }
+      }
+    ]
+  }
+}

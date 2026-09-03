@@ -6,10 +6,18 @@ repository interface 계층을 더 쌓지 않고, 구현은 Firestore 하나 + t
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from typing import Protocol
 
 from app.auth.models import Session, User, identity_key, utcnow
+from app.auth.profile import (
+    DisplayNameCooldown,
+    DisplayNameTaken,
+    can_change,
+    display_name_key,
+    next_change_at,
+)
 
 
 class StoreUnavailable(Exception):
@@ -33,6 +41,33 @@ class AuthStore(Protocol):
 
     def user(self, user_id: str) -> User | None: ...
 
+    def is_admin(self, user_id: str) -> bool:
+        """**운영자 권한의 authority는 이 한 곳이다.**
+
+        `User` 문서에 `isAdmin`을 두지 않는다 — 그러면 프로필을 쓰는 모든 경로가
+        권한을 건드릴 수 있는 자리가 되고, `/users/me` 응답에 실려 나가면 client가
+        자기 권한을 아는 것처럼 보인다. 별도 collection이면 **쓰는 경로가 없다** —
+        운영자 등록은 사람이 Firestore에서 직접 한다.
+
+        이름 · 이메일 · Apple subject로 판단하지 않는다. 그것들은 사용자가 바꿀 수
+        있거나 로그인 때마다 달라진다.
+        """
+
+
+    def seed_display_name(self, user_id: str, name: str) -> User:
+        """Apple이 준 이름으로 **비어 있을 때만** 채운다.
+
+        이미 이름이 있으면 아무것도 하지 않는다 — 로그인할 때마다 사용자가 정한
+        이름이 Apple 이름으로 되돌아가면 안 된다. 30일 규칙도 소비하지 않는다.
+        """
+
+    def set_display_name(self, user_id: str, name: str, now: datetime) -> User:
+        """사용자가 직접 바꾼다. **30일 규칙을 여기서 강제한다.**
+
+        읽고-검사하고-쓰는 일이 한 transaction 안에 있어야 한다. 나누면 동시에 들어온
+        두 요청이 둘 다 통과해 연속으로 이름을 바꿀 수 있다.
+        """
+
 
 class InMemoryAuthStore:
     """test / local용. Firestore에 붙지 않는다."""
@@ -41,6 +76,45 @@ class InMemoryAuthStore:
         self.users: dict[str, User] = {}
         self.identities: dict[str, str] = {}
         self.sessions: dict[str, Session] = {}
+        #: 운영자 allowlist. test에서 직접 채운다 — API로 쓰는 경로가 없다.
+        self.admins: dict[str, bool] = {}
+        #: `display_name_key` → user id. **이름 하나에 사람 하나다.**
+        self.name_claims: dict[str, str] = {}
+
+    def seed_display_name(self, user_id: str, name: str) -> User:
+        user = self.users[user_id]
+        if user.display_name is None:
+            # **이미 쓰이는 이름이면 채우지 않는다.** Apple이 준 이름 때문에
+            # 로그인이 실패하면 안 되므로, 조용히 비워 둔다 —
+            # 상점에 올릴 때 사용자가 직접 고른다.
+            key = display_name_key(name)
+            if self._name_owner(key) is None:
+                self.name_claims[key] = user_id
+                user = replace(user, display_name=name)
+                self.users[user_id] = user
+        return user
+
+    def set_display_name(self, user_id: str, name: str, now: datetime) -> User:
+        user = self.users[user_id]
+        if not can_change(user.display_name_changed_at, now):
+            raise DisplayNameCooldown(next_change_at(user.display_name_changed_at))
+        key = display_name_key(name)
+        owner = self._name_owner(key)
+        if owner is not None and owner != user_id:
+            raise DisplayNameTaken(name)
+        # **먼저 잡고 나중에 놓는다.** 순서가 반대면 중간에 실패했을 때
+        # 예전 이름도 잃고 새 이름도 못 얻는다.
+        self.name_claims[key] = user_id
+        if user.display_name is not None:
+            previous = display_name_key(user.display_name)
+            if previous != key:
+                self.name_claims.pop(previous, None)
+        user = replace(user, display_name=name, display_name_changed_at=now)
+        self.users[user_id] = user
+        return user
+
+    def _name_owner(self, key: str) -> str | None:
+        return self.name_claims.get(key)
 
     def user_for_identity(self, provider: str, subject: str) -> tuple[User, bool]:
         key = identity_key(provider, subject)
@@ -74,3 +148,7 @@ class InMemoryAuthStore:
 
     def user(self, user_id: str) -> User | None:
         return self.users.get(user_id)
+
+    def is_admin(self, user_id: str) -> bool:
+        # 문서가 있어도 `enabled`가 아니면 운영자가 아니다 — 지우지 않고 끌 수 있다.
+        return self.admins.get(user_id, False)

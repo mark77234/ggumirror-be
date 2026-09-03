@@ -16,6 +16,13 @@ from uuid import uuid4
 from google.api_core import exceptions as gcp_exceptions
 from google.cloud import firestore
 
+from app.auth.profile import (
+    DisplayNameCooldown,
+    DisplayNameTaken,
+    can_change,
+    display_name_key,
+    next_change_at,
+)
 from app.auth.models import Session, User, identity_key, utcnow
 from app.auth.store import StoreUnavailable
 
@@ -24,6 +31,11 @@ logger = logging.getLogger(__name__)
 USERS = "ggumirror_users"
 IDENTITIES = "ggumirror_auth_identities"
 SESSIONS = "ggumirror_sessions"
+#: 운영자 allowlist. **client가 쓸 수 있는 경로가 없다** — 사람이 직접 만든다.
+ADMIN_USERS = "ggumirror_admin_users"
+#: 사용자 이름 자리. 문서 id가 `display_name_key(이름)`이라 **이름 하나에 문서 하나**다.
+#: 그 자체가 uniqueness 보증이고, transaction 안에서 읽고 쓴다.
+USERNAME_CLAIMS = "ggumirror_username_claims"
 
 
 class FirestoreAuthStore:
@@ -96,7 +108,117 @@ class FirestoreAuthStore:
             id=user_id,
             created_at=_as_datetime(data.get("createdAt")),
             updated_at=_as_datetime(data.get("updatedAt")),
+            # 예전 문서에는 이 두 값이 없다. **migration을 돌리지 않는다** —
+            # 없으면 없는 것으로 읽고, 사용자가 이름을 정할 때 비로소 생긴다.
+            display_name=data.get("displayName"),
+            display_name_changed_at=(
+                _as_datetime(data["displayNameChangedAt"])
+                if data.get("displayNameChangedAt") is not None
+                else None
+            ),
         )
+
+    def is_admin(self, user_id: str) -> bool:
+        """문서 하나 읽기. **cache를 만들지 않는다** — 운영자 요청은 극소량이고,
+        cache가 있으면 권한을 껐을 때 언제 실제로 꺼지는지가 불확실해진다.
+
+        `enabled`가 참일 때만 운영자다. 문서를 지우지 않고 끌 수 있어야
+        기록(누가 언제 운영자였는지)이 남는다.
+        """
+        try:
+            snapshot = self._db.collection(ADMIN_USERS).document(user_id).get()
+        except gcp_exceptions.GoogleAPIError as error:
+            # **읽기 실패를 "운영자 아님"으로 바꾸지 않는다** — 그러면 Firestore가
+            # 흔들릴 때 조용히 권한이 사라진 것처럼 보인다. 503으로 올린다.
+            raise self._unavailable("admin_lookup", error) from error
+        return bool(snapshot.exists and (snapshot.to_dict() or {}).get("enabled") is True)
+
+    # MARK: - 프로필 이름
+
+    def seed_display_name(self, user_id: str, name: str) -> User:
+        """**비어 있을 때만** 채운다. 이미 있으면 그대로 둔다.
+
+        transaction 안에서 읽고 쓴다 — 동시에 두 번 로그인해도 한쪽만 쓴다.
+        `displayNameChangedAt`은 **남기지 않는다**: Apple이 넣어 준 값은 사용자가
+        고른 것이 아니므로 30일 규칙을 소비하면 안 된다.
+        """
+        user_ref = self._db.collection(USERS).document(user_id)
+
+        @firestore.transactional
+        def run(transaction: firestore.Transaction) -> User:
+            snapshot = user_ref.get(transaction=transaction)
+            if not snapshot.exists:
+                raise StoreUnavailable("user document missing")
+            data = snapshot.to_dict() or {}
+            if data.get("displayName"):
+                return _user_with_profile(user_id, data)
+            # **이미 쓰이는 이름이면 채우지 않는다.** Apple이 준 이름 때문에
+            # 로그인이 실패하면 안 되므로 조용히 비워 둔다 —
+            # 상점에 올릴 때 사용자가 직접 고른다.
+            claim_ref = self._db.collection(USERNAME_CLAIMS).document(display_name_key(name))
+            claim = claim_ref.get(transaction=transaction)
+            if claim.exists and (claim.to_dict() or {}).get("userId") != user_id:
+                return _user_with_profile(user_id, data)
+            transaction.set(claim_ref, {"userId": user_id, "createdAt": utcnow()})
+            transaction.update(user_ref, {"displayName": name, "updatedAt": utcnow()})
+            return _user_with_profile(user_id, {**data, "displayName": name})
+
+        try:
+            return run(self._db.transaction())
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("display_name_seed", error) from error
+
+    def set_display_name(self, user_id: str, name: str, now: datetime) -> User:
+        """사용자가 직접 바꾼다. **읽기·검사·쓰기가 한 transaction이다.**
+
+        나누면 동시에 들어온 두 요청이 둘 다 "아직 30일 안 지났나? 아니네" 하고
+        지나가 이름이 연속으로 바뀐다.
+        """
+        user_ref = self._db.collection(USERS).document(user_id)
+
+        @firestore.transactional
+        def run(transaction: firestore.Transaction) -> User:
+            snapshot = user_ref.get(transaction=transaction)
+            if not snapshot.exists:
+                raise StoreUnavailable("user document missing")
+            data = snapshot.to_dict() or {}
+            changed_at = (
+                _as_datetime(data["displayNameChangedAt"])
+                if data.get("displayNameChangedAt") is not None
+                else None
+            )
+            if not can_change(changed_at, now):
+                raise DisplayNameCooldown(next_change_at(changed_at))
+
+            # **이름 하나에 사람 하나다.** 읽기·검사·쓰기가 이 transaction 안에 있어
+            # 같은 이름을 동시에 적은 두 사람 중 한 명만 통과한다.
+            key = display_name_key(name)
+            claim_ref = self._db.collection(USERNAME_CLAIMS).document(key)
+            claim = claim_ref.get(transaction=transaction)
+            if claim.exists and (claim.to_dict() or {}).get("userId") != user_id:
+                raise DisplayNameTaken(name)
+
+            # 예전 이름의 자리는 **새 자리를 잡은 뒤에** 놓는다. 순서가 반대면
+            # 중간에 실패했을 때 예전 이름도 잃고 새 이름도 못 얻는다.
+            previous = data.get("displayName")
+            transaction.set(claim_ref, {"userId": user_id, "createdAt": now})
+            if previous and display_name_key(previous) != key:
+                transaction.delete(
+                    self._db.collection(USERNAME_CLAIMS).document(display_name_key(previous))
+                )
+
+            transaction.update(
+                user_ref,
+                {"displayName": name, "displayNameChangedAt": now, "updatedAt": now},
+            )
+            return _user_with_profile(
+                user_id, {**data, "displayName": name, "displayNameChangedAt": now}
+            )
+
+        try:
+            return run(self._db.transaction())
+        except gcp_exceptions.GoogleAPIError as error:
+            raise self._unavailable("display_name_set", error) from error
 
     # MARK: - session
 
@@ -155,3 +277,18 @@ def _as_datetime(value: object) -> datetime:
 
 def _as_optional_datetime(value: object) -> datetime | None:
     return value if isinstance(value, datetime) else None
+
+
+def _user_with_profile(user_id: str, data: dict) -> User:
+    """문서 하나를 User로. **없는 값은 없는 것으로 읽는다** — 기본 이름을 지어내지 않는다."""
+    return User(
+        id=user_id,
+        created_at=_as_datetime(data.get("createdAt")),
+        updated_at=_as_datetime(data.get("updatedAt")),
+        display_name=data.get("displayName"),
+        display_name_changed_at=(
+            _as_datetime(data["displayNameChangedAt"])
+            if data.get("displayNameChangedAt") is not None
+            else None
+        ),
+    )

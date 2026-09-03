@@ -85,7 +85,13 @@ def content_for(
     reward_amount: int = 1,
     reward_item: str = REWARD_ITEM,
 ) -> str:
-    """Google이 실제로 보내는 순서를 흉내 낸다(알파벳 순이 아니다)."""
+    """Google이 실제로 보내는 순서를 흉내 낸다(알파벳 순이 아니다).
+
+    기본 timestamp는 고정 날짜다 — 대부분의 test가 그 날짜로 상태를 직접 조회하므로
+    결정적이어야 한다. 다만 **서버의 "오늘"을 쓰는 경로**(HTTP `GET /users/me/rewarded-ads`)를
+    지나는 test는 이 기본값을 쓰면 자정을 넘기는 순간 깨진다 — 그쪽은 `timestamp=today_kst()`를
+    명시적으로 넘긴다.
+    """
     moment = timestamp or datetime(2026, 8, 16, 10, 0, tzinfo=KST)
     milliseconds = int(moment.timestamp() * 1000)
     return (
@@ -923,7 +929,11 @@ def test_issued_context_resolves_to_its_owner(client, apple_key, google, shard_s
     user_id = client.get("/users/me", headers=headers).json()["id"]
     context = client.post("/users/me/rewarded-ads/context", headers=headers).json()["context"]
 
-    query = google.callback_query(content_for(transaction_id="real-1", custom_data=context))
+    # 상태 조회는 **서버의 오늘**을 본다. 고정 날짜로 지급하면 자정을 넘기는 순간
+    # "지급은 어제 몫, 조회는 오늘 몫"이 되어 시계 때문에 깨진다.
+    query = google.callback_query(content_for(
+        transaction_id="real-1", custom_data=context, timestamp=datetime.now(KST)
+    ))
     assert client.get(f"/admob/rewarded/ssv?{query}").status_code == 200
 
     assert shard_store.wallet(user_id).balance == 1
@@ -1009,3 +1019,83 @@ def test_redaction_leaves_other_paths_alone():
     )
     RedactSensitiveQuery().filter(record)
     assert record.getMessage() == "/users/me/shards?userId=someone"
+
+
+# MARK: - ad unit 진단 로그 (설정값을 확정하기 위한 최소 노출)
+
+
+def test_unconfigured_logs_observed_ad_unit(shard_store, contexts, google, caplog):
+    """설정 전이라도 **검증된 ad_unit 값은** 한 번 봐야 채울 수 있다.
+
+    이 로그가 `ADMOB_SSV_EXPECTED_AD_UNIT`을 확정하는 유일한 근거다 —
+    platform request log는 exclusion으로 저장되지 않기 때문이다.
+    """
+    import logging
+
+    ads = RewardedAdService(
+        shards=ShardLedgerService(shard_store),
+        contexts=contexts,
+        keys=AdMobKeyProvider(fetch=lambda: google.document),
+        config=RewardedAdConfig(ad_unit="", reward_item=""),  # 미설정 = 현재 production 상태
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(RewardedAdError) as error:
+            call(ads, google.callback_query(content_for(ad_unit="1234567890")))
+
+    assert error.value.reason is RewardedAdReason.NOT_CONFIGURED
+    assert "observed_ad_unit=1234567890" in caplog.text
+    assert shard_store.entries == []
+
+
+def test_unexpected_ad_unit_logs_the_observed_value(ads, google, shard_store, caplog):
+    import logging
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(RewardedAdError):
+            call(ads, google.callback_query(content_for(ad_unit="9999999999")))
+
+    assert "observed_ad_unit=9999999999" in caplog.text
+    assert shard_store.entries == []
+
+
+def test_invalid_signature_never_logs_an_ad_unit(ads, google, shard_store, caplog):
+    """**서명이 틀리면 ad_unit을 읽지도 남기지도 않는다.**
+
+    검증 전 값을 로그에 남기면, 아무나 우리 로그에 원하는 문자열을 적을 수 있다.
+    """
+    import logging
+
+    content = content_for(ad_unit="ATTACKER_CONTROLLED")
+    forged = f"{content}&signature=AAAA&key_id={google.key_id}"
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(RewardedAdError):
+            call(ads, forged)
+
+    assert "observed_ad_unit" not in caplog.text
+    assert "ATTACKER_CONTROLLED" not in caplog.text
+    assert shard_store.entries == []
+
+
+def test_diagnostic_log_never_leaks_credentials(shard_store, contexts, google, caplog):
+    """ad_unit 하나만 늘었을 뿐, 나머지는 그대로 로그에 없다."""
+    import logging
+
+    ads = RewardedAdService(
+        shards=ShardLedgerService(shard_store),
+        contexts=contexts,
+        keys=AdMobKeyProvider(fetch=lambda: google.document),
+        config=RewardedAdConfig(ad_unit="", reward_item=""),
+    )
+    query = google.callback_query(
+        content_for(ad_unit="1234567890", custom_data="secret-context", transaction_id="secret-txn")
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(RewardedAdError):
+            call(ads, query)
+
+    assert "observed_ad_unit=1234567890" in caplog.text
+    for secret in ("secret-context", "secret-txn", "signature=", "custom_data"):
+        assert secret not in caplog.text, f"로그에 {secret}이 새어 나갔다"

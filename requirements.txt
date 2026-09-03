@@ -7,3 +7,20 @@ uvicorn==0.40.0
 pyjwt[crypto]==2.12.0
 # Firestore. iOS는 Firestore에 직접 붙지 않는다 — 이 backend만 접근한다.
 google-cloud-firestore==2.22.0
+# AI 생성 결과를 잠시 두는 private bucket. **client는 bucket에 직접 붙지 않는다** —
+# signed URL을 만들지 않고 우리 endpoint로만 스트리밍한다.
+google-cloud-storage==3.4.1
+# Apple StoreKit transaction JWS 검증. **x5c 인증서 체인 검증기를 직접 만들지 않는다** —
+# 체인·만료·폐기 판단을 우리가 지면 틀렸을 때 조각이 공짜가 된다.
+# App Store Server **API**는 부르지 않으므로 .p8 / issuerId / keyId가 필요 없다.
+app-store-server-library==3.1.2
+
+# Marketplace snapshot 업로드(multipart/form-data)에 필요하다.
+# multipart 파싱을 직접 만들지 않는다 — 경계 처리·인코딩·크기 제한을 우리가 지면
+# 틀렸을 때 그대로 취약점이 된다. FastAPI가 권장하는 표준 구현을 쓴다.
+python-multipart==0.0.32
+
+# APNs 판매 알림. **APNs는 HTTP/1.1을 받지 않는다** — urllib으로는 보낼 수 없어서
+# HTTP/2 client가 필요하다. 다른 outbound 호출(OpenAI · Apple JWKS)은 계속 urllib을
+# 쓴다 — 이것 하나 때문에 전부 옮기지 않는다.
+httpx[http2]==0.28.1

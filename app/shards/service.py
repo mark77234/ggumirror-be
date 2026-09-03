@@ -18,13 +18,20 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 from app.shards.models import (
     MAX_DELTA,
+    DocumentKey,
+    ExclusiveClaim,
     InvalidShardAmount,
     PeriodQuota,
+    RefundPlan,
     ShardMutationResult,
     ShardReason,
+    ShardRefundResult,
+    ShardTransactionContext,
+    ShardRefundReversalResult,
     ShardWallet,
     idempotency_hash,
 )
@@ -78,6 +85,7 @@ class ShardLedgerService:
         external_event_id: str | None = None,
         period: str | None = None,
         limit: int | None = None,
+        claim: ExclusiveClaim | None = None,
     ) -> ShardMutationResult:
         """조각을 준다.
 
@@ -97,7 +105,9 @@ class ShardLedgerService:
             if period is not None and limit is not None
             else None
         )
-        return self._apply(user_id, self._checked(amount), reason, external_event_id, quota)
+        return self._apply(
+            user_id, self._checked(amount), reason, external_event_id, quota, claim
+        )
 
     def debit(
         self,
@@ -109,6 +119,119 @@ class ShardLedgerService:
         """조각을 쓴다. 잔액이 모자라면 `InsufficientShards` — 아무것도 기록되지 않는다."""
         return self._apply(user_id, -self._checked(amount), reason, external_event_id)
 
+    def refund_iap(
+        self,
+        user_id: str,
+        external_event_id: str,
+        purchase: DocumentKey,
+        record: DocumentKey,
+        document: dict,
+        plan: Callable[[dict], RefundPlan],
+    ) -> ShardRefundResult:
+        """Apple 환불을 반영한다. **`debit`이 아니다.**
+
+        `debit`의 음수 delta는 `lifetime_spent`로 집계되는데, 환불은 사용자가 쓴 것이
+        아니다. 그 칸에 넣으면 "얼마나 썼는가"가 거짓말이 되므로 projection이 다른
+        전용 경로를 쓴다 — generic debit의 의미는 그대로 둔다.
+
+        되돌릴 양은 `plan`이 **원본 구매 claim을 보고** 정한다. 알림이 말한 값도,
+        지금의 catalog 값도 쓰지 않는다(catalog는 나중에 바뀔 수 있고, 그러면
+        예전 구매를 잘못된 금액으로 되돌리게 된다).
+
+        열쇠는 다른 이유와 **같은 함수**로 만든다 — user scope도 여기서 강제한다.
+        """
+        key = idempotency_hash(user_id, ShardReason.IAP_REFUND, external_event_id)
+        result = self._store.refund(user_id, purchase, record, document, key, plan)
+        # 값만 남긴다. 누구인지 · 어떤 transaction인지는 남기지 않는다.
+        logger.info(
+            "shard_refund reason=%s requested=%d recovered=%d unrecovered=%d balance=%d applied=%s",
+            ShardReason.IAP_REFUND.value, result.requested, result.recovered,
+            result.unrecovered, result.wallet.balance, result.applied,
+        )
+        return result
+
+    def reverse_iap_refund(
+        self,
+        user_id: str,
+        external_event_id: str,
+        purchase: DocumentKey,
+        record: DocumentKey,
+        remaining: Callable[[dict], int],
+    ) -> ShardRefundReversalResult:
+        """Apple이 되돌린 환불만큼 복구한다. **`credit`이 아니다.**
+
+        `credit`은 `lifetime_earned`를 올리는데, 이 조각은 원래 구매 때 이미 earned로
+        세어졌다 — 또 올리면 한 결제를 두 번 센다. 그래서 projection이 다른 전용 경로다.
+
+        복구량은 `remaining`이 **환불 record를 보고** 정한다(`recovered - reversed`).
+        원본 지급량도, Apple이 요청했던 양도, catalog 값도 쓰지 않는다.
+        """
+        key = idempotency_hash(user_id, ShardReason.IAP_REFUND_REVERSED, external_event_id)
+        result = self._store.reverse_refund(user_id, purchase, record, key, remaining)
+        logger.info(
+            "shard_refund_reversed reason=%s restored=%d balance=%d applied=%s",
+            ShardReason.IAP_REFUND_REVERSED.value, result.restored,
+            result.wallet.balance, result.applied,
+        )
+        return result
+
+    # MARK: - 호출자가 소유하는 transaction (B-7B)
+
+    def transaction(self):
+        """marketplace처럼 **다른 문서와 함께 commit해야 하는** 호출자가 transaction을 연다."""
+        return self._store.transaction()
+
+    def context(self, transaction) -> ShardTransactionContext:
+        """**transactional callable 안에서 매번** 부른다.
+
+        Firestore는 commit이 `ABORTED`되면 **같은 transaction 객체로** callable을 다시
+        부른다. 시도마다 새 기록으로 시작해야 재시도가 잘못 거절되지 않는다.
+        """
+        return self._store.context(transaction)
+
+    def apply_in_transaction(
+        self,
+        context: ShardTransactionContext,
+        user_id: str,
+        delta: int,
+        reason: ShardReason,
+        external_event_id: str,
+    ) -> ShardMutationResult:
+        """이미 열려 있는 transaction에 조각 이동 하나를 얹는다. **commit하지 않는다.**
+
+        marketplace가 유일한 사용자다 — 구매는 **구매자 지갑 · 판매자 지갑 · 원장 두 줄 ·
+        ownership**이 한 transaction에서 커밋돼야 하고, `credit`/`debit`은 각자 transaction을
+        열어 버려서 "구매자만 차감된" 중간 상태를 만든다.
+
+        **범용 이체 함수가 아니다.** 보내는 사람 · 받는 사람을 한 번에 받는 자리가 없고,
+        방향은 `delta`의 부호가 아니라 **호출부가 고른 `reason`**과 함께 읽힌다.
+        같은 지갑을 한 transaction에서 두 번 바꾸려 하면 저장소가 거절한다
+        (자기 자신에게 파는 경우가 정확히 그 모양이다).
+
+        열쇠는 다른 이유와 **같은 함수**로 만든다 — user scope도 여기서 강제한다.
+        """
+        key = idempotency_hash(user_id, reason, external_event_id)
+        wallet, entry, applied = self._store.apply_in_transaction(
+            context, user_id, self._moved(delta), reason, key
+        )
+        event = "shard_ledger_credit" if entry.delta > 0 else "shard_ledger_debit"
+        logger.info(
+            "%s reason=%s delta=%d balance=%d applied=%s scoped=True",
+            event, reason.value, entry.delta, wallet.balance, applied,
+        )
+        return ShardMutationResult(wallet=wallet, applied=applied, entry_id=entry.id)
+
+    @staticmethod
+    def _moved(delta: int) -> int:
+        """0은 이동이 아니다. 크기 검사는 `_checked`와 같은 규칙을 쓴다."""
+        if not isinstance(delta, int) or isinstance(delta, bool):
+            raise InvalidShardAmount("delta must be an integer")
+        if delta == 0:
+            raise InvalidShardAmount("delta must not be zero")
+        if abs(delta) > MAX_DELTA:
+            raise InvalidShardAmount("delta is too large")
+        return delta
+
     # MARK: - 내부
 
     def _apply(
@@ -118,12 +241,13 @@ class ShardLedgerService:
         reason: ShardReason,
         external_event_id: str | None,
         quota: PeriodQuota | None = None,
+        claim: ExclusiveClaim | None = None,
     ) -> ShardMutationResult:
         # user scope는 **service가 강제한다.** 호출부가 event id에 user id를 넣어주기를
         # 기대하면, 잊은 곳 하나가 사용자끼리 같은 문서를 겨루게 만든다.
         key = idempotency_hash(user_id, reason, external_event_id) if external_event_id else None
         # `applied`는 저장소의 원자적 쓰기 결과다. 여기서 다시 판단하지 않는다.
-        wallet, entry, applied = self._store.apply(user_id, delta, reason, key, quota)
+        wallet, entry, applied = self._store.apply(user_id, delta, reason, key, quota, claim)
 
         event = "shard_ledger_credit" if delta > 0 else "shard_ledger_debit"
         # 값은 남기되 누구인지 · 어떤 외부 id인지는 남기지 않는다.

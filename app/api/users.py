@@ -12,14 +12,30 @@ client가 `amount`와 `reason`을 정하는 구조가 된다. 잔액을 바꾸�
 client가 정할 수 있는 값이 하나도 없다.
 """
 
+from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
 from app.ads.service import RewardedAdService
-from app.api.deps import CurrentUser, rewarded_ad_service, shard_service
-from app.auth.models import issue_session_token
+from app.api.deps import (
+    CurrentUser,
+    account_deletion,
+    rewarded_ad_service,
+    shard_service,
+    store as auth_store_dep,
+)
+from app.auth.deletion import AccountDeleting
+from app.auth.models import issue_session_token, utcnow
+from app.auth.profile import (
+    DisplayNameCooldown,
+    DisplayNameTaken,
+    InvalidDisplayName,
+    ProfileView,
+    normalize_display_name,
+)
+from app.auth.store import AuthStore, StoreUnavailable
 from app.shards import attendance
 from app.shards.service import ShardLedgerService
 
@@ -79,10 +95,116 @@ class RewardContextPayload(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class ProfilePayload(BaseModel):
+    """내 프로필. **공개 표면에 나가는 것은 `displayName`뿐이다** —
+    email · Apple subject · 내부 metadata를 담지 않는다."""
+
+    id: str
+    #: 아직 정하지 않았으면 `null`이다. 서버가 기본 이름을 지어내지 않는다.
+    display_name: str | None = Field(default=None, serialization_alias="displayName")
+    can_change_display_name: bool = Field(serialization_alias="canChangeDisplayName")
+    next_display_name_change_at: datetime | None = Field(
+        default=None, serialization_alias="nextDisplayNameChangeAt"
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class DisplayNameRequest(BaseModel):
+    display_name: str = Field(alias="displayName", min_length=1, max_length=128)
+
+    model_config = {"populate_by_name": True}
+
+
+def _profile(user) -> ProfilePayload:
+    view = ProfileView(
+        display_name=user.display_name,
+        display_name_changed_at=user.display_name_changed_at,
+        now=utcnow(),
+    )
+    return ProfilePayload(
+        id=user.id,
+        display_name=view.display_name,
+        can_change_display_name=view.can_change_display_name,
+        next_display_name_change_at=view.next_display_name_change_at,
+    )
+
+
 @router.get("/me")
-def me(user: CurrentUser) -> dict[str, str]:
-    """internal user UUID만 돌려준다. Apple subject는 나가지 않는다."""
-    return {"id": user.id}
+def me(user: CurrentUser) -> dict[str, object]:
+    """internal user UUID + 프로필. Apple subject는 나가지 않는다.
+
+    **필드를 더하기만 한다.** 1.0.7 client는 `id`만 읽고 나머지를 무시하므로
+    이 응답이 넓어져도 그대로 동작한다(Swift `JSONDecoder`는 모르는 key를 버린다).
+    """
+    payload = _profile(user)
+    return {
+        "id": user.id,
+        "displayName": payload.display_name,
+        "canChangeDisplayName": payload.can_change_display_name,
+        "nextDisplayNameChangeAt": (
+            payload.next_display_name_change_at.isoformat()
+            if payload.next_display_name_change_at
+            else None
+        ),
+    }
+
+
+@router.delete("/me/account", status_code=status.HTTP_204_NO_CONTENT)
+def delete_account(
+    user: CurrentUser,
+    deletion: Annotated[AccountDeleting, Depends(account_deletion)],
+) -> Response:
+    """**본인 계정을 지운다.** 되돌릴 수 없다.
+
+    다른 user id를 받아 지우는 자리를 만들지 않는다 — 지울 수 있는 것은
+    지금 인증된 사람 자신뿐이다.
+
+    여러 번 불러도 안전하다(멱등). 중간에 실패하면 그대로 다시 부르면 된다.
+
+    **Apple 연결 해제는 여기서 하지 않는다.** 그러려면 Apple에 보낼 client secret
+    (`.p8`)과 authorization code가 필요한데 지금 우리는 둘 다 갖고 있지 않다.
+    없다고 계정 삭제를 막지는 않는다 — 삭제는 끝내고, 사용자에게 설정에서 직접
+    연결을 해제하는 방법을 안내한다.
+    """
+    try:
+        deletion.delete(user.id)
+    except StoreUnavailable as error:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "잠시 뒤 다시 시도해 주세요."
+        ) from error
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.patch("/me/profile", response_model=ProfilePayload, response_model_by_alias=True)
+def update_profile(
+    body: DisplayNameRequest,
+    user: CurrentUser,
+    auth_store: Annotated[AuthStore, Depends(auth_store_dep)],
+) -> ProfilePayload:
+    """이름을 바꾼다. **30일 규칙은 서버가 강제한다** — 기기 시계를 믿지 않는다."""
+    try:
+        name = normalize_display_name(body.display_name)
+    except InvalidDisplayName as error:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "이름을 다시 확인해 주세요.") from error
+
+    try:
+        updated = auth_store.set_display_name(user.id, name, utcnow())
+    except DisplayNameTaken as error:
+        # **generic 오류로 숨기지 않는다.** 사용자가 다음에 무엇을 할지 알아야 한다.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "이미 사용 중인 이름이에요."
+        ) from error
+    except DisplayNameCooldown as error:
+        # 재시도해도 같은 답이라 4xx다. 언제부터 되는지 함께 알려 준다.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"이름은 30일에 한 번 변경할 수 있어요. 다음 변경 가능: {error.available_at.date().isoformat()}",
+        ) from error
+    except StoreUnavailable as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "잠시 뒤 다시 시도해 주세요.") from error
+
+    return _profile(updated)
 
 
 @router.get("/me/shards", response_model=ShardWalletPayload, response_model_by_alias=True)

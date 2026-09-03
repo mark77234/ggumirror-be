@@ -14,7 +14,11 @@ from typing import Annotated
 from fastapi import Depends, HTTPException, Request, status
 
 from app.ads.service import RewardedAdService
+from app.ai.service import AIStickerService
 from app.auth.apple import AppleTokenVerifier
+from app.iap.notifications import AppStoreNotificationService
+from app.iap.service import IAPService
+from app.marketplace.service import MarketplaceService
 from app.auth.models import User, sha256_hex
 from app.auth.store import AuthStore, StoreUnavailable
 from app.shards.service import ShardLedgerService
@@ -57,6 +61,118 @@ def rewarded_ad_service(request: Request) -> RewardedAdService:
         return request.app.state.rewarded_ad_service()
     except Exception as error:  # Firestore client 생성 실패 (credential / network)
         logger.error("rewarded_ad_service_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
+def ai_sticker_service(request: Request) -> AIStickerService:
+    """AI 스티커 service. store와 같은 이유로 처음 쓰일 때 만든다.
+
+    provider가 설정되지 않은 것은 **여기서 실패하지 않는다** — service는 만들어지고
+    `is_available`이 False가 될 뿐이다. 그래야 `/ai/stickers/config`가 답할 수 있다.
+    """
+    try:
+        return request.app.state.ai_sticker_service()
+    except Exception as error:  # Firestore client 생성 실패 (credential / network)
+        logger.error("ai_sticker_service_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
+def iap_service(request: Request) -> IAPService:
+    """조각 IAP service. store와 같은 이유로 처음 쓰일 때 만든다.
+
+    검증기가 설정되지 않은 것은 **여기서 실패하지 않는다** — service는 만들어지고
+    `is_available`이 False가 될 뿐이다(A-1A provider와 같은 규칙).
+    """
+    try:
+        return request.app.state.iap_service()
+    except Exception as error:  # Firestore client 생성 실패 (credential / network)
+        logger.error("iap_service_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
+def app_store_notifications(request: Request) -> AppStoreNotificationService:
+    """App Store 알림 service. **Bearer가 없는 경로**라 세션을 보지 않는다."""
+    try:
+        return request.app.state.app_store_notifications()
+    except Exception as error:  # Firestore client 생성 실패 등
+        logger.error("app_store_notifications_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
+def catalog_service(request: Request):
+    """내장 템플릿 통계 service. marketplace와 같은 이유로 처음 쓰일 때 만든다."""
+    try:
+        return request.app.state.catalog_service()
+    except Exception as error:  # Firestore client 생성 실패
+        logger.error("catalog_service_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
+def mirror_capacity_service(request: Request):
+    """거울 보관 공간 service. catalog와 같은 이유로 처음 쓰일 때 만든다."""
+    try:
+        return request.app.state.mirror_capacity_service()
+    except Exception as error:  # Firestore client 생성 실패
+        logger.error("mirror_capacity_service_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
+def marketplace_service(request: Request) -> MarketplaceService:
+    """상점 service. store와 같은 이유로 처음 쓰일 때 만든다."""
+    try:
+        return request.app.state.marketplace_service()
+    except Exception as error:  # Firestore client 생성 실패 (credential / network)
+        logger.error("marketplace_service_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
+def ai_mirror_service(request: Request):
+    """AI 거울 service. store와 같은 이유로 처음 쓰일 때 만든다."""
+    try:
+        return request.app.state.ai_mirror_service()
+    except Exception as error:  # provider / Firestore 준비 실패
+        logger.error("ai_mirror_service_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
+def notification_service(request: Request):
+    """알림센터 service. store와 같은 이유로 처음 쓰일 때 만든다."""
+    try:
+        return request.app.state.notification_service()
+    except Exception as error:  # Firestore client 생성 실패
+        logger.error("notification_service_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
+def notification_preferences(request: Request):
+    """알림 설정 service. store와 같은 이유로 처음 쓰일 때 만든다."""
+    try:
+        return request.app.state.notification_preferences()
+    except Exception as error:  # Firestore client 생성 실패
+        logger.error("notification_preferences_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
+def push_service(request: Request):
+    """Push service.
+
+    APNs 자격 증명이 없는 것은 **여기서 실패하지 않는다** — service는 만들어지고
+    `is_available`이 False가 될 뿐이다(AI provider와 같은 규칙). 알림이 안 갈 뿐
+    기기 등록과 판매는 그대로 동작해야 한다.
+    """
+    try:
+        return request.app.state.push_service()
+    except Exception as error:  # Firestore client 생성 실패
+        logger.error("push_service_unavailable error=%s", type(error).__name__)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+
+
+def account_deletion(request: Request):
+    """계정 삭제 service. store와 같은 이유로 처음 쓰일 때 만든다."""
+    try:
+        return request.app.state.account_deletion()
+    except Exception as error:  # Firestore client 생성 실패
+        logger.error("account_deletion_unavailable error=%s", type(error).__name__)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
 
 
@@ -108,3 +224,33 @@ def current_user(
 
 
 CurrentUser = Annotated[User, Depends(current_user)]
+
+
+FORBIDDEN = "권한이 없어요."
+
+
+def admin_user(
+    user: CurrentUser,
+    auth_store: Annotated[AuthStore, Depends(store)],
+) -> User:
+    """**운영자만.** 인증을 먼저 하고 그 다음에 allowlist를 본다.
+
+    client가 보낸 어떤 값도 여기 들어오지 않는다 — body에도 header에도
+    "나는 운영자다"라고 적을 자리가 없다. 판단 근거는 서버가 읽은 문서 하나뿐이다.
+
+    화면이 운영자 메뉴를 숨기는 것은 **편의일 뿐이다.** 강제로 화면을 열어
+    요청을 보내도 여기서 막힌다.
+    """
+    try:
+        allowed = auth_store.is_admin(user.id)
+    except StoreUnavailable as error:
+        # **읽기 실패를 "권한 없음"으로 바꾸지 않는다** — 장애를 권한 문제로
+        # 잘못 보여 주면 운영자가 자기 계정을 의심하게 된다.
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UNAVAILABLE) from error
+    if not allowed:
+        logger.warning("admin_denied")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, FORBIDDEN)
+    return user
+
+
+AdminUser = Annotated[User, Depends(admin_user)]
