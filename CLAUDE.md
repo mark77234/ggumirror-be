@@ -1795,5 +1795,46 @@ A-1A로 조각을 **쓰는** 곳이 처음 생겼으므로 B-6이 전보다 급�
 SSV callback URL 등록, `ADMOB_SSV_EXPECTED_AD_UNIT` · `ADMOB_REWARD_ITEM` 배포.
 그때까지 SSV endpoint는 살아 있되 fail closed다.
 
-Cloud Run 자동 배포 workflow는 GCP project · service account ·
-Workload Identity가 확정된 뒤에 만든다.
+## Branch / Deploy
+
+```
+feature/* ──PR──▶ dev ──PR──▶ main ──merge──▶ production
+                  CI만        CI만            CI ▶ build ▶ deploy ▶ health smoke
+```
+
+`.github/workflows/backend.yml` 하나가 전부다. 자세한 것은 `docs/deployment.md`.
+
+- **배포는 `push` to `main` 하나뿐이다.** PR event · `dev` push에서는 절대 배포하지 않는다
+- `main`으로 오는 PR의 출처는 `dev` 또는 `hotfix/*`뿐이다
+- image tag는 **commit SHA**. `latest`를 production authority로 쓰지 않는다
+- **WIF + GitHub OIDC.** service account JSON key를 만들지 않고 GitHub Secret도 쓰지 않는다.
+  runtime SA와 배포 SA를 나눈다
+- project · region · service · AR repo는 **workflow에 박아 둔다** — variable 한 줄로
+  다른 production project를 향하게 만들 수 없다(fail closed). 이 머신의 gcloud 기본
+  project가 DailyOPIc라 그 사고는 이론이 아니다
+- 배포는 **`--image`만** 바꾼다. `--set-env-vars` · `--set-secrets`는 선언하지 않은 것을
+  지운다 — env var 17개와 secret reference 2개가 이미 붙어 있다.
+  배포 전후 config를 비교해 image 말고 달라진 것이 있으면 실패시킨다
+- `/health` smoke 실패면 **traffic만** 이전 revision으로 되돌린다. data rollback은 없다
+
+**WIF pool · 배포 SA · repo variable은 아직 만들지 않았다** — `docs/deployment.md`의
+일회성 명령을 한 번 실행해야 배포가 동작한다.
+
+### test는 credential 없이 돈다
+
+`tests/conftest.py`의 `no_google_credentials`가 **모든 test에서 Google ADC lookup을
+막는다**(guard 본체는 `tests/adc_guard.py`). `create_app`에 store를 주지 않으면
+production은 Firestore로 fallback해야 하고 그 동작은 그대로 두었는데, 개발 기기에는
+ADC가 있어서 그 fallback이 **조용히 성공**했다 — 주입을 빠뜨린 test가 실제 Firestore를
+붙잡은 채로 초록이었고, ADC가 없는 CI에서 `DefaultCredentialsError` → 503으로 69개가
+무너졌다.
+
+guard가 터지면 고칠 곳은 **그 test의 `create_app(...)` 인자**다(빠진 store를 in-memory
+fake로 준다). production fallback을 바꾸지 않는다. guard는 `BaseException`이라
+dependency의 `except Exception`에 삼켜지지 않는다.
+
+CI를 로컬에서 재현하려면:
+
+```bash
+env -i PATH=/usr/bin:/bin HOME=$(mktemp -d) GCE_METADATA_HOST=localhost:1 ./.venv/bin/python -m pytest
+```
